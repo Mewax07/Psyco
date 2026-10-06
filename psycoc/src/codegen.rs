@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 
 use crate::{
-    Alu, Assembler, Cond, DataLabel, ElfBuilder, Label, LinuxPlatform, PeBuilder, Platform, Reg, Runtime, UefiPlatform, ast::{BinOp, Block, Expr, ExprKind, Function, Program, Stmt, Type, UnaryOp},
+    Alu, Assembler, Cond, DataLabel, ElfBuilder, Label, LinuxPlatform, PeBuilder, Platform, Reg,
+    Runtime, UefiPlatform,
+    ast::{BinOp, Block, Expr, ExprKind, Function, Program, Stmt, Type, UnaryOp},
 };
 
 pub struct Codegen {
@@ -72,6 +74,38 @@ impl Codegen {
         let label = self.asm.data_str(s);
         self.strings.insert(s.to_string(), label);
         label
+    }
+
+    fn cmp_cond(&self, op: BinOp) -> Option<Cond> {
+        Some(match op {
+            BinOp::Eq => Cond::E,
+            BinOp::Ne => Cond::NE,
+            BinOp::Lt => Cond::L,
+            BinOp::Le => Cond::LE,
+            BinOp::Gt => Cond::G,
+            BinOp::Ge => Cond::GE,
+            _ => return None,
+        })
+    }
+
+    fn as_imm32(&self, e: &Expr) -> Option<i32> {
+        match e.kind {
+            ExprKind::Int(n) => i32::try_from(n).ok(),
+            ExprKind::Bool(b) => Some(b as i32),
+            _ => None,
+        }
+    }
+
+    fn always_exits(&self, block: &Block) -> bool {
+        match block.stmts.last() {
+            Some(Stmt::Return { .. }) => true,
+            Some(Stmt::If {
+                then_block,
+                else_block: Some(else_block),
+                ..
+            }) => self.always_exits(then_block) && self.always_exits(else_block),
+            _ => false,
+        }
     }
 
     pub fn generate(&mut self, program: &Program, target: Target) -> Vec<u8> {
@@ -260,36 +294,126 @@ impl Codegen {
                 ..
             } => {
                 let else_label = self.asm.new_label();
-                let end_label = self.asm.new_label();
-
-                self.gen_expr(cond);
-                self.asm.alu_ri(Alu::Cmp, Reg::Rax, 0);
-                self.asm.jcc(Cond::E, else_label);
+                self.gen_branch(cond, false, else_label);
                 self.gen_block(then_block);
-                self.asm.jmp(end_label);
-                self.asm.bind(else_label);
-                if let Some(block) = else_block {
-                    self.gen_block(block);
+
+                match else_block {
+                    None => self.asm.bind(else_label),
+                    Some(block) => {
+                        let end_label = self.asm.new_label();
+                        if !self.always_exits(then_block) {
+                            self.asm.jmp(end_label);
+                        }
+                        self.asm.bind(else_label);
+                        self.gen_block(block);
+                        self.asm.bind(end_label);
+                    }
                 }
-                self.asm.bind(end_label);
             }
             Stmt::While { cond, body, .. } => {
-                let start_label = self.asm.new_label();
-                let end_label = self.asm.new_label();
+                let body_label = self.asm.new_label();
+                let cond_label = self.asm.new_label();
 
-                self.asm.bind(start_label);
-                self.gen_expr(cond);
-                self.asm.alu_ri(Alu::Cmp, Reg::Rax, 0);
-                self.asm.jcc(Cond::E, end_label);
+                self.asm.jmp(cond_label);
+                self.asm.bind(body_label);
                 self.gen_block(body);
-                self.asm.jmp(start_label);
-                self.asm.bind(end_label);
+                self.asm.bind(cond_label);
+                self.gen_branch(cond, true, body_label);
             }
         }
     }
 
+    fn gen_branch(&mut self, expr: &Expr, jump_if: bool, target: Label) {
+        match &expr.kind {
+            ExprKind::Bool(b) => {
+                if *b == jump_if {
+                    self.asm.jmp(target);
+                }
+            }
+            ExprKind::Unary {
+                op: UnaryOp::Not,
+                operand,
+            } => self.gen_branch(operand, !jump_if, target),
+            ExprKind::Binary {
+                op: BinOp::And,
+                lhs,
+                rhs,
+            } => {
+                if jump_if {
+                    // jump if lhs && rhs
+                    let skip = self.asm.new_label();
+                    self.gen_branch(lhs, false, skip);
+                    self.gen_branch(rhs, true, target);
+                    self.asm.bind(skip);
+                } else {
+                    // jump if !(lhs && rhs)
+                    self.gen_branch(lhs, false, target);
+                    self.gen_branch(rhs, false, target);
+                }
+            }
+            ExprKind::Binary {
+                op: BinOp::Or,
+                lhs,
+                rhs,
+            } => {
+                if jump_if {
+                    self.gen_branch(lhs, true, target);
+                    self.gen_branch(rhs, true, target);
+                } else {
+                    // jump if !(lhs || rhs)
+                    let skip = self.asm.new_label();
+                    self.gen_branch(lhs, true, skip);
+                    self.gen_branch(rhs, false, target);
+                    self.asm.bind(skip);
+                }
+            }
+            ExprKind::Binary { op, lhs, rhs } if self.cmp_cond(*op).is_some() => {
+                let cc = self.gen_cmp(self.cmp_cond(*op).unwrap(), lhs, rhs);
+                self.asm.jcc(if jump_if { cc } else { cc.negate() }, target);
+            }
+            _ => {
+                self.gen_expr(expr);
+                self.asm.test_rr(Reg::Rax, Reg::Rax);
+                self.asm
+                    .jcc(if jump_if { Cond::NE } else { Cond::E }, target);
+            }
+        }
+    }
+
+    fn gen_cmp(&mut self, cc: Cond, lhs: &Expr, rhs: &Expr) -> Cond {
+        if let Some(imm) = self.as_imm32(rhs) {
+            self.gen_expr(lhs);
+            self.cmp_imm(Reg::Rax, imm);
+            return cc;
+        }
+        if let Some(imm) = self.as_imm32(lhs) {
+            self.gen_expr(rhs);
+            self.cmp_imm(Reg::Rax, imm);
+            return cc.swap();
+        }
+        self.gen_operands(lhs, rhs);
+        self.asm.alu_rr(Alu::Cmp, Reg::Rcx, Reg::Rax);
+        cc
+    }
+
+    fn cmp_imm(&mut self, r: Reg, imm: i32) {
+        if imm == 0 {
+            self.asm.test_rr(r, r);
+        } else {
+            self.asm.alu_ri(Alu::Cmp, r, imm);
+        }
+    }
+
+    fn gen_operands(&mut self, lhs: &Expr, rhs: &Expr) {
+        self.gen_expr(lhs);
+        self.asm.push(Reg::Rax);
+        self.gen_expr(rhs);
+        self.asm.pop(Reg::Rcx);
+    }
+
     fn gen_expr(&mut self, expr: &Expr) {
         match &expr.kind {
+            ExprKind::Int(0) | ExprKind::Bool(false) => self.asm.zero(Reg::Rax),
             ExprKind::Int(n) => self.asm.mov_ri(Reg::Rax, *n),
             ExprKind::Bool(b) => self.asm.mov_ri(Reg::Rax, *b as i64),
             ExprKind::Str(s) => {
@@ -316,54 +440,93 @@ impl Codegen {
     }
 
     fn gen_binary(&mut self, op: BinOp, lhs: &Expr, rhs: &Expr) {
-        if op == BinOp::And || op == BinOp::Or {
-            let end_label = self.asm.new_label();
-            self.gen_expr(lhs);
-            self.asm.alu_ri(Alu::Cmp, Reg::Rax, 0);
-            let cc = if op == BinOp::And { Cond::E } else { Cond::NE };
-            self.asm.jcc(cc, end_label);
-            self.gen_expr(rhs);
-            self.asm.bind(end_label);
-            return;
-        }
-
-        self.gen_expr(lhs);
-        self.asm.push(Reg::Rax);
-        self.gen_expr(rhs);
-        self.asm.mov_rr(Reg::Rcx, Reg::Rax);
-        self.asm.pop(Reg::Rax); // rax = lhs, rcx = rhs
-
+        use Reg::*;
         let overflow = self.rt.panic_overflow;
+
         match op {
-            BinOp::Add => {
-                self.asm.alu_rr(Alu::Add, Reg::Rax, Reg::Rcx);
+            BinOp::And | BinOp::Or => {
+                let end_label = self.asm.new_label();
+                self.gen_expr(lhs);
+                self.asm.test_rr(Rax, Rax);
+                let cc = if op == BinOp::And { Cond::E } else { Cond::NE };
+                self.asm.jcc(cc, end_label);
+                self.gen_expr(rhs);
+                self.asm.bind(end_label);
+            }
+            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                let cc = self.gen_cmp(self.cmp_cond(op).unwrap(), lhs, rhs);
+                self.asm.setcc(cc, Rax);
+                self.asm.movzx8(Rax, Rax);
+            }
+            BinOp::Add | BinOp::Mul => {
+                let imm_side = self.as_imm32(rhs)
+                    .map(|imm| (lhs, imm))
+                    .or_else(|| self.as_imm32(lhs).map(|imm| (rhs, imm)));
+
+                match (op, imm_side) {
+                    (BinOp::Add, Some((other, imm))) => {
+                        self.gen_expr(other);
+                        self.asm.alu_ri(Alu::Add, Rax, imm);
+                    }
+                    (BinOp::Mul, Some((other, imm))) => {
+                        self.gen_expr(other);
+                        self.asm.imul_ri(Rax, Rax, imm);
+                    }
+                    (BinOp::Add, None) => {
+                        self.gen_operands(lhs, rhs);
+                        self.asm.alu_rr(Alu::Add, Rax, Rcx);
+                    }
+                    (BinOp::Mul, None) => {
+                        self.gen_operands(lhs, rhs);
+                        self.asm.imul_rr(Rax, Rcx);
+                    }
+                    _ => unreachable!(),
+                }
                 self.asm.jcc(Cond::O, overflow);
             }
             BinOp::Sub => {
-                self.asm.alu_rr(Alu::Sub, Reg::Rax, Reg::Rcx);
+                if let Some(imm) = self.as_imm32(rhs) {
+                    // x - k
+                    self.gen_expr(lhs);
+                    self.asm.alu_ri(Alu::Sub, Rax, imm);
+                } else if let ExprKind::Int(k) = lhs.kind {
+                    self.gen_expr(rhs);
+                    self.asm.mov_rr(Rcx, Rax);
+                    if k == 0 {
+                        self.asm.zero(Rax);
+                    } else {
+                        self.asm.mov_ri(Rax, k);
+                    }
+                    self.asm.alu_rr(Alu::Sub, Rax, Rcx);
+                } else {
+                    self.gen_operands(lhs, rhs); // rcx = lhs, rax = rhs
+                    self.asm.alu_rr(Alu::Sub, Rcx, Rax);
+                    self.asm.mov_rr(Rax, Rcx);
+                }
                 self.asm.jcc(Cond::O, overflow);
             }
-            BinOp::Mul => {
-                self.asm.imul_rr(Reg::Rax, Reg::Rcx);
-                self.asm.jcc(Cond::O, overflow);
+            BinOp::Div | BinOp::Mod => {
+                let is_mod = op == BinOp::Mod;
+                match rhs.kind {
+                    ExprKind::Int(k) if k != 0 && k != -1 => {
+                        self.gen_expr(lhs);
+                        self.asm.mov_ri(Rcx, k);
+                        self.asm.cqo();
+                        self.asm.idiv(Rcx);
+                        if is_mod {
+                            self.asm.mov_rr(Rax, Rdx);
+                        }
+                    }
+                    _ => {
+                        self.gen_expr(lhs);
+                        self.asm.push(Rax);
+                        self.gen_expr(rhs);
+                        self.asm.mov_rr(Rcx, Rax);
+                        self.asm.pop(Rax); // rax = lhs, rcx = rhs
+                        self.gen_divmod(is_mod);
+                    }
+                }
             }
-            BinOp::Div => self.gen_divmod(false),
-            BinOp::Mod => self.gen_divmod(true),
-            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
-                let cc = match op {
-                    BinOp::Eq => Cond::E,
-                    BinOp::Ne => Cond::NE,
-                    BinOp::Lt => Cond::L,
-                    BinOp::Le => Cond::LE,
-                    BinOp::Gt => Cond::G,
-                    BinOp::Ge => Cond::GE,
-                    _ => unreachable!(),
-                };
-                self.asm.alu_rr(Alu::Cmp, Reg::Rax, Reg::Rcx);
-                self.asm.setcc(cc, Reg::Rax);
-                self.asm.movzx8(Reg::Rax, Reg::Rax);
-            }
-            BinOp::And | BinOp::Or => unreachable!(),
         }
     }
 

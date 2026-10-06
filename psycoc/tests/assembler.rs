@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use psycoc::{Alu, Assembler, Reg};
+    use psycoc::{Alu, Assembler, Cond, Reg};
 
     fn encode(f: impl FnOnce(&mut Assembler)) -> Vec<u8> {
         let mut a = Assembler::new();
@@ -78,9 +78,15 @@ mod tests {
             encode(|a| a.mov_ri(Reg::Rax, -1)),
             vec![0x48, 0xC7, 0xC0, 0xFF, 0xFF, 0xFF, 0xFF]
         );
+        // 0 reste un vrai `mov` : mov_ri ne doit pas toucher aux flags.
         assert_eq!(
-            encode(|a| a.mov_ri(Reg::Rax, -1)),
-            vec![0x48, 0xC7, 0xC0, 0xFF, 0xFF, 0xFF, 0xFF]
+            encode(|a| a.mov_ri(Reg::Rax, 0)),
+            vec![0xB8, 0x00, 0x00, 0x00, 0x00]
+        );
+        // u32::MAX tient dans `mov r32, imm32` (zero-extend), pas besoin de REX.W.
+        assert_eq!(
+            encode(|a| a.mov_ri(Reg::Rcx, 0xFFFF_FFFF)),
+            vec![0xB9, 0xFF, 0xFF, 0xFF, 0xFF]
         );
     }
 
@@ -175,10 +181,99 @@ mod tests {
         assert_eq!(encode(|a| a.cli()), vec![0xFA]);
     }
 
+    // Les octets attendus ci-dessous ont été obtenus avec GNU as + objdump.
+
     #[test]
     fn load8() {
-        assert_eq!(encode(|a| a.load8(Reg::Rax, Reg::Rsi)), vec![0x48, 0x0F, 0xB6, 0x06]);
-        assert_eq!(encode(|a| a.load8(Reg::Rax, Reg::Rsp)), vec![0x48, 0x0F, 0xB6, 0x04, 0x24]);
-        assert_eq!(encode(|a| a.load8(Reg::Rax, Reg::Rbp)), vec![0x48, 0x0F, 0xB6, 0x45, 0x00]);
+        assert_eq!(encode(|a| a.load8(Reg::Rax, Reg::Rsi)), vec![0x0F, 0xB6, 0x06]);
+        assert_eq!(encode(|a| a.load8(Reg::Rax, Reg::Rsp)), vec![0x0F, 0xB6, 0x04, 0x24]);
+        assert_eq!(encode(|a| a.load8(Reg::Rax, Reg::Rbp)), vec![0x0F, 0xB6, 0x45, 0x00]);
+        assert_eq!(
+            encode(|a| a.load8(Reg::R9, Reg::R12)),
+            vec![0x45, 0x0F, 0xB6, 0x0C, 0x24]
+        );
+    }
+
+    #[test]
+    fn setcc_all_byte_regs() {
+        assert_eq!(encode(|a| a.setcc(Cond::E, Reg::Rax)), vec![0x0F, 0x94, 0xC0]);
+        assert_eq!(encode(|a| a.setcc(Cond::LE, Reg::Rbx)), vec![0x0F, 0x9E, 0xC3]);
+        // sil : sans le 0x40 forcé, ce serait `setl dh`.
+        assert_eq!(encode(|a| a.setcc(Cond::L, Reg::Rsi)), vec![0x40, 0x0F, 0x9C, 0xC6]);
+        assert_eq!(encode(|a| a.setcc(Cond::G, Reg::R8)), vec![0x41, 0x0F, 0x9F, 0xC0]);
+        assert_eq!(encode(|a| a.setcc(Cond::NE, Reg::R15)), vec![0x41, 0x0F, 0x95, 0xC7]);
+    }
+
+    #[test]
+    fn movzx8_all_byte_regs() {
+        assert_eq!(encode(|a| a.movzx8(Reg::Rax, Reg::Rax)), vec![0x0F, 0xB6, 0xC0]);
+        assert_eq!(encode(|a| a.movzx8(Reg::Rcx, Reg::Rbx)), vec![0x0F, 0xB6, 0xCB]);
+        assert_eq!(encode(|a| a.movzx8(Reg::Rax, Reg::Rsi)), vec![0x40, 0x0F, 0xB6, 0xC6]);
+        assert_eq!(encode(|a| a.movzx8(Reg::R8, Reg::Rax)), vec![0x44, 0x0F, 0xB6, 0xC0]);
+        assert_eq!(encode(|a| a.movzx8(Reg::Rax, Reg::R9)), vec![0x41, 0x0F, 0xB6, 0xC1]);
+        assert_eq!(encode(|a| a.movzx8(Reg::R15, Reg::Rdi)), vec![0x44, 0x0F, 0xB6, 0xFF]);
+    }
+
+    #[test]
+    fn store8() {
+        assert_eq!(encode(|a| a.store8(Reg::Rsi, Reg::Rdx)), vec![0x88, 0x16]);
+        assert_eq!(encode(|a| a.store8(Reg::Rsi, Reg::Rsi)), vec![0x40, 0x88, 0x36]);
+        assert_eq!(encode(|a| a.store8(Reg::R8, Reg::Rax)), vec![0x41, 0x88, 0x00]);
+        assert_eq!(encode(|a| a.store8(Reg::Rsi, Reg::R9)), vec![0x44, 0x88, 0x0E]);
+        assert_eq!(encode(|a| a.store8(Reg::Rbp, Reg::Rdi)), vec![0x40, 0x88, 0x7D, 0x00]);
+    }
+
+    #[test]
+    fn imul_ri() {
+        assert_eq!(
+            encode(|a| a.imul_ri(Reg::Rax, Reg::Rax, 3)),
+            vec![0x48, 0x6B, 0xC0, 0x03]
+        );
+        assert_eq!(
+            encode(|a| a.imul_ri(Reg::Rax, Reg::Rcx, -8)),
+            vec![0x48, 0x6B, 0xC1, 0xF8]
+        );
+        assert_eq!(
+            encode(|a| a.imul_ri(Reg::Rax, Reg::Rax, 1000)),
+            vec![0x48, 0x69, 0xC0, 0xE8, 0x03, 0x00, 0x00]
+        );
+        assert_eq!(
+            encode(|a| a.imul_ri(Reg::R8, Reg::R9, 127)),
+            vec![0x4D, 0x6B, 0xC1, 0x7F]
+        );
+        assert_eq!(
+            encode(|a| a.imul_ri(Reg::Rax, Reg::R12, 128)),
+            vec![0x49, 0x69, 0xC4, 0x80, 0x00, 0x00, 0x00]
+        );
+    }
+
+    #[test]
+    fn zero_and_test() {
+        assert_eq!(encode(|a| a.zero(Reg::Rax)), vec![0x31, 0xC0]);
+        assert_eq!(encode(|a| a.zero(Reg::R8)), vec![0x45, 0x31, 0xC0]);
+        assert_eq!(encode(|a| a.test_rr(Reg::Rax, Reg::Rax)), vec![0x48, 0x85, 0xC0]);
+        assert_eq!(encode(|a| a.test_rr(Reg::R8, Reg::Rcx)), vec![0x49, 0x85, 0xC8]);
+    }
+
+    const ALL_CONDS: [Cond; 10] = [
+        Cond::O, Cond::NO, Cond::E, Cond::NE, Cond::S,
+        Cond::NS, Cond::L, Cond::GE, Cond::LE, Cond::G,
+    ];
+
+    #[test]
+    fn cond_negate_flips_low_bit() {
+        for c in ALL_CONDS {
+            assert_eq!(c.negate() as u8, c as u8 ^ 1, "{c:?}");
+            assert_eq!(c.negate().negate(), c);
+        }
+    }
+
+    #[test]
+    fn cond_swap() {
+        use Cond::*;
+        for (c, s) in [(L, G), (G, L), (LE, GE), (GE, LE), (E, E), (NE, NE)] {
+            assert_eq!(c.swap(), s, "{c:?}");
+            assert_eq!(c.swap().swap(), c);
+        }
     }
 }

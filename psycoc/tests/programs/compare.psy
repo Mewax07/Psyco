@@ -1,0 +1,23 @@
+// Les 6 comparaisons en contexte valeur : var/var, var/imm, imm/var, zéro, imm64, bool.
+fn main() {
+    let a = 3
+    let b = 5
+    let n = -4
+    let t = true
+    print(a < b, a <= b, a > b, a >= b, a == b, a != b)
+    print(a < 3, a <= 3, a > 3, a >= 3, a == 3, a != 3)
+    print(3 < a, 3 <= a, 4 > a, 2 >= a, 3 == a, 3 != a)
+    print(n < 0, n <= 0, n > 0, n >= 0, n == 0, n != 0)
+    print(0 < n, 0 > n, 0 == a)
+    print(a < 5000000000, 5000000000 < a, a == 5000000000)
+    print(t == true, t == false, t != true, true == t, false != t)
+    print(!(a < b), !t, !!t)
+}
+//> true true false false false true
+//> false true false true true false
+//> false true true false true false
+//> true true false false false true
+//> false true false
+//> true false false
+//> true false false true true
+//> false false true

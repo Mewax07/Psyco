@@ -1,0 +1,62 @@
+// && / || : court-circuit (effets de bord visibles), en valeur et en branche,
+// imbrications avec ! et mélanges.
+fn t(tag: Str) -> Bool {
+    print(tag)
+    return true
+}
+
+fn f(tag: Str) -> Bool {
+    print(tag)
+    return false
+}
+
+fn main() {
+    print(f("a") && t("b"))
+    print(t("c") && f("d"))
+    print(t("e") || f("g"))
+    print(f("h") || t("i"))
+
+    if f("j") && t("k") { print("never") } else { print("else1") }
+    if t("l") || f("m") { print("then2") }
+    if !(f("n") || f("o")) { print("then3") }
+    if !(t("p") && f("q")) || t("r") { print("then4") }
+    if (f("s") || t("u")) && (t("v") || f("w")) { print("then5") }
+    if f("x") || f("y") || f("z") { print("never") } else { print("else6") }
+
+    let a = 3
+    let b = 8
+    if a < b && b < 10 { print("in range") }
+    if a > b || b == 8 { print("or ok") }
+    print(a < b && b > 100, a > b || b > 7)
+}
+//> a
+//> false
+//> c
+//> d
+//> false
+//> e
+//> true
+//> h
+//> i
+//> true
+//> j
+//> else1
+//> l
+//> then2
+//> n
+//> o
+//> then3
+//> p
+//> q
+//> then4
+//> s
+//> u
+//> v
+//> then5
+//> x
+//> y
+//> z
+//> else6
+//> in range
+//> or ok
+//> false true

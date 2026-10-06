@@ -1,0 +1,11 @@
+// Division par un littéral 0 : l'opérande gauche (avec effet de bord) est évalué avant la panic.
+fn id(x: Int) -> Int {
+    print(x)
+    return x
+}
+
+fn main() {
+    print(id(10) / 0)
+}
+// exit: 101
+//> 10

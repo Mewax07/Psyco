@@ -1,0 +1,7 @@
+fn main() {
+    let z = 0
+    print("before")
+    print(10 / z)
+}
+// exit: 101
+//> before

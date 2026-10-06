@@ -1,0 +1,6 @@
+fn main() {
+    let x = 5000000000000000000
+    let y = 3
+    print(y * x)
+}
+// exit: 101

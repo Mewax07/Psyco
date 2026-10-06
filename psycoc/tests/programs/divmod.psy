@@ -1,0 +1,24 @@
+// Division et modulo : troncature vers zéro, par constante et par variable.
+fn main() {
+    let a = 7
+    let b = -7
+    let two = 2
+    let mtwo = -2
+    let mone = -1
+    print(a / 2, a % 2, b / 2, b % 2)
+    print(a / two, a % two, b / two, b % two)
+    print(a / mtwo, a % mtwo, b / mtwo, b % mtwo)
+    print(a / mone, a % mone, b / mone, b % mone)
+    print(a / 1, a % 1, 100 / a, 100 % a)
+    print(a / 3000000000, 9000000000 / a, 9000000000 % a)
+    print(1000000 / 7, 1000000 % 7)
+    print(a / -1, a % -1, b / -1, b % -1, a / -2, b % -3)
+}
+//> 3 1 -3 -1
+//> 3 1 -3 -1
+//> -3 1 3 -1
+//> -7 0 7 0
+//> 7 0 14 2
+//> 0 1285714285 5
+//> 142857 1
+//> -7 0 7 0 -3 -1

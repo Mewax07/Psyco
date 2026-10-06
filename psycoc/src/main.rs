@@ -50,4 +50,12 @@ fn main() {
     };
     let binary = Codegen::new().generate(&program, target);
     fs::write(output, binary).expect("cannot write output");
+
+    #[cfg(unix)]
+    if target == Target::Linux {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = fs::set_permissions(output, fs::Permissions::from_mode(0o755)) {
+            eprintln!("warning: cannot make {output} executable: {e}");
+        }
+    }
 }

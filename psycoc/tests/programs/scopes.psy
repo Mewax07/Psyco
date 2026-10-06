@@ -1,0 +1,23 @@
+// Portées, masquage, affectation, chaînes, print multi-arguments.
+fn main() {
+    let x = 1
+    if true {
+        let x = 2
+        print(x)
+        x = 3
+        print(x)
+    }
+    print(x)
+    let s = "hello"
+    print(s, "world", 42, true)
+    print()
+    print(-9223372036854775807 - 1)
+    print(9223372036854775807)
+}
+//> 2
+//> 3
+//> 1
+//> hello world 42 true
+//>
+//> -9223372036854775808
+//> 9223372036854775807

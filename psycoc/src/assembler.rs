@@ -29,7 +29,7 @@ impl Reg {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Cond {
     O = 0x0,
@@ -42,6 +42,36 @@ pub enum Cond {
     GE = 0xD,
     LE = 0xE,
     G = 0xF,
+}
+
+impl Cond {
+    pub fn negate(self) -> Cond {
+        use Cond::*;
+        match self {
+            O => NO,
+            NO => O,
+            E => NE,
+            NE => E,
+            S => NS,
+            NS => S,
+            L => GE,
+            GE => L,
+            LE => G,
+            G => LE,
+        }
+    }
+
+    pub fn swap(self) -> Cond {
+        use Cond::*;
+        match self {
+            L => G,
+            G => L,
+            LE => GE,
+            GE => LE,
+            E | NE => self,
+            O | NO | S | NS => panic!("ICE: Cond::swap on non-comparison {self:?}"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -124,6 +154,13 @@ impl Assembler {
     fn rex(&mut self, w: bool, reg_ext: u8, rm_ext: u8) {
         let rex = 0x40 | (w as u8) << 3 | reg_ext << 2 | rm_ext;
         if rex != 0x40 {
+            self.byte(rex);
+        }
+    }
+
+    fn rex_byte(&mut self, reg_ext: u8, rm_ext: u8, byte_reg: Reg) {
+        let rex = 0x40 | reg_ext << 2 | rm_ext;
+        if rex != 0x40 || (4..8).contains(&(byte_reg as u8)) {
             self.byte(rex);
         }
     }
@@ -273,7 +310,7 @@ impl Assembler {
     }
 
     pub fn load8(&mut self, dst: Reg, base: Reg) {
-        self.rex(true, dst.ext(), base.ext());
+        self.rex(false, dst.ext(), base.ext());
         self.bytes(&[0x0F, 0xB6]);
         self.modrm_mem(dst as u8, base, 0);
     }
@@ -285,10 +322,7 @@ impl Assembler {
     }
 
     pub fn store8(&mut self, base: Reg, src: Reg) {
-        let rex = 0x40 | src.ext() << 2 | base.ext();
-        if rex != 0x40 || src.low() >= 4 {
-            self.byte(rex);
-        }
+        self.rex_byte(src.ext(), base.ext(), src);
         self.byte(0x88);
         self.modrm_mem(src as u8, base, 0);
     }
@@ -337,6 +371,19 @@ impl Assembler {
         self.modrm_rr(dst as u8, src);
     }
 
+    pub fn imul_ri(&mut self, dst: Reg, src: Reg, imm: i32) {
+        self.rex(true, dst.ext(), src.ext());
+        if let Ok(imm8) = i8::try_from(imm) {
+            self.byte(0x6B);
+            self.modrm_rr(dst as u8, src);
+            self.byte(imm8 as u8);
+        } else {
+            self.byte(0x69);
+            self.modrm_rr(dst as u8, src);
+            self.bytes(&imm.to_le_bytes());
+        }
+    }
+
     fn group_f7(&mut self, digit: u8, r: Reg) {
         self.rex(true, 0, r.ext());
         self.byte(0xF7);
@@ -356,14 +403,13 @@ impl Assembler {
     }
 
     pub fn setcc(&mut self, cc: Cond, dst: Reg) {
-        assert!((dst as u8) < 4, "ICE: setcc only supports al/cl/dl/bl");
+        self.rex_byte(0, dst.ext(), dst);
         self.bytes(&[0x0F, 0x90 + cc as u8]);
         self.modrm_rr(0, dst);
     }
 
     pub fn movzx8(&mut self, dst: Reg, src: Reg) {
-        assert!((src as u8) < 4, "ICE: movzx8 only supports al/cl/dl/bl");
-        self.rex(true, dst.ext(), 0);
+        self.rex_byte(dst.ext(), src.ext(), src);
         self.bytes(&[0x0F, 0xB6]);
         self.modrm_rr(dst as u8, src);
     }

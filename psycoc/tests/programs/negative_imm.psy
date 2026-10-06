@@ -1,0 +1,15 @@
+// Immédiats négatifs (actifs une fois foldés) et `k - x` aux limites.
+fn main() {
+    let x = 10
+    let min = -9223372036854775807 - 1
+    print(x + -3, x - -3, x * -3, -3 * x, -3 - x)
+    print(x < -1, -1 < x, x == -10, -10 != x)
+    print(-1 - min)
+    print(0 - x, -3000000000 - x, x * -3000000000)
+    if -5 < x && x < -1 { print("never") } else { print("ok") }
+}
+//> 7 13 -30 -30 -13
+//> false true false true
+//> 9223372036854775807
+//> -10 -3000000010 -30000000000
+//> ok

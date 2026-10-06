@@ -1,0 +1,59 @@
+// Les mêmes comparaisons en contexte de branchement (if/else, else if, if sans else).
+fn check(x: Int) {
+    if x < 0 {
+        print("neg")
+    } else if x == 0 {
+        print("zero")
+    } else if 10 <= x {
+        print("big")
+    } else {
+        print("small")
+    }
+}
+
+fn main() {
+    check(-3)
+    check(0)
+    check(4)
+    check(10)
+    check(11)
+
+    let x = 5
+    if x != 5 {
+        print("never")
+    }
+    if x >= 5 {
+        print("ge")
+    }
+    if 5 > x {
+        print("never")
+    }
+    if !(x > 7) {
+        print("not gt")
+    }
+    if true {
+        print("lit true")
+    }
+    if false {
+        print("never")
+    } else {
+        print("lit false")
+    }
+    let flag = x == 5
+    if flag {
+        print("flag")
+    }
+    if !flag {
+        print("never")
+    }
+}
+//> neg
+//> zero
+//> small
+//> big
+//> big
+//> ge
+//> not gt
+//> lit true
+//> lit false
+//> flag

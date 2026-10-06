@@ -1,0 +1,5 @@
+fn main() {
+    let x = 10
+    print(x % 0)
+}
+// exit: 101

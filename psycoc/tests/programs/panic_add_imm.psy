@@ -1,0 +1,9 @@
+// Overflow sur le chemin immédiat : le `jo` doit rester.
+fn main() {
+    let x = 9223372036854775807
+    print("before")
+    print(x + 1)
+    print("never")
+}
+// exit: 101
+//> before

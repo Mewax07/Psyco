@@ -1,0 +1,6 @@
+fn main() {
+    let x = -9223372036854775807
+    let y = 2
+    print(x - y)
+}
+// exit: 101

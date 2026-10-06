@@ -1,0 +1,26 @@
+// Arithmétique, priorités, immédiats imm8/imm32/imm64, constante à gauche.
+fn main() {
+    let x = 7
+    let big = 3000000000
+    print(1 + 2 * 3)
+    print((1 + 2) * 3)
+    print(x + 1, x - 1, x * 3)
+    print(1 + x, 10 - x, 3 * x)
+    print(x + 1000, x - 1000, x * 1000)
+    print(x + big, x - big, x * big)
+    print(big + x, big - x, big * x)
+    print(x - x, 0 - x, -x)
+    print(x * 0, 0 * x, x + 0)
+    let z = 0
+    print(z, z + 1, z - 1)
+}
+//> 7
+//> 9
+//> 8 6 21
+//> 8 3 21
+//> 1007 -993 7000
+//> 3000000007 -2999999993 21000000000
+//> 3000000007 2999999993 21000000000
+//> 0 -7 -7
+//> 0 0 7
+//> 0 1 -1
