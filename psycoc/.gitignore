@@ -1,0 +1,9 @@
+/target
+
+# local test with wsl
+*.efi
+*.fd
+*.ld
+*.out
+*.o
+esp

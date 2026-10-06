@@ -1,0 +1,4 @@
+fn main() {
+    let z = 0
+    print(10 / z)
+}
