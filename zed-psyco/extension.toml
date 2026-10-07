@@ -1,0 +1,14 @@
+id = "psyco"
+name = "Psyco"
+version = "0.1.0"
+schema_version = 1
+authors = ["Mewax07"]
+description = "Language support for Psyco"
+
+[grammars.psyco]
+repository = "https://github.com/Mewax07/psyco-tree-sitter"
+commit = "f2302f47c6614eb5178efa5b2ed4ebacb62379d6"
+
+[language_servers.psyco-lsp]
+name = "Psyco LSP"
+languages = ["Psyco"]

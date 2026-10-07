@@ -1,6 +1,5 @@
-// while : somme, zéro itération, boucles imbriquées, condition composée, return dans la boucle.
 fn first_multiple(n: Int, k: Int) -> Int {
-    let i = 1
+    let mut i = 1
     while true {
         if i % k == 0 && i >= n {
             return i
@@ -11,8 +10,8 @@ fn first_multiple(n: Int, k: Int) -> Int {
 }
 
 fn main() {
-    let i = 1
-    let sum = 0
+    let mut i = 1
+    let mut sum = 0
     while i <= 10 {
         sum = sum + i
         i = i + 1
@@ -27,10 +26,10 @@ fn main() {
         print("never")
     }
 
-    let row = 0
+    let mut row = 0
     while row < 3 {
-        let col = 0
-        let line = 0
+        let mut col = 0
+        let mut line = 0
         while col < 4 {
             line = line * 10 + col + row
             col = col + 1
@@ -39,15 +38,15 @@ fn main() {
         row = row + 1
     }
 
-    let a = 0
-    let b = 10
+    let mut a = 0
+    let mut b = 10
     while a < 5 && b > 7 {
         a = a + 1
         b = b - 1
     }
     print(a, b)
 
-    let k = 10
+    let mut k = 10
     while !(k == 0) {
         k = k - 3
         if k < 0 { k = 0 }
@@ -56,6 +55,7 @@ fn main() {
 
     print(first_multiple(20, 7))
 }
+
 //> 55 11
 //> 123
 //> 1234

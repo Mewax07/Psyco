@@ -3,4 +3,5 @@ fn main() {
     let y = 3
     print(y * x)
 }
+
 // exit: 101

@@ -34,8 +34,12 @@ impl Reg {
 pub enum Cond {
     O = 0x0,
     NO = 0x1,
+    B = 0x2,
+    AE = 0x3,
     E = 0x4,
     NE = 0x5,
+    BE = 0x6,
+    A = 0x7,
     S = 0x8,
     NS = 0x9,
     L = 0xC,
@@ -50,8 +54,12 @@ impl Cond {
         match self {
             O => NO,
             NO => O,
+            B => AE,
+            AE => B,
             E => NE,
             NE => E,
+            BE => A,
+            A => BE,
             S => NS,
             NS => S,
             L => GE,
@@ -68,6 +76,10 @@ impl Cond {
             G => L,
             LE => GE,
             GE => LE,
+            B => A,
+            A => B,
+            BE => AE,
+            AE => BE,
             E | NE => self,
             O | NO | S | NS => panic!("ICE: Cond::swap on non-comparison {self:?}"),
         }
@@ -108,15 +120,48 @@ impl Alu {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum Shift {
+    Shl,
+    Shr,
+    Sar,
+}
+
+impl Shift {
+    fn digit(self) -> u8 {
+        match self {
+            Shift::Shl => 4,
+            Shift::Shr => 5,
+            Shift::Sar => 7,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum Sreg {
+    Es = 0,
+    Ss = 2,
+    Ds = 3,
+    Fs = 4,
+    Gs = 5,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Label(usize);
 
 #[derive(Debug, Clone, Copy)]
 pub struct DataLabel(usize);
 
+#[derive(Debug, Clone, Copy)]
+pub enum RwLabel {
+    Data(usize),
+    Bss(usize),
+}
+
 enum Target {
     Code(Label),
     Data(DataLabel),
+    Rw(RwLabel),
 }
 
 struct Fixup {
@@ -127,8 +172,16 @@ struct Fixup {
 pub struct Assembler {
     pub code: Vec<u8>,
     pub rodata: Vec<u8>,
+    pub data: Vec<u8>,
+    pub bss_size: usize,
     labels: Vec<Option<usize>>,
     fixups: Vec<Fixup>,
+}
+
+impl Default for Assembler {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Assembler {
@@ -136,6 +189,8 @@ impl Assembler {
         Self {
             code: Vec::new(),
             rodata: Vec::new(),
+            data: Vec::new(),
+            bss_size: 0,
             labels: Vec::new(),
             fixups: Vec::new(),
         }
@@ -190,6 +245,14 @@ impl Assembler {
         }
     }
 
+    pub fn pos(&self) -> usize {
+        self.code.len()
+    }
+
+    pub fn patch_i32(&mut self, pos: usize, value: i32) {
+        self.code[pos..pos + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
     /// Labels & Data
 
     pub fn new_label(&mut self) -> Label {
@@ -206,6 +269,15 @@ impl Assembler {
         self.labels[label.0].expect("ICE: label never bound")
     }
 
+    pub fn data_aligned(&mut self, bytes: &[u8], align: usize) -> DataLabel {
+        while self.rodata.len() % align.max(1) != 0 {
+            self.rodata.push(0);
+        }
+        let offset = self.rodata.len();
+        self.rodata.extend_from_slice(bytes);
+        DataLabel(offset)
+    }
+
     pub fn data(&mut self, bytes: &[u8]) -> DataLabel {
         while self.rodata.len() % 8 != 0 {
             self.rodata.push(0);
@@ -215,10 +287,39 @@ impl Assembler {
         DataLabel(offset)
     }
 
-    pub fn data_str(&mut self, s: &str) -> DataLabel {
+    pub fn data_str(&mut self, s: &[u8]) -> DataLabel {
         let mut bytes = (s.len() as u64).to_le_bytes().to_vec();
-        bytes.extend_from_slice(s.as_bytes());
+        bytes.extend_from_slice(s);
         self.data(&bytes)
+    }
+
+    pub fn rw_data(&mut self, bytes: &[u8], align: usize) -> RwLabel {
+        while self.data.len() % align.max(1) != 0 {
+            self.data.push(0);
+        }
+        let offset = self.data.len();
+        self.data.extend_from_slice(bytes);
+        RwLabel::Data(offset)
+    }
+
+    pub fn bss(&mut self, size: usize, align: usize) -> RwLabel {
+        assert!(align <= 4096usize, "ICE: bss alignment too large");
+        self.bss_size = self.bss_size.next_multiple_of(align.max(1));
+        let offset = self.bss_size;
+        self.bss_size += size;
+        RwLabel::Bss(offset)
+    }
+
+    pub fn bss_offset(&self) -> usize {
+        self.data.len().next_multiple_of(4096usize)
+    }
+
+    pub fn rw_size(&self) -> usize {
+        if self.bss_size == 0 {
+            self.data.len()
+        } else {
+            self.bss_offset() + self.bss_size
+        }
     }
 
     fn rel32(&mut self, target: Target) {
@@ -229,13 +330,16 @@ impl Assembler {
         self.bytes(&[0; 4]); // fix in link()
     }
 
-    pub fn link(&mut self, code_addr: u64, rodata_addr: u64) {
+    pub fn link(&mut self, code_addr: u64, rodata_addr: u64, data_addr: u64) {
+        let bss_addr = data_addr + self.bss_offset() as u64;
         for fixup in &self.fixups {
             let target = match &fixup.target {
                 Target::Code(l) => {
                     code_addr + self.labels[l.0].expect("ICE: label never bound") as u64
                 }
                 Target::Data(d) => rodata_addr + d.0 as u64,
+                Target::Rw(RwLabel::Data(o)) => data_addr + *o as u64,
+                Target::Rw(RwLabel::Bss(o)) => bss_addr + *o as u64,
             };
             let next_ip = code_addr + fixup.pos as u64 + 4;
             let rel = i32::try_from(target as i64 - next_ip as i64).expect("ICE: jump too far");
@@ -250,6 +354,11 @@ impl Assembler {
         self.byte(0x50 + r.low());
     }
 
+    pub fn push_imm(&mut self, imm: i32) {
+        self.byte(0x68);
+        self.bytes(&imm.to_le_bytes());
+    }
+
     pub fn pop(&mut self, r: Reg) {
         self.rex(false, 0, r.ext());
         self.byte(0x58 + r.low());
@@ -259,12 +368,25 @@ impl Assembler {
         self.byte(0xC3);
     }
 
-    pub fn syscall(&mut self) {
-        self.bytes(&[0x0F, 0x05]);
+    pub fn jmp(&mut self, label: Label) {
+        self.byte(0xE9);
+        self.rel32(Target::Code(label))
     }
 
-    pub fn cqo(&mut self) {
-        self.bytes(&[0x48, 0x99]);
+    pub fn jcc(&mut self, cc: Cond, label: Label) {
+        self.bytes(&[0x0F, 0x80 + cc as u8]);
+        self.rel32(Target::Code(label));
+    }
+
+    pub fn call(&mut self, label: Label) {
+        self.byte(0xE8);
+        self.rel32(Target::Code(label));
+    }
+
+    pub fn call_r(&mut self, r: Reg) {
+        self.rex(false, 0, r.ext());
+        self.byte(0xFF);
+        self.modrm_rr(2, r);
     }
 
     pub fn mov_rr(&mut self, dst: Reg, src: Reg) {
@@ -315,6 +437,41 @@ impl Assembler {
         self.modrm_mem(dst as u8, base, 0);
     }
 
+    pub fn load_sized(&mut self, dst: Reg, base: Reg, disp: i32, size: u64, signed: bool) {
+        match (size, signed) {
+            (1, false) => {
+                self.rex(false, dst.ext(), base.ext());
+                self.bytes(&[0x0F, 0xB6]);
+            }
+            (1, true) => {
+                self.rex(true, dst.ext(), base.ext());
+                self.bytes(&[0x0F, 0xBE]);
+            }
+            (2, false) => {
+                self.rex(false, dst.ext(), base.ext());
+                self.bytes(&[0x0F, 0xB7]);
+            }
+            (2, true) => {
+                self.rex(true, dst.ext(), base.ext());
+                self.bytes(&[0x0F, 0xBF]);
+            }
+            (4, false) => {
+                self.rex(false, dst.ext(), base.ext());
+                self.byte(0x8B);
+            }
+            (4, true) => {
+                self.rex(true, dst.ext(), base.ext());
+                self.byte(0x63); // movsxd
+            }
+            (8, _) => {
+                self.rex(true, dst.ext(), base.ext());
+                self.byte(0x8B);
+            }
+            _ => panic!("ICE: load of size {size}"),
+        }
+        self.modrm_mem(dst as u8, base, disp);
+    }
+
     pub fn store(&mut self, base: Reg, disp: i32, src: Reg) {
         self.rex(true, src.ext(), base.ext());
         self.byte(0x89);
@@ -325,6 +482,65 @@ impl Assembler {
         self.rex_byte(src.ext(), base.ext(), src);
         self.byte(0x88);
         self.modrm_mem(src as u8, base, 0);
+    }
+
+    pub fn store_sized(&mut self, base: Reg, disp: i32, src: Reg, size: u64) {
+        match size {
+            1 => {
+                self.rex_byte(src.ext(), base.ext(), src);
+                self.byte(0x88);
+            }
+            2 => {
+                self.byte(0x66);
+                self.rex(false, src.ext(), base.ext());
+                self.byte(0x89);
+            }
+            4 => {
+                self.rex(false, src.ext(), base.ext());
+                self.byte(0x89);
+            }
+            8 => {
+                self.rex(true, src.ext(), base.ext());
+                self.byte(0x89);
+            }
+            _ => panic!("ICE: store of size {size}"),
+        }
+        self.modrm_mem(src as u8, base, disp);
+    }
+
+    pub fn extend(&mut self, r: Reg, size: u64, signed: bool) {
+        match (size, signed) {
+            (1, false) => self.movzx8(r, r),
+            (1, true) => {
+                // movsx r64, r8
+                self.rex(true, r.ext(), r.ext());
+                self.bytes(&[0x0F, 0xBE]);
+                self.modrm_rr(r as u8, r);
+            }
+            (2, false) => {
+                self.rex(false, r.ext(), r.ext());
+                self.bytes(&[0x0F, 0xB7]);
+                self.modrm_rr(r as u8, r);
+            }
+            (2, true) => {
+                self.rex(true, r.ext(), r.ext());
+                self.bytes(&[0x0F, 0xBF]);
+                self.modrm_rr(r as u8, r);
+            }
+            (4, false) => {
+                // mov r32, r32
+                self.rex(false, r.ext(), r.ext());
+                self.byte(0x89);
+                self.modrm_rr(r as u8, r);
+            }
+            (4, true) => {
+                self.rex(true, r.ext(), r.ext());
+                self.byte(0x63);
+                self.modrm_rr(r as u8, r);
+            }
+            (8, _) => {}
+            _ => panic!("ICE: extend to size {size}"),
+        }
     }
 
     pub fn lea(&mut self, dst: Reg, base: Reg, disp: i32) {
@@ -338,6 +554,20 @@ impl Assembler {
         self.byte(0x8D);
         self.byte(0b00 << 6 | dst.low() << 3 | 0b101);
         self.rel32(Target::Data(data));
+    }
+
+    pub fn lea_rw(&mut self, dst: Reg, data: RwLabel) {
+        self.rex(true, dst.ext(), 0);
+        self.byte(0x8D);
+        self.byte(dst.low() << 3 | 0b101);
+        self.rel32(Target::Rw(data));
+    }
+
+    pub fn lea_code(&mut self, dst: Reg, label: Label) {
+        self.rex(true, dst.ext(), 0);
+        self.byte(0x8D);
+        self.byte(dst.low() << 3 | 0b101);
+        self.rel32(Target::Code(label));
     }
 
     pub fn alu_rr(&mut self, op: Alu, dst: Reg, src: Reg) {
@@ -390,8 +620,16 @@ impl Assembler {
         self.modrm_rr(digit, r);
     }
 
+    pub fn not(&mut self, r: Reg) {
+        self.group_f7(2, r);
+    }
+
     pub fn neg(&mut self, r: Reg) {
         self.group_f7(3, r);
+    }
+
+    pub fn mul(&mut self, r: Reg) {
+        self.group_f7(4, r);
     }
 
     pub fn div(&mut self, r: Reg) {
@@ -402,6 +640,42 @@ impl Assembler {
         self.group_f7(7, r);
     }
 
+    pub fn sub_rsp_placeholder(&mut self) -> usize {
+        self.bytes(&[0x48, 0x81, 0xEC]);
+        let pos = self.pos();
+        self.bytes(&[0; 4]);
+        pos
+    }
+
+    /// `xchg rax, r`
+    pub fn xchg_rax(&mut self, r: Reg) {
+        self.rex(true, 0, r.ext());
+        self.byte(0x90 + r.low());
+    }
+
+    pub fn cqo(&mut self) {
+        self.bytes(&[0x48, 0x99]);
+    }
+
+    pub fn shift_cl(&mut self, op: Shift, r: Reg) {
+        self.rex(true, 0, r.ext());
+        self.byte(0xD3);
+        self.modrm_rr(op.digit(), r);
+    }
+
+    pub fn shift_ri(&mut self, op: Shift, r: Reg, count: u8) {
+        self.rex(true, 0, r.ext());
+        if count == 1 {
+            self.byte(0xD1);
+            self.modrm_rr(op.digit(), r);
+        } else {
+            self.byte(0xC1);
+            self.modrm_rr(op.digit(), r);
+            self.byte(count);
+        }
+    }
+
+    /// `setcc r8`
     pub fn setcc(&mut self, cc: Cond, dst: Reg) {
         self.rex_byte(0, dst.ext(), dst);
         self.bytes(&[0x0F, 0x90 + cc as u8]);
@@ -414,12 +688,42 @@ impl Assembler {
         self.modrm_rr(dst as u8, src);
     }
 
+    /// `rep movsb`
+    pub fn rep_movsb(&mut self) {
+        self.bytes(&[0xF3, 0xA4]);
+    }
+
+    /// `rep stosb`
+    pub fn rep_stosb(&mut self) {
+        self.bytes(&[0xF3, 0xAA]);
+    }
+
+    pub fn cld(&mut self) {
+        self.byte(0xFC);
+    }
+
+    pub fn syscall(&mut self) {
+        self.bytes(&[0x0F, 0x05]);
+    }
+
     pub fn in_al_dx(&mut self) {
         self.byte(0xEC);
     }
 
+    pub fn in_ax_dx(&mut self) {
+        self.bytes(&[0x66, 0xED]);
+    }
+
+    pub fn in_eax_dx(&mut self) {
+        self.byte(0xED);
+    }
+
     pub fn out_dx_al(&mut self) {
         self.byte(0xEE);
+    }
+
+    pub fn out_dx_ax(&mut self) {
+        self.bytes(&[0x66, 0xEF]);
     }
 
     pub fn out_dx_eax(&mut self) {
@@ -434,18 +738,85 @@ impl Assembler {
         self.byte(0xFA);
     }
 
-    pub fn jmp(&mut self, label: Label) {
-        self.byte(0xE9);
-        self.rel32(Target::Code(label))
+    pub fn sti(&mut self) {
+        self.byte(0xFB);
     }
 
-    pub fn jcc(&mut self, cc: Cond, label: Label) {
-        self.bytes(&[0x0F, 0x80 + cc as u8]);
-        self.rel32(Target::Code(label));
+    pub fn pause(&mut self) {
+        self.bytes(&[0xF3, 0x90]);
     }
 
-    pub fn call(&mut self, label: Label) {
-        self.byte(0xE8);
-        self.rel32(Target::Code(label));
+    pub fn int3(&mut self) {
+        self.byte(0xCC);
+    }
+
+    pub fn iretq(&mut self) {
+        self.bytes(&[0x48, 0xCF]);
+    }
+
+    /// `retfq`
+    pub fn retfq(&mut self) {
+        self.bytes(&[0x48, 0xCB]);
+    }
+
+    /// `lgdt [r]`
+    pub fn lgdt(&mut self, r: Reg) {
+        self.rex(false, 0, r.ext());
+        self.bytes(&[0x0F, 0x01]);
+        self.modrm_mem(2, r, 0);
+    }
+
+    /// `lidt [r]`
+    pub fn lidt(&mut self, r: Reg) {
+        self.rex(false, 0, r.ext());
+        self.bytes(&[0x0F, 0x01]);
+        self.modrm_mem(3, r, 0);
+    }
+
+    /// `invlpg [r]`
+    pub fn invlpg(&mut self, r: Reg) {
+        self.rex(false, 0, r.ext());
+        self.bytes(&[0x0F, 0x01]);
+        self.modrm_mem(7, r, 0);
+    }
+
+    /// `mov dst, crN`
+    pub fn mov_from_cr(&mut self, dst: Reg, cr: u8) {
+        self.rex(false, 0, dst.ext());
+        self.bytes(&[0x0F, 0x20]);
+        self.modrm_rr(cr, dst);
+    }
+
+    /// `mov crN, src`
+    pub fn mov_to_cr(&mut self, cr: u8, src: Reg) {
+        self.rex(false, 0, src.ext());
+        self.bytes(&[0x0F, 0x22]);
+        self.modrm_rr(cr, src);
+    }
+
+    /// `mov sreg, ax`
+    pub fn mov_sreg(&mut self, sreg: Sreg, src: Reg) {
+        self.rex(false, 0, src.ext());
+        self.byte(0x8E);
+        self.modrm_rr(sreg as u8, src);
+    }
+
+    /// `ltr r16`
+    pub fn ltr(&mut self, src: Reg) {
+        self.rex(false, 0, src.ext());
+        self.bytes(&[0x0F, 0x00]);
+        self.modrm_rr(3, src);
+    }
+
+    pub fn rdmsr(&mut self) {
+        self.bytes(&[0x0F, 0x32]);
+    }
+
+    pub fn wrmsr(&mut self) {
+        self.bytes(&[0x0F, 0x30]);
+    }
+
+    pub fn rdtsc(&mut self) {
+        self.bytes(&[0x0F, 0x31]);
     }
 }

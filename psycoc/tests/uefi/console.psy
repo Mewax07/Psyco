@@ -1,0 +1,80 @@
+import "../../../psycos/src/console.psy"
+
+fn cell_is(col: usize, row: usize, c: u8, fg: u32, bg: u32) -> bool {
+    for y in 0..font_h {
+        let bits = font[c as usize * font_h + y]
+        for x in 0..font_w {
+            let mut want = bg
+            if bits & (0x80u8 >> x as u8) != 0 { want = fg }
+            if get_pixel(col * font_w + x, row * font_h + y) != want { return false }
+        }
+    }
+    return true
+}
+
+fn main() {
+    efi_init()
+    con_init(fb_init())
+    print("grid ok:", con_columns() == fb_width() / 8, con_lines() == fb_height() / 16)
+
+    puts("hello\n")
+    print("pos:", cursor_x(), cursor_y())
+    print("glyph:", cell_is(0, 0, 'h', gray, black), cell_is(4, 0, 'o', gray, black))
+
+    set_colors(red, blue)
+    puts("Z\n")
+    print("colors:", cell_is(0, 1, 'Z', red, blue))
+    set_colors(gray, black)
+
+    put_u64(0)
+    putc(' ')
+    put_u64(18446744073709551615)
+    putc(' ')
+    put_i64(-9223372036854775807 - 1)
+    putc(' ')
+    put_hex(0)
+    putc(' ')
+    put_hex(0xDEADBEEF)
+    putc(' ')
+    put_hex_width(0x2A, 4)
+    putc('\n')
+
+    con_set_mirror(false)
+
+    clear()
+    for i in 0..con_columns() {
+        putc('w')
+    }
+    print("wrap:", cursor_x(), cursor_y(), cell_is(con_columns() - 1, 0, 'w', gray, black))
+
+    clear()
+    puts("a\tb")
+    print("tab:", cursor_x(), cell_is(8, 0, 'b', gray, black))
+    putc(8)
+    putc(' ')
+    putc(8)
+    putc('x')
+    print("backspace:", cursor_x(), cell_is(8, 0, 'x', gray, black), cell_is(7, 0, ' ', gray, black))
+
+    clear()
+    let rows = con_lines()
+    for i in 0..rows + 1 {
+        putc('A' + (i % 26) as u8)
+        putc('\n')
+    }
+    print("scroll:", cursor_y() == rows - 1, cell_is(0, 0, 'C', gray, black), cell_is(0, rows - 2, 'A' + (rows % 26) as u8, gray, black))
+    exit(12)
+}
+
+//> grid ok: true true
+//> hello
+//> pos: 0 1
+//> glyph: true true
+//> Z
+//> colors: true
+//> 0 18446744073709551615 -9223372036854775808 0 DEADBEEF 002A
+//> wrap: 0 1 true
+//> tab: 9 true
+//> backspace: 9 true true
+//> scroll: true true true
+// exit: 12

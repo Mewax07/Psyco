@@ -1,0 +1,24 @@
+#![trusted]
+
+const COM1: u16 = 0x3F8
+
+fn serial_putc(c: u8) {
+    if c == '\n' {
+        serial_raw('\r')
+    }
+    serial_raw(c)
+}
+
+fn serial_raw(c: u8) {
+    while inb(COM1 + 5) & 0x20 == 0 {
+        pause()
+    }
+    outb(COM1, c)
+}
+
+fn serial_poll() -> i32 {
+    if inb(COM1 + 5) & 0x01 == 0 {
+        return -1
+    }
+    return inb(COM1) as i32
+}

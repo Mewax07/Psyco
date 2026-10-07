@@ -1,0 +1,59 @@
+#![trusted]
+
+fn ps2_wait_write() -> bool {
+    for i in 0..100000 {
+        if inb(0x64) & 0x02 == 0 {
+            return true
+        }
+        pause()
+    }
+    return false
+}
+
+fn ps2_wait_read() -> bool {
+    for i in 0..100000 {
+        if inb(0x64) & 0x01 != 0 {
+            return true
+        }
+        pause()
+    }
+    return false
+}
+
+fn ps2_init() -> bool {
+    if inb(0x64) == 0xFF {
+        return false
+    }
+    for i in 0..32 {
+        if inb(0x64) & 0x01 == 0 {
+            break
+        }
+        inb(0x60)
+    }
+    if !ps2_wait_write() {
+        return false
+    }
+    outb(0x64, 0x20)
+    if !ps2_wait_read() {
+        return false
+    }
+    let config = inb(0x60)
+    let wanted = (config & 0xFC) | 0x40
+    if !ps2_wait_write() {
+        return false
+    }
+    outb(0x64, 0x60)
+    if !ps2_wait_write() {
+        return false
+    }
+    outb(0x60, wanted)
+    return true
+}
+
+fn ps2_poll() -> i32 {
+    let status = inb(0x64)
+    if status & 0x01 == 0 { return -1 }
+    let data = inb(0x60)
+    if status & 0x20 != 0 { return -1 }
+    return data as i32
+}

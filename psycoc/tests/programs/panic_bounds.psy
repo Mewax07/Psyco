@@ -1,0 +1,10 @@
+fn get(s: &[u8], i: usize) -> u8 { return s[i] }
+
+fn main() {
+    let a = [1u8, 2, 3]
+    print(get(&a, 2))
+    print(get(&a, 3))
+}
+
+// exit: 101
+//> 3

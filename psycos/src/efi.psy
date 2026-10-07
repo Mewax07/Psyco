@@ -1,0 +1,270 @@
+#![trusted]
+
+struct TableHeader {
+    signature: u64,
+    revision: u32,
+    header_size: u32,
+    crc32: u32,
+    reserved: u32,
+}
+
+struct InputKey {
+    scan_code: u16,
+    unicode_char: u16,
+}
+
+struct SimpleTextInput {
+    reset: extern fn(*mut SimpleTextInput, bool) -> u64,
+    read_key_stroke: extern fn(*mut SimpleTextInput, *mut InputKey) -> u64,
+    wait_for_key: *mut u8,
+}
+
+struct SimpleTextOutput {
+    reset: extern fn(*mut SimpleTextOutput, bool) -> u64,
+    output_string: extern fn(*mut SimpleTextOutput, *const u16) -> u64,
+    test_string: *mut u8,
+    query_mode: *mut u8,
+    set_mode: *mut u8,
+    set_attribute: extern fn(*mut SimpleTextOutput, usize) -> u64,
+    clear_screen: extern fn(*mut SimpleTextOutput) -> u64,
+}
+
+struct Time {
+    year: u16,
+    month: u8,
+    day: u8,
+    hour: u8,
+    minute: u8,
+    second: u8,
+    pad1: u8,
+    nanosecond: u32,
+    time_zone: i16,
+    daylight: u8,
+    pad2: u8,
+}
+
+struct RuntimeServices {
+    hdr: TableHeader,
+    get_time: extern fn(*mut Time, *mut u8) -> u64,
+    set_time: *mut u8,
+    get_wakeup_time: *mut u8,
+    set_wakeup_time: *mut u8,
+    set_virtual_address_map: *mut u8,
+    convert_pointer: *mut u8,
+    get_variable: *mut u8,
+    get_next_variable_name: *mut u8,
+    set_variable: *mut u8,
+    get_next_high_monotonic_count: *mut u8,
+    reset_system: extern fn(u32, u64, usize, *const u8),
+}
+
+struct MemoryDescriptor {
+    kind: u32,
+    pad: u32,
+    physical_start: u64,
+    virtual_start: u64,
+    number_of_pages: u64,
+    attribute: u64,
+}
+
+struct BootServices {
+    hdr: TableHeader,
+    raise_tpl: *mut u8,
+    restore_tpl: *mut u8,
+    allocate_pages: *mut u8,
+    free_pages: *mut u8,
+    get_memory_map: extern fn(*mut usize, *mut u8, *mut usize, *mut usize, *mut u32) -> u64,
+    allocate_pool: *mut u8,
+    free_pool: *mut u8,
+    create_event: *mut u8,
+    set_timer: *mut u8,
+    wait_for_event: extern fn(usize, *mut *mut u8, *mut usize) -> u64,
+    signal_event: *mut u8,
+    close_event: *mut u8,
+    check_event: *mut u8,
+    install_protocol_interface: *mut u8,
+    reinstall_protocol_interface: *mut u8,
+    uninstall_protocol_interface: *mut u8,
+    handle_protocol: *mut u8,
+    reserved: *mut u8,
+    register_protocol_notify: *mut u8,
+    locate_handle: *mut u8,
+    locate_device_path: *mut u8,
+    install_configuration_table: *mut u8,
+    load_image: *mut u8,
+    start_image: *mut u8,
+    exit: *mut u8,
+    unload_image: *mut u8,
+    exit_boot_services: extern fn(*mut u8, usize) -> u64,
+    get_next_monotonic_count: *mut u8,
+    stall: *mut u8,
+    set_watchdog_timer: extern fn(usize, u64, usize, *const u16) -> u64,
+    connect_controller: *mut u8,
+    disconnect_controller: *mut u8,
+    open_protocol: *mut u8,
+    close_protocol: *mut u8,
+    open_protocol_information: *mut u8,
+    protocols_per_handle: *mut u8,
+    locate_handle_buffer: *mut u8,
+    locate_protocol: extern fn(*const Guid, *mut u8, *mut *mut u8) -> u64,
+}
+
+struct Guid {
+    d1: u32,
+    d2: u16,
+    d3: u16,
+    d4: [u8; 8],
+}
+
+struct SystemTable {
+    hdr: TableHeader,
+    firmware_vendor: *const u16,
+    firmware_revision: u32,
+    console_in_handle: *mut u8,
+    con_in: *mut SimpleTextInput,
+    console_out_handle: *mut u8,
+    con_out: *mut SimpleTextOutput,
+    standard_error_handle: *mut u8,
+    std_err: *mut SimpleTextOutput,
+    runtime_services: *mut RuntimeServices,
+    boot_services: *mut BootServices,
+}
+
+static mut st: *mut SystemTable
+static mut map: [u8; 16384]
+static mut map_size: usize = 0
+static mut map_desc_size: usize = 0
+static mut boot_services_done: bool = false
+
+struct MemRegion {
+    kind: u32,
+    start: u64,
+    pages: u64,
+}
+
+fn efi_init() {
+    st = efi_system_table() as *mut SystemTable
+    let bs = (*st).boot_services
+    (*bs).set_watchdog_timer(0, 0, 0, 0 as *const u16)
+}
+
+fn read_memory_map() -> i64 {
+    let bs = (*st).boot_services
+    let mut size: usize = map.len()
+    let mut key: usize = 0
+    let mut desc_size: usize = 0
+    let mut version: u32 = 0
+    let status = (*bs).get_memory_map(&mut size as *mut usize, map.as_mut_ptr(), &mut key as *mut usize, &mut desc_size as *mut usize, &mut version as *mut u32)
+    if status != 0 || desc_size < sizeof(MemoryDescriptor) {
+        map_size = 0
+        return -1
+    }
+    map_size = size
+    map_desc_size = desc_size
+    return key as i64
+}
+
+fn exit_boot_services() -> bool {
+    if boot_services_done {
+        return true
+    }
+    let bs = (*st).boot_services
+    let image = efi_image_handle()
+    for attempt in 0..8 {
+        let key = read_memory_map()
+        if key < 0 {
+            return false
+        }
+        if (*bs).exit_boot_services(image, key as usize) == 0 {
+            boot_services_done = true
+            return true
+        }
+    }
+    return false
+}
+
+fn boot_services_exited() -> bool {
+    return boot_services_done
+}
+
+fn memory_map_entries() -> usize {
+    if map_desc_size == 0 {
+        return 0
+    }
+    return map_size / map_desc_size
+}
+
+fn memory_region(i: usize) -> MemRegion {
+    if i >= memory_map_entries() {
+        panic("memory_region: index out of bounds")
+    }
+    let d = (map.as_ptr() as usize + i * map_desc_size) as *const MemoryDescriptor
+    return MemRegion {
+        kind: (*d).kind,
+        start: (*d).physical_start,
+        pages: (*d).number_of_pages
+    }
+}
+
+fn free_pages() -> u64 {
+    if !boot_services_done {
+        read_memory_map()
+    }
+    let mut pages: u64 = 0
+    for i in 0..memory_map_entries() {
+        let r = memory_region(i)
+        if r.kind == 7u32 {
+            pages += r.pages
+        }
+    }
+    return pages
+}
+
+fn str_byte(s: Str, i: usize) -> u8 {
+    if i >= s.len() {
+        panic("str_byte: index out of bounds")
+    }
+    return s.as_ptr().add(i).read()
+}
+
+fn now() -> Time {
+    let mut t: Time
+    let rt = (*st).runtime_services
+    (*rt).get_time(&mut t as *mut Time, 0 as *mut u8)
+    return t
+}
+
+fn firmware_vendor(buf: &mut [u8]) -> usize {
+    let name = (*st).firmware_vendor
+    if name.is_null() {
+        return 0
+    }
+    let mut n: usize = 0
+    while n < buf.len() {
+        let c = name.add(n).read()
+        if c == 0 {
+            break
+        }
+        if c < 128 {
+            buf[n] = c as u8
+        } else {
+            buf[n] = '?'
+        }
+        n += 1
+    }
+    return n
+}
+
+fn uefi_revision() -> u32 {
+    return (*st).hdr.revision
+}
+
+fn reboot() {
+    let rt = (*st).runtime_services
+    (*rt).reset_system(0, 0, 0, 0 as *const u8)
+}
+
+fn shutdown() {
+    let rt = (*st).runtime_services
+    (*rt).reset_system(2, 0, 0, 0 as *const u8)
+}

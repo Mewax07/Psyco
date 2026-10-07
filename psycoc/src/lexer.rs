@@ -1,46 +1,80 @@
 #[derive(Debug, Clone, PartialEq)]
 pub enum TokenKind {
     // Keywords
-    Let,    // let ...
-    Fn,     // fn ...
-    If,     // if ...
-    Else,   // else ...
-    While,  // while ...
-    Return, // return ...
-    True,   // true
-    False,  // false
+    Let,      // let ...
+    Fn,       // fn ...
+    If,       // if ...
+    Else,     // else ...
+    While,    // while ...
+    Loop,     // loop ...
+    For,      // for ...
+    In,       // in ...
+    Break,    // break
+    Continue, // continue
+    Return,   // return ...
+    True,     // true
+    False,    // false
+    Struct,   // struct ...
+    Enum,     // enum ...
+    Impl,     // impl ...
+    Match,    // match ...
+    As,       // as ...
+    Static,   // static ...
+    Const,    // const ...
+    Extern,   // extern ...
+    Import,   // import ...
+    Sizeof,   // sizeof ...
+    Mut,      // mut ...
+    Unsafe,   // unsafe ... (I hope to remove that)
 
     // Identifier
     Ident(String), // bob
 
-    // Basic Type
-    Str(String), // "alice"
-    Int(i64),    // 15
+    // Literals
+    Str(Vec<u8>),           // "alice" -> Str (length + octets)
+    CStr(Vec<u8>),          // c"alice" -> *u8 ended with 0
+    WStr(Vec<u16>),         // u"alice" -> *u16 ended with 0
+    Int(u64),               // 15, 0xFF, 0b1010, 1_000, 'a'
+    IntSuffix(u64, String), // 15u8, 0xFFusize
 
     // Delimiter
     LParen,     // (
     RParen,     // )
     LBrace,     // {
     RBrace,     // }
+    LBracket,   // [
+    RBracket,   // ]
     Colon,      // :
     Semicolon,  // ;
     Comma,      // ,
     Dot,        // .
     ColonColon, // ::
     DotDot,     // ..
+    Hash,       // #
 
     // Operator
-    Plus,   // +
-    Minus,  // -
-    Star,   // *
-    Slash,  // /
-    Modulo, // %
+    Plus,         // +
+    Minus,        // -
+    Star,         // *
+    Slash,        // /
+    Modulo,       // %
+    PlusPercent,  // +%
+    MinusPercent, // -%
+    StarPercent,  // *%
 
-    // Arrow
+    // Bitwise
+    Amp,   // &
+    Pipe,  // |
+    Caret, // ^
+    Tilde, // ~
+    Shl,   // <<
+    Shr,   // >>
+
+    // Arrows
     Arrow,    // ->
     FatArrow, // =>
 
-    // Comparator
+    // Comparison / logic
     Lt,     // <
     Gt,     // >
     Eq,     // =
@@ -52,6 +86,18 @@ pub enum TokenKind {
     AndAnd, // &&
     OrOr,   // ||
 
+    // Compound assignment
+    PlusEq,    // +=
+    MinusEq,   // -=
+    StarEq,    // *=
+    SlashEq,   // /=
+    PercentEq, // %=
+    AmpEq,     // &=
+    PipeEq,    // |=
+    CaretEq,   // ^=
+    ShlEq,     // <<=
+    ShrEq,     // >>=
+
     Eof, // Eof
 }
 
@@ -59,6 +105,8 @@ pub enum TokenKind {
 pub struct Span {
     pub line: usize,
     pub col: usize,
+    // source file index
+    pub file: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -80,15 +128,21 @@ pub struct Lexer {
     pos: usize,
     line: usize,
     col: usize,
+    file: usize,
 }
 
 impl Lexer {
     pub fn new(src: &str) -> Self {
+        Self::with_file(src, 0)
+    }
+
+    pub fn with_file(src: &str, file: usize) -> Self {
         Self {
             chars: src.chars().collect(),
             pos: 0,
             line: 1,
             col: 1,
+            file,
         }
     }
 
@@ -127,10 +181,20 @@ impl Lexer {
         Some(c)
     }
 
+    fn eat(&mut self, c: char) -> bool {
+        if self.peek() == Some(c) {
+            self.advance();
+            true
+        } else {
+            false
+        }
+    }
+
     fn span(&self) -> Span {
         Span {
             line: self.line,
             col: self.col,
+            file: self.file,
         }
     }
 
@@ -141,7 +205,7 @@ impl Lexer {
         }
     }
 
-    fn skip(&mut self) {
+    fn skip(&mut self) -> LexerResult<()> {
         loop {
             match (self.peek(), self.peek_next()) {
                 (Some(c), _) if c.is_whitespace() => {
@@ -155,13 +219,33 @@ impl Lexer {
                         self.advance();
                     }
                 }
-                _ => break,
+                (Some('/'), Some('*')) => {
+                    let span = self.span();
+                    self.advance();
+                    self.advance();
+                    let mut depth = 1;
+                    while depth > 0 {
+                        match (self.advance(), self.peek()) {
+                            (Some('*'), Some('/')) => {
+                                self.advance();
+                                depth -= 1;
+                            }
+                            (Some('/'), Some('*')) => {
+                                self.advance();
+                                depth += 1;
+                            }
+                            (None, _) => return Err(self.error("unterminated block comment", span)),
+                            _ => {}
+                        }
+                    }
+                }
+                _ => return Ok(()),
             }
         }
     }
 
     fn next_token(&mut self) -> LexerResult<Token> {
-        self.skip();
+        self.skip()?;
 
         let span = self.span();
         let Some(c) = self.advance() else {
@@ -171,130 +255,278 @@ impl Lexer {
             });
         };
 
+        use TokenKind as T;
         let kind = match c {
-            '(' => TokenKind::LParen,
-            ')' => TokenKind::RParen,
-            '{' => TokenKind::LBrace,
-            '}' => TokenKind::RBrace,
-            '+' => TokenKind::Plus,
-            '-' => {
-                if self.peek() == Some('>') {
-                    self.advance();
-                    TokenKind::Arrow
+            '(' => T::LParen,
+            ')' => T::RParen,
+            '{' => T::LBrace,
+            '}' => T::RBrace,
+            '[' => T::LBracket,
+            ']' => T::RBracket,
+            ';' => T::Semicolon,
+            ',' => T::Comma,
+            '#' => T::Hash,
+            '~' => T::Tilde,
+            '+' => {
+                if self.eat('%') {
+                    T::PlusPercent
+                } else if self.eat('=') {
+                    T::PlusEq
                 } else {
-                    TokenKind::Minus
+                    T::Plus
                 }
             }
-            '*' => TokenKind::Star,
-            '/' => TokenKind::Slash,
-            '%' => TokenKind::Modulo,
-            '=' => {
-                if self.peek() == Some('=') {
-                    self.advance();
-                    TokenKind::EqEq
-                } else if self.peek() == Some('>') {
-                    self.advance();
-                    TokenKind::FatArrow
+            '-' => {
+                if self.eat('>') {
+                    T::Arrow
+                } else if self.eat('%') {
+                    T::MinusPercent
+                } else if self.eat('=') {
+                    T::MinusEq
                 } else {
-                    TokenKind::Eq
+                    T::Minus
+                }
+            }
+            '*' => {
+                if self.eat('%') {
+                    T::StarPercent
+                } else if self.eat('=') {
+                    T::StarEq
+                } else {
+                    T::Star
+                }
+            }
+            '/' => {
+                if self.eat('=') {
+                    T::SlashEq
+                } else {
+                    T::Slash
+                }
+            }
+            '%' => {
+                if self.eat('=') {
+                    T::PercentEq
+                } else {
+                    T::Modulo
+                }
+            }
+            '^' => {
+                if self.eat('=') {
+                    T::CaretEq
+                } else {
+                    T::Caret
+                }
+            }
+            '=' => {
+                if self.eat('=') {
+                    T::EqEq
+                } else if self.eat('>') {
+                    T::FatArrow
+                } else {
+                    T::Eq
                 }
             }
             '<' => {
-                if self.peek() == Some('=') {
-                    self.advance();
-                    TokenKind::Le
+                if self.eat('<') {
+                    if self.eat('=') { T::ShlEq } else { T::Shl }
+                } else if self.eat('=') {
+                    T::Le
                 } else {
-                    TokenKind::Lt
+                    T::Lt
                 }
             }
             '>' => {
-                if self.peek() == Some('=') {
-                    self.advance();
-                    TokenKind::Ge
+                if self.eat('>') {
+                    if self.eat('=') { T::ShrEq } else { T::Shr }
+                } else if self.eat('=') {
+                    T::Ge
                 } else {
-                    TokenKind::Gt
+                    T::Gt
                 }
             }
             '!' => {
-                if self.peek() == Some('=') {
-                    self.advance();
-                    TokenKind::Ne
+                if self.eat('=') {
+                    T::Ne
                 } else {
-                    TokenKind::Bang
+                    T::Bang
                 }
             }
             '&' => {
-                if self.peek() == Some('&') {
-                    self.advance();
-                    TokenKind::AndAnd
+                if self.eat('&') {
+                    T::AndAnd
+                } else if self.eat('=') {
+                    T::AmpEq
                 } else {
-                    return Err(self.error(format!("'&' is unsupported use '&&'"), span));
+                    T::Amp
                 }
             }
             '|' => {
-                if self.peek() == Some('|') {
-                    self.advance();
-                    TokenKind::OrOr
+                if self.eat('|') {
+                    T::OrOr
+                } else if self.eat('=') {
+                    T::PipeEq
                 } else {
-                    return Err(self.error(format!("'|' is unsupported use '||'"), span));
+                    T::Pipe
                 }
             }
             ':' => {
-                if self.peek() == Some(':') {
-                    self.advance();
-                    TokenKind::ColonColon
+                if self.eat(':') {
+                    T::ColonColon
                 } else {
-                    TokenKind::Colon
+                    T::Colon
                 }
             }
-            ';' => TokenKind::Semicolon,
-            ',' => TokenKind::Comma,
             '.' => {
-                if self.peek() == Some('.') {
-                    self.advance();
-                    TokenKind::DotDot
+                if self.eat('.') {
+                    T::DotDot
                 } else {
-                    TokenKind::Dot
+                    T::Dot
                 }
             }
-            '"' => self.read_string(span)?,
+            '"' => T::Str(self.read_string_bytes(span)?),
+            'c' if self.peek() == Some('"') => {
+                self.advance();
+                T::CStr(self.read_string_bytes(span)?)
+            }
+            'u' if self.peek() == Some('"') => {
+                self.advance();
+                let s = self.read_string_chars(span)?;
+                T::WStr(s.encode_utf16().collect())
+            }
+            '\'' => self.read_char(span)?,
             c if c.is_ascii_digit() => self.read_number(span, c)?,
             c if c.is_alphabetic() || c == '_' => self.read_ident(c),
-            _ => return Err(self.error(format!("Unexpected char: '{c}'"), span)),
+            _ => return Err(self.error(format!("unexpected character '{c}'"), span)),
         };
 
         Ok(Token { kind, span })
     }
 
-    fn read_string(&mut self, span: Span) -> LexerResult<TokenKind> {
+    fn read_escape(&mut self, span: Span) -> LexerResult<char> {
+        let Some(c) = self.advance() else {
+            return Err(self.error("unfinished escape sequence", span));
+        };
+        Ok(match c {
+            'n' => '\n',
+            't' => '\t',
+            'r' => '\r',
+            '0' => '\0',
+            '\\' => '\\',
+            '\'' => '\'',
+            '"' => '"',
+            'x' => {
+                let mut v = 0u32;
+                for _ in 0..2 {
+                    let d = self
+                        .advance()
+                        .and_then(|d| d.to_digit(16))
+                        .ok_or_else(|| self.error("\\x expects two hex digits", span))?;
+                    v = v * 16 + d;
+                }
+                char::from_u32(v).unwrap()
+            }
+            other => return Err(self.error(format!("unknown escape '\\{other}'"), span)),
+        })
+    }
+
+    fn read_string_chars(&mut self, span: Span) -> LexerResult<String> {
         let mut text = String::new();
         loop {
             match self.advance() {
-                Some('"') => return Ok(TokenKind::Str(text)),
+                Some('"') => return Ok(text),
+                Some('\\') => text.push(self.read_escape(span)?),
                 Some(c) => text.push(c),
-                None => return Err(self.error("Unfinished string", span)),
+                None => return Err(self.error("unfinished string", span)),
             }
         }
     }
 
-    fn read_number(&mut self, span: Span, ch: char) -> LexerResult<TokenKind> {
-        let mut digits = String::from(ch);
+    fn read_string_bytes(&mut self, span: Span) -> LexerResult<Vec<u8>> {
+        let mut bytes = Vec::new();
+        loop {
+            match self.advance() {
+                Some('"') => return Ok(bytes),
+                Some('\\') => {
+                    let is_hex = self.peek() == Some('x');
+                    let c = self.read_escape(span)?;
+                    if is_hex {
+                        bytes.push(c as u32 as u8);
+                    } else {
+                        let mut buf = [0; 4];
+                        bytes.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+                    }
+                }
+                Some(c) => {
+                    let mut buf = [0; 4];
+                    bytes.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+                }
+                None => return Err(self.error("unfinished string", span)),
+            }
+        }
+    }
+
+    fn read_char(&mut self, span: Span) -> LexerResult<TokenKind> {
+        let c = match self.advance() {
+            Some('\\') => self.read_escape(span)?,
+            Some('\'') | None => return Err(self.error("empty character literal", span)),
+            Some(c) => c,
+        };
+        if !self.eat('\'') {
+            return Err(self.error("character literal must contain one character", span));
+        }
+        Ok(TokenKind::Int(c as u64))
+    }
+
+    fn read_number(&mut self, span: Span, first: char) -> LexerResult<TokenKind> {
+        let mut radix = 10;
+        let mut digits = String::new();
+        if first == '0' && matches!(self.peek(), Some('x' | 'b' | 'o')) {
+            radix = match self.advance() {
+                Some('x') => 16,
+                Some('b') => 2,
+                _ => 8,
+            };
+        } else {
+            digits.push(first);
+        }
+        let mut suffix = String::new();
         while let Some(c) = self.peek() {
-            if c.is_ascii_digit() {
+            if c == '_' && suffix.is_empty() {
+                self.advance();
+            } else if c.is_digit(radix) && suffix.is_empty() {
                 digits.push(c);
                 self.advance();
+            } else if (c == 'u' || c == 'i') && suffix.is_empty() {
+                suffix.push(c);
+                self.advance();
+            } else if c.is_ascii_alphanumeric() && !suffix.is_empty() {
+                suffix.push(c);
+                self.advance();
+            } else if c.is_ascii_alphanumeric() {
+                return Err(self.error(format!("invalid digit '{c}' in number"), span));
             } else {
                 break;
             }
         }
-        digits
-            .parse()
-            .map(TokenKind::Int)
-            .map_err(|_| self.error(format!("Number too big: {digits}"), span))
+        if digits.is_empty() {
+            return Err(self.error("number has no digits", span));
+        }
+        let value = u64::from_str_radix(&digits, radix)
+            .map_err(|_| self.error(format!("number too big: {digits}"), span))?;
+        if suffix.is_empty() {
+            return Ok(TokenKind::Int(value));
+        }
+        const SUFFIXES: [&str; 10] = [
+            "u8", "u16", "u32", "u64", "usize", "i8", "i16", "i32", "i64", "isize",
+        ];
+        if !SUFFIXES.contains(&suffix.as_str()) {
+            return Err(self.error(format!("unknown integer suffix '{suffix}'"), span));
+        }
+        Ok(TokenKind::IntSuffix(value, suffix))
     }
 
-    fn read_ident(&mut self, ch: char) -> TokenKind {
-        let mut word = String::from(ch);
+    fn read_ident(&mut self, first: char) -> TokenKind {
+        let mut word = String::from(first);
         while let Some(c) = self.peek() {
             if c.is_alphanumeric() || c == '_' {
                 word.push(c);
@@ -303,16 +535,37 @@ impl Lexer {
                 break;
             }
         }
+        use TokenKind as T;
         match word.as_str() {
-            "let" => TokenKind::Let,
-            "fn" => TokenKind::Fn,
-            "if" => TokenKind::If,
-            "else" => TokenKind::Else,
-            "while" => TokenKind::While,
-            "return" => TokenKind::Return,
-            "true" => TokenKind::True,
-            "false" => TokenKind::False,
-            _ => TokenKind::Ident(word),
+            "let" => T::Let,
+            "fn" => T::Fn,
+            "if" => T::If,
+            "else" => T::Else,
+            "while" => T::While,
+            "loop" => T::Loop,
+            "for" => T::For,
+            "in" => T::In,
+            "break" => T::Break,
+            "continue" => T::Continue,
+            "return" => T::Return,
+            "true" => T::True,
+            "false" => T::False,
+            "struct" => T::Struct,
+            "enum" => T::Enum,
+            "impl" => T::Impl,
+            "match" => T::Match,
+            "as" => T::As,
+            "static" => T::Static,
+            "const" => T::Const,
+            "extern" => T::Extern,
+            "import" => T::Import,
+            "sizeof" => T::Sizeof,
+            "mut" => T::Mut,
+            "unsafe" => T::Unsafe,
+            "not" => T::Bang,
+            "and" => T::AndAnd,
+            "or" => T::OrOr,
+            _ => T::Ident(word),
         }
     }
 }

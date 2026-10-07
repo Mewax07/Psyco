@@ -1,4 +1,3 @@
-// Arithmétique, priorités, immédiats imm8/imm32/imm64, constante à gauche.
 fn main() {
     let x = 7
     let big = 3000000000
@@ -14,6 +13,7 @@ fn main() {
     let z = 0
     print(z, z + 1, z - 1)
 }
+
 //> 7
 //> 9
 //> 8 6 21

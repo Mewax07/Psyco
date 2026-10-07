@@ -1,0 +1,40 @@
+#![trusted]
+
+struct TableHeader {
+    signature: u64,
+    revision: u32,
+    header_size: u32,
+    crc32: u32,
+    reserved: u32,
+}
+
+struct SimpleTextOutput {
+    reset: extern fn(*mut SimpleTextOutput, bool) -> u64,
+    output_string: extern fn(*mut SimpleTextOutput, *const u16) -> u64,
+}
+
+struct SystemTable {
+    hdr: TableHeader,
+    firmware_vendor: *const u16,
+    firmware_revision: u32,
+    console_in_handle: *mut u8,
+    con_in: *mut u8,
+    console_out_handle: *mut u8,
+    con_out: *mut SimpleTextOutput,
+}
+
+fn main() {
+    print("serial: hello from psy")
+    let st = efi_system_table() as *mut SystemTable
+    print("signature ok:", (*st).hdr.signature == 0x5453_5953_2049_4249)
+    let out = (*st).con_out
+    let status = (*out).output_string(out, u"screen: hello from psy\r\n")
+    print("OutputString status:", status)
+    exit(42)
+}
+
+//> serial: hello from psy
+//> signature ok: true
+//> screen: hello from psy
+//> OutputString status: 0
+// exit: 42

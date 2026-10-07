@@ -1,4 +1,3 @@
-// Les mêmes comparaisons en contexte de branchement (if/else, else if, if sans else).
 fn check(x: Int) {
     if x < 0 {
         print("neg")
@@ -47,6 +46,7 @@ fn main() {
         print("never")
     }
 }
+
 //> neg
 //> zero
 //> small

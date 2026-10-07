@@ -1,0 +1,31 @@
+import "../../../psycos/src/fb.psy"
+
+fn main() {
+    efi_init()
+    print("gop:", fb_init())
+    let w = fb_width()
+    let h = fb_height()
+    print("size ok:", w >= 640 && h >= 480)
+
+    fill_rect(0, 0, w, h, 0x000000)
+    fill_rect(10, 20, 30, 40, 0xFF0000)
+    print("inside:", get_pixel(10, 20) == 0xFF0000, get_pixel(39, 54) == 0xFF0000)
+    print("outside:", get_pixel(9, 20) == 0x000000, get_pixel(10, 60) == 0x000000)
+
+    put_pixel(5, 5, 0x123456)
+    print("pixel:", get_pixel(5, 5))
+
+    fill_rect(w - 3, h - 2, 100, 100, 0x00FF00)
+    put_pixel(w, h, 0xFFFFFF)
+    fill_rect(w + 5, 0, 10, 10, 0xFFFFFF)
+    print("clip:", get_pixel(w - 1, h - 1) == 0x00FF00, get_pixel(w - 4, h - 1) == 0x000000)
+    exit(11)
+}
+
+//> gop: true
+//> size ok: true
+//> inside: true true
+//> outside: true true
+//> pixel: 1193046
+//> clip: true true
+// exit: 11

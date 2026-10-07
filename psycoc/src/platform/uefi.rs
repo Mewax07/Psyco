@@ -1,60 +1,83 @@
-use crate::{Alu, Assembler, Cond, Label, Platform, Reg::*};
+use crate::{Alu, Assembler, Cond, Label, Platform, Reg::*, Runtime};
 
 pub struct UefiPlatform;
 
-impl Platform for UefiPlatform {
-    fn gen_write(&self, asm: &mut Assembler, label: Label) {
-        let com1: i64 = 0x3F8;
-
-        let putc = asm.new_label();
-        let wait = asm.new_label();
-        asm.bind(putc);
-        asm.push(Rax);
-        asm.bind(wait);
-        asm.mov_ri(Rdx, com1 + 5);
-        asm.in_al_dx();
-        asm.alu_ri(Alu::And, Rax, 0x20);
-        asm.jcc(Cond::E, wait);
-        asm.pop(Rax);
-        asm.mov_ri(Rdx, com1);
-        asm.out_dx_al();
-        asm.ret();
-
-        // sys_write: rsi = octets, rdx = length, \n => \r\n
-        let next = asm.new_label();
-        let send = asm.new_label();
-        let done = asm.new_label();
-        asm.bind(label);
-        asm.mov_rr(Rcx, Rdx);
-        asm.bind(next);
-        asm.test_rr(Rcx, Rcx);
-        asm.jcc(Cond::E, done);
-        asm.load8(Rax, Rsi);
-        asm.alu_ri(Alu::Cmp, Rax, b'\n' as i32);
-        asm.jcc(Cond::NE, send);
-        asm.push(Rax);
-        asm.mov_ri(Rax, b'\r' as i64);
-        asm.call(putc);
-        asm.pop(Rax);
-        asm.bind(send);
-        asm.call(putc);
-        asm.alu_ri(Alu::Add, Rsi, 1);
-        asm.alu_ri(Alu::Sub, Rcx, 1);
-        asm.jmp(next);
-        asm.bind(done);
-        asm.ret();
+impl UefiPlatform {
+    fn outb(a: &mut Assembler, port: i64, value: i64) {
+        a.mov_ri(Rdx, port);
+        a.mov_ri(Rax, value);
+        a.out_dx_al();
     }
 
-    fn gen_exit(&self, asm: &mut Assembler, label: Label) {
-        // sys_exit : rdi = code
-        let halt = asm.new_label();
-        asm.bind(label);
-        asm.mov_rr(Rax, Rdi);
-        asm.mov_ri(Rdx, 0xF4);
-        asm.out_dx_eax();
-        asm.bind(halt);
-        asm.cli();
-        asm.hlt();
-        asm.jmp(halt);
+    fn emit_byte(a: &mut Assembler, byte: Option<u8>) {
+        let wait = a.new_label();
+        a.bind(wait);
+        a.mov_ri(Rdx, 0x3F8 + 5);
+        a.in_al_dx();
+        a.alu_ri(Alu::And, Rax, 0x20);
+        a.jcc(Cond::E, wait);
+        a.mov_ri(Rdx, 0x3F8);
+        match byte {
+            Some(b) => a.mov_ri(Rax, b as i64),
+            None => a.mov_rr(Rax, R8),
+        }
+        a.out_dx_al();
+    }
+}
+
+impl Platform for UefiPlatform {
+    fn gen_entry(&self, a: &mut Assembler, rt: &Runtime, entry: Label, main: Label) {
+        a.bind(entry);
+        a.lea_rw(Rax, rt.efi_image_handle);
+        a.store(Rax, 0, Rcx);
+        a.lea_rw(Rax, rt.efi_system_table);
+        a.store(Rax, 0, Rdx);
+
+        Self::outb(a, 0x3F8 + 1, 0x00);
+        Self::outb(a, 0x3F8 + 3, 0x80);
+        Self::outb(a, 0x3F8, 0x01);
+        Self::outb(a, 0x3F8 + 1, 0x00);
+        Self::outb(a, 0x3F8 + 3, 0x03);
+        Self::outb(a, 0x3F8 + 2, 0xC7);
+        Self::outb(a, 0x3F8 + 4, 0x03);
+
+        a.alu_ri(Alu::And, Rsp, -16);
+        a.call(main);
+        a.zero(Rdi);
+        a.jmp(rt.sys_exit);
+    }
+
+    fn gen_write(&self, a: &mut Assembler, rt: &Runtime) {
+        a.bind(rt.sys_write);
+        a.mov_rr(Rcx, Rdx);
+        let done = a.new_label();
+        let next = a.new_label();
+        a.bind(next);
+        a.test_rr(Rcx, Rcx);
+        a.jcc(Cond::E, done);
+        a.load8(R8, Rsi);
+        let not_nl = a.new_label();
+        a.alu_ri(Alu::Cmp, R8, b'\n' as i32);
+        a.jcc(Cond::NE, not_nl);
+        Self::emit_byte(a, Some(b'\r'));
+        a.bind(not_nl);
+        Self::emit_byte(a, None);
+        a.alu_ri(Alu::Add, Rsi, 1);
+        a.alu_ri(Alu::Sub, Rcx, 1);
+        a.jmp(next);
+        a.bind(done);
+        a.ret();
+    }
+
+    fn gen_exit(&self, a: &mut Assembler, rt: &Runtime) {
+        a.bind(rt.sys_exit);
+        a.mov_rr(Rax, Rdi);
+        a.mov_ri(Rdx, 0xF4);
+        a.out_dx_al();
+        let halt = a.new_label();
+        a.bind(halt);
+        a.cli();
+        a.hlt();
+        a.jmp(halt);
     }
 }

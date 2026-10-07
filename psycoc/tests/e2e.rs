@@ -1,71 +1,16 @@
+#![cfg(target_os = "linux")]
+
 use std::{
-    fs, path::{Path, PathBuf}, process::{Command, Output}, thread::sleep, time::Duration,
+    fs,
+    os::unix::fs::PermissionsExt,
+    path::{Path, PathBuf},
+    process::Command,
 };
 
-use psycoc::{
-    Target,
-    ast::{Block, Expr, ExprKind, Program, Stmt, UnaryOp},
-    codegen::Codegen,
-    lexer::Lexer,
-    parser::Parser,
-    typeck::TypeChecker,
-};
+use psycoc::{Target, compile_str};
 
-type Transform = fn(&mut Program);
-
-fn compile(src: &str, transform: Transform) -> Result<Vec<u8>, String> {
-    let tokens = Lexer::new(src)
-        .tokenize()
-        .map_err(|e| format!("lexer {}:{}: {}", e.span.line, e.span.col, e.message))?;
-    let mut program = Parser::new(tokens)
-        .parse_program()
-        .map_err(|e| format!("parser {}:{}: {}", e.span.line, e.span.col, e.message))?;
-    TypeChecker::new()
-        .check_program(&mut program)
-        .map_err(|e| format!("type {}:{}: {}", e.span.line, e.span.col, e.message))?;
-    transform(&mut program);
-    Ok(Codegen::new().generate(&program, Target::Linux))
-}
-
-fn identity(_: &mut Program) {}
-
-fn fold_negative_literals(program: &mut Program) {
-    fn expr(e: &mut Expr) {
-        match &mut e.kind {
-            ExprKind::Unary { op, operand } => {
-                expr(operand);
-                if let (UnaryOp::Neg, ExprKind::Int(n)) = (*op, &operand.kind) {
-                    e.kind = ExprKind::Int(-*n);
-                }
-            }
-            ExprKind::Binary { lhs, rhs, .. } => {
-                expr(lhs);
-                expr(rhs);
-            }
-            ExprKind::Call { args, .. } => args.iter_mut().for_each(expr),
-            ExprKind::Int(_) | ExprKind::Bool(_) | ExprKind::Str(_) | ExprKind::Var(_) => {}
-        }
-    }
-    fn block(b: &mut Block) {
-        for s in &mut b.stmts {
-            match s {
-                Stmt::Let { value, .. } | Stmt::Assign { value, .. } | Stmt::Expr(value) => {
-                    expr(value)
-                }
-                Stmt::Return { value, .. } => value.iter_mut().for_each(expr),
-                Stmt::If { cond, then_block, else_block, .. } => {
-                    expr(cond);
-                    block(then_block);
-                    else_block.iter_mut().for_each(block);
-                }
-                Stmt::While { cond, body, .. } => {
-                    expr(cond);
-                    block(body);
-                }
-            }
-        }
-    }
-    program.functions.iter_mut().for_each(|f| block(&mut f.body));
+fn compile(src: &str) -> Result<Vec<u8>, String> {
+    compile_str(src, Target::Linux)
 }
 
 struct Expect {
@@ -88,20 +33,22 @@ fn parse_expect(src: &str) -> Expect {
     Expect { stdout, exit }
 }
 
-fn run_one(path: &Path, out_dir: &Path, transform: Transform) -> Result<(), String> {
+fn run_one(path: &Path, out_dir: &Path) -> Result<(), String> {
     let src = fs::read_to_string(path).map_err(|e| e.to_string())?;
     let expect = parse_expect(&src);
-    let binary = compile(&src, transform)?;
+    let binary = compile(&src)?;
 
     let exe = out_dir.join(path.file_stem().unwrap());
     fs::write(&exe, &binary).map_err(|e| e.to_string())?;
-    #[cfg(unix)]
     fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).map_err(|e| e.to_string())?;
 
     let out = run_exe(&exe)?;
     let stdout = String::from_utf8_lossy(&out.stdout);
     let Some(code) = out.status.code() else {
-        return Err(format!("killed by signal: {:?}\nstdout:\n{stdout}", out.status));
+        return Err(format!(
+            "killed by signal: {:?}\nstdout:\n{stdout}",
+            out.status
+        ));
     };
 
     let stdout_ok = if expect.exit == 0 {
@@ -118,12 +65,12 @@ fn run_one(path: &Path, out_dir: &Path, transform: Transform) -> Result<(), Stri
     Ok(())
 }
 
-fn run_exe(exe: &Path) -> Result<Output, String> {
+fn run_exe(exe: &Path) -> Result<std::process::Output, String> {
     const ETXTBSY: i32 = 26;
     for _ in 0..100 {
         match Command::new(exe).output() {
             Err(e) if e.raw_os_error() == Some(ETXTBSY) => {
-                sleep(Duration::from_millis(5))
+                std::thread::sleep(std::time::Duration::from_millis(5))
             }
             other => return other.map_err(|e| e.to_string()),
         }
@@ -142,20 +89,9 @@ fn programs() -> Vec<PathBuf> {
     files
 }
 
-#[cfg(target_os = "linux")]
 #[test]
 fn programs_behave_as_expected() {
-    run_all("plain", identity);
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn programs_with_negative_literals_folded() {
-    run_all("negfold", fold_negative_literals);
-}
-
-fn run_all(name: &str, transform: Transform) {
-    let out_dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("e2e").join(name);
+    let out_dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("e2e");
     fs::create_dir_all(&out_dir).unwrap();
 
     let files = programs();
@@ -164,7 +100,7 @@ fn run_all(name: &str, transform: Transform) {
     let failures: Vec<String> = files
         .iter()
         .filter_map(|p| {
-            run_one(p, &out_dir, transform)
+            run_one(p, &out_dir)
                 .err()
                 .map(|e| format!("=== {} ===\n{e}", p.file_name().unwrap().to_string_lossy()))
         })

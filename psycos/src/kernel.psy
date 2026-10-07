@@ -1,0 +1,213 @@
+import "efi.psy"
+import "fb.psy"
+import "console.psy"
+import "keyboard.psy"
+
+static mut line: [u8; 76]
+static mut line_len: usize = 0
+static mut has_fb: bool = false
+
+fn banner() {
+    set_color(cyan)
+    puts(" ____                  ___  ____  \n")
+    puts("|  _ \\ ___ _   _  ___ / _ \\/ ___| \n")
+    puts("| |_) / __| | | |/ __| | | \\___ \\ \n")
+    puts("|  __/\\__ \\ |_| | (__| |_| |___) |\n")
+    puts("|_|   |___/\\__, |\\___|\\___/|____/ \n")
+    puts("           |___/           v0.1\n\n")
+    set_color(gray)
+    puts("Type 'help' for the list of commands.\n\n")
+}
+
+fn prompt() {
+    set_color(green)
+    puts("psycos> ")
+    set_color(white)
+}
+
+fn line_is(cmd: Str) -> bool {
+    if line_len != cmd.len() { return false }
+    for i in 0..line_len {
+        if line[i] != str_byte(cmd, i) { return false }
+    }
+    return true
+}
+
+fn line_starts_with(prefix: Str) -> bool {
+    if line_len < prefix.len() { return false }
+    for i in 0..prefix.len() {
+        if line[i] != str_byte(prefix, i) { return false }
+    }
+    return true
+}
+
+fn put2(n: u64) {
+    if n < 10 { putc('0') }
+    put_u64(n)
+}
+
+fn cmd_help() {
+    set_color(yellow)
+    puts("Commands:\n")
+    set_color(gray)
+    puts("  help       this help\n")
+    puts("  clear      clear the screen\n")
+    puts("  ver        version and firmware\n")
+    puts("  time       date and time\n")
+    puts("  mem        free memory\n")
+    puts("  fb         framebuffer info and test pattern\n")
+    puts("  echo TXT   print TXT\n")
+    puts("  reboot     restart the machine\n")
+    puts("  shutdown   power off the machine\n")
+}
+
+fn cmd_time() {
+    let t = now()
+    put_u64(t.year as u64)
+    putc('-')
+    put2(t.month as u64)
+    putc('-')
+    put2(t.day as u64)
+    putc(' ')
+    put2(t.hour as u64)
+    putc(':')
+    put2(t.minute as u64)
+    putc(':')
+    put2(t.second as u64)
+    putc('\n')
+}
+
+fn cmd_ver() {
+    puts("PsycOS 0.1, written in psy\nFirmware: ")
+    let mut vendor = [0u8; 64]
+    let n = firmware_vendor(&mut vendor)
+    for i in 0..n {
+        putc(vendor[i])
+    }
+    let rev = uefi_revision()
+    puts(" (UEFI ")
+    put_u64((rev >> 16) as u64)
+    putc('.')
+    put_u64(((rev & 0xFFFF) / 10) as u64)
+    puts(")\n")
+    if has_fb {
+        puts("Screen: ")
+        put_u64(fb_width() as u64)
+        putc('x')
+        put_u64(fb_height() as u64)
+        puts(", console ")
+        put_u64(con_columns() as u64)
+        putc('x')
+        put_u64(con_lines() as u64)
+        putc('\n')
+    }
+}
+
+fn cmd_mem() {
+    let pages = free_pages()
+    put_u64(pages * 4096 / 1048576)
+    puts(" MiB free (")
+    put_u64(pages)
+    puts(" pages of 4 KiB)\n")
+}
+
+fn cmd_fb() {
+    if !has_fb {
+        puts("no linear framebuffer\n")
+        return
+    }
+    let w = fb_width()
+    let h = fb_height()
+    put_u64(w as u64)
+    putc('x')
+    put_u64(h as u64)
+    puts(" at 0x")
+    put_hex(fb_address())
+    puts(", ")
+    put_u64(fb_bytes() as u64 / 1024)
+    puts(" KiB\n")
+
+    let colors = [0xFFFFFFu32, 0xFFFF00u32, 0x00FFFFu32, 0x00FF00u32, 0xFF00FFu32, 0xFF0000u32, 0x0000FFu32, 0x000000u32]
+    let bar = w / 8
+    let top = h - h / 4
+    for i in 0..colors.len() {
+        fill_rect(i * bar, top, bar, h / 4, colors[i])
+    }
+    for x in 0..w {
+        let v = (x * 255 / w) as u32
+        fill_rect(x, h - 16, 1, 16, (v << 16) | (v << 8) | v)
+    }
+}
+
+fn run_command() {
+    if line_len == 0 { return }
+    if line_is("help") {
+        cmd_help()
+    } else if line_is("clear") {
+        clear()
+    } else if line_is("ver") {
+        cmd_ver()
+    } else if line_is("time") {
+        cmd_time()
+    } else if line_is("mem") {
+        cmd_mem()
+    } else if line_is("fb") {
+        cmd_fb()
+    } else if line_starts_with("echo ") {
+        for i in 5..line_len { putc(line[i]) }
+        putc('\n')
+    } else if line_is("reboot") {
+        reboot()
+    } else if line_is("shutdown") {
+        shutdown()
+    } else {
+        set_color(red)
+        puts("unknown command: ")
+        for i in 0..line_len { putc(line[i]) }
+        putc('\n')
+        set_color(white)
+    }
+}
+
+fn read_line() {
+    line_len = 0
+    loop {
+        let c = read_key()
+        if c == 13 {
+            putc('\n')
+            return
+        }
+        if c == 8 {
+            if line_len > 0 {
+                line_len -= 1
+                putc(8)
+                putc(' ')
+                putc(8)
+            }
+            continue
+        }
+        if c >= 32 && c < 127 && line_len < line.len() {
+            line[line_len] = c as u8
+            line_len += 1
+            putc(c as u8)
+        }
+    }
+}
+
+fn main() {
+    efi_init()
+    has_fb = fb_init()
+    con_init(has_fb)
+    if !exit_boot_services() {
+        panic("ExitBootServices failed")
+    }
+    cli()
+    kbd_init()
+    print("PsycOS: boot ok")
+    banner()
+    loop {
+        prompt()
+        read_line()
+        run_command()
+    }
+}

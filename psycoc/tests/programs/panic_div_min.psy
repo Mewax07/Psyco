@@ -1,9 +1,9 @@
-// i64::MIN / -1 doit paniquer, pas crasher (SIGFPE).
 fn main() {
     let x = -9223372036854775807 - 1
     let m = -1
     print(x % m)
     print(x / m)
 }
+
 // exit: 101
 //> 0

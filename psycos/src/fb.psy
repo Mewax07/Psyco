@@ -1,0 +1,134 @@
+#![trusted]
+
+import "efi.psy"
+
+struct GopModeInfo {
+    version: u32,
+    width: u32,
+    height: u32,
+    pixel_format: u32,
+    red_mask: u32,
+    green_mask: u32,
+    blue_mask: u32,
+    reserved_mark: u32,
+    pixels_per_scan_line: u32,
+}
+
+struct GopMode {
+    max_mode: u32,
+    mode: u32,
+    info: *mut GopModeInfo,
+    size_of_info: usize,
+    frame_buffer_base: u64,
+    frame_buffer_size: usize,
+}
+
+struct Gop {
+    query_mode: *mut u8,
+    set_mode: *mut u8,
+    blt: *mut u8,
+    mode: *mut GopMode
+}
+
+static mut fb_base: *mut u32
+static mut fb_size: usize = 0
+static mut fb_w: usize = 0
+static mut fb_h: usize = 0
+static mut fb_stride: usize = 0
+static mut fb_rgb: bool = false
+
+fn fb_init() -> bool {
+    let guid = Guid {
+        d1: 0x9042a9de,
+        d2: 0x23dc,
+        d3: 0x4a38,
+        d4: [0x96, 0xfb, 0x7a, 0xde, 0xd0, 0x80, 0x51, 0x6a]
+    }
+    let bs = (*st).boot_services
+    let mut gop = 0 as *mut u8
+    let status = (*bs).locate_protocol(&guid as *const Guid, 0 as *mut u8, &mut gop as *mut *mut u8)
+    if status != 0 || gop.is_null() {
+        return false
+    }
+
+    let mode = (*(gop as *mut Gop)).mode
+    let info = (*mode).info
+    let format = (*info).pixel_format
+    if format != 0u32 && format != 1u32 {
+        return false
+    }
+
+    fb_base = (*mode).frame_buffer_base as *mut u32
+    fb_size = (*mode).frame_buffer_size
+    fb_w = (*info).width as usize
+    fb_h = (*info).height as usize
+    fb_stride = (*info).pixels_per_scan_line as usize
+    fb_rgb = format == 0u32
+    return !fb_base.is_null() && fb_w > 0 && fb_h > 0
+}
+
+fn fb_width() -> usize {
+    return fb_w
+}
+
+fn fb_height() -> usize {
+    return fb_h
+}
+
+fn fb_address() -> u64 {
+    return fb_base as u64
+}
+
+fn fb_bytes() -> usize {
+    return fb_size
+}
+
+// 0x00RRGGBB
+fn to_native(color: u32) -> u32 {
+    if fb_rgb {
+        return ((color & 0xFF) << 16) | (color & 0xFF00) | ((color >> 16) & 0xFF)
+    }
+    return color & 0xFFFFFF
+}
+
+fn put_pixel(x: usize, y: usize, color: u32) {
+    if x >= fb_w || y >= fb_h {
+        return
+    }
+    fb_base.add(y * fb_stride + x).write(to_native(color))
+}
+
+fn get_pixel(x: usize, y: usize) -> u32 {
+    if x >= fb_w || y >= fb_h {
+        return 0
+    }
+    return to_native(fb_base.add(y * fb_stride + x).read())
+}
+
+fn fill_rect(x: usize, y: usize, w: usize, h: usize, color: u32) {
+    if x >= fb_w || y >= fb_h {
+        return
+    }
+    let mut cw = w
+    let mut ch = h
+    if cw > fb_w - x { cw = fb_w - x }
+    if ch > fb_h - y { ch = fb_h - y }
+    let c = to_native(color)
+    let mut row = fb_base.add(y * fb_stride + x)
+    for j in 0..ch {
+        for i in 0..cw {
+            row.add(i).write(c)
+        }
+        row = row.add(fb_stride)
+    }
+}
+
+fn fb_scroll_up(dy: usize, color: u32) {
+    if dy >= fb_h {
+        fill_rect(0, 0, fb_w, fb_h, color)
+        return
+    }
+    let line = fb_stride * 4
+    memcpy(fb_base as *mut u8, fb_base.add(dy * fb_stride) as *const u8, (fb_h - dy) * line)
+    fill_rect(0, fb_h - dy, fb_w, dy, color)
+}

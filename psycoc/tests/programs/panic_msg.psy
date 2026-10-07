@@ -1,0 +1,8 @@
+fn main() {
+    print("before")
+    panic("custom failure")
+}
+
+// exit: 101
+//> before
+//> panic: custom failure

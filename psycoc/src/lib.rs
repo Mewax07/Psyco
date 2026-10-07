@@ -1,19 +1,23 @@
 pub mod assembler;
 pub mod ast;
-pub mod build;
 pub mod codegen;
+pub mod driver;
+pub mod elf;
 pub mod lexer;
 pub mod parser;
+pub mod pe;
+pub mod platform;
 pub mod runtime;
 pub mod typeck;
-pub mod platform;
 
 pub use assembler::*;
 pub use ast::*;
-pub use build::*;
 pub use codegen::*;
+pub use driver::*;
+pub use elf::*;
 pub use lexer::*;
 pub use parser::*;
+pub use pe::*;
+pub use platform::*;
 pub use runtime::*;
 pub use typeck::*;
-pub use platform::*;

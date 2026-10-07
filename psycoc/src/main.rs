@@ -1,60 +1,55 @@
 use std::{env, fs, process};
 
-use psycoc::{
-    Target,
-    codegen::Codegen,
-    lexer::{Lexer, Span},
-    parser::Parser,
-    typeck::TypeChecker,
-};
+use psycoc::{Target, compile_file};
 
-fn fail(path: &str, stage: &str, span: Span, message: &str) -> ! {
-    eprintln!(
-        "{path}:{}:{}: {stage} error: {message}",
-        span.line, span.col
-    );
+fn usage_error(message: &str) -> ! {
+    eprintln!("psycoc: {message}\nusage: psycoc [--uefi] [-o <output>] <file>");
     process::exit(1);
 }
 
 fn main() {
-    let args: Vec<String> = env::args().skip(1).collect();
+    let mut uefi = false;
+    let mut path = None;
+    let mut output = None;
+    let mut args = env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--uefi" => uefi = true,
+            "-o" => match args.next() {
+                Some(o) => output = Some(o),
+                None => usage_error("-o needs a file name"),
+            },
+            "-h" | "--help" => {
+                println!("usage: psycoc [--uefi] [-o <output>] <file>");
+                return;
+            }
+            flag if flag.starts_with('-') => usage_error(&format!("unknown option '{flag}'")),
+            _ if path.is_some() => usage_error("only one input file is supported"),
+            _ => path = Some(arg),
+        }
+    }
 
-    let Some(path) = args.iter().find(|a| !a.starts_with("--")) else {
-        eprintln!("usage: psycoc [--nasm] <file>");
-        process::exit(1);
+    let Some(path) = path else {
+        usage_error("no input file");
     };
-    let path = path.clone();
 
-    let src = fs::read_to_string(&path).unwrap_or_else(|e| {
-        eprintln!("cannot read {path}: {e}");
+    let target = if uefi { Target::Uefi } else { Target::Linux };
+    let output = output.unwrap_or_else(|| if uefi { "out.efi".into() } else { "out".into() });
+
+    let binary = compile_file(&path, target).unwrap_or_else(|e| {
+        eprintln!("{e}");
         process::exit(1);
     });
 
-    let tokens = Lexer::new(&src)
-        .tokenize()
-        .unwrap_or_else(|e| fail(&path, "lexer", e.span, &e.message));
-
-    let mut program = Parser::new(tokens)
-        .parse_program()
-        .unwrap_or_else(|e| fail(&path, "parser", e.span, &e.message));
-
-    if let Err(e) = TypeChecker::new().check_program(&mut program) {
-        fail(&path, "type", e.span, &e.message);
-    }
-
-    let uefi = args.iter().any(|a| a == "--uefi");
-    let (target, output) = if uefi {
-        (Target::Uefi, "out.efi")
-    } else {
-        (Target::Linux, "out")
-    };
-    let binary = Codegen::new().generate(&program, target);
-    fs::write(output, binary).expect("cannot write output");
+    fs::write(&output, binary).unwrap_or_else(|e| {
+        eprintln!("cannot write {output}: {e}");
+        process::exit(1);
+    });
 
     #[cfg(unix)]
     if target == Target::Linux {
         use std::os::unix::fs::PermissionsExt;
-        if let Err(e) = fs::set_permissions(output, fs::Permissions::from_mode(0o755)) {
+        if let Err(e) = fs::set_permissions(&output, fs::Permissions::from_mode(0o755)) {
             eprintln!("warning: cannot make {output} executable: {e}");
         }
     }
