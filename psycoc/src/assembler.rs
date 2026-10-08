@@ -140,6 +140,7 @@ impl Shift {
 #[derive(Debug, Clone, Copy)]
 pub enum Sreg {
     Es = 0,
+    Cs = 1,
     Ss = 2,
     Ds = 3,
     Fs = 4,
@@ -796,9 +797,29 @@ impl Assembler {
 
     /// `mov sreg, ax`
     pub fn mov_sreg(&mut self, sreg: Sreg, src: Reg) {
+        assert!(!matches!(sreg, Sreg::Cs), "ICE: cs can only be loaded with a far jump/return");
         self.rex(false, 0, src.ext());
         self.byte(0x8E);
         self.modrm_rr(sreg as u8, src);
+    }
+
+    /// `mov r32, sreg` (les bits hauts de la destination sont mis à zéro)
+    pub fn mov_from_sreg(&mut self, dst: Reg, sreg: Sreg) {
+        self.rex(false, 0, dst.ext());
+        self.byte(0x8C);
+        self.modrm_rr(sreg as u8, dst);
+    }
+
+    /// `str r32` : sélecteur du TSS courant
+    pub fn str_r(&mut self, dst: Reg) {
+        self.rex(false, 0, dst.ext());
+        self.bytes(&[0x0F, 0x00]);
+        self.modrm_rr(1, dst);
+    }
+
+    /// `ud2` : instruction invalide garantie (#UD)
+    pub fn ud2(&mut self) {
+        self.bytes(&[0x0F, 0x0B]);
     }
 
     /// `ltr r16`

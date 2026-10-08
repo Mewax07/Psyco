@@ -2,6 +2,8 @@ import "efi.psy"
 import "fb.psy"
 import "console.psy"
 import "keyboard.psy"
+import "stack.psy"
+import "gdt.psy"
 
 static mut line: [u8; 76]
 static mut line_len: usize = 0
@@ -198,11 +200,18 @@ fn main() {
     efi_init()
     has_fb = fb_init()
     con_init(has_fb)
+
     if !exit_boot_services() {
         panic("ExitBootServices failed")
     }
     cli()
+    gdt_init()
     kbd_init()
+
+    run_on_kernel_stack(kmain)
+}
+
+fn kmain() {
     print("PsycOS: boot ok")
     banner()
     loop {

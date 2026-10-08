@@ -1,0 +1,25 @@
+#![trusted]
+
+#[align(4096)]
+static mut KSTACK: [u8; 65536]
+
+fn kstack_bottom() -> usize {
+    return KSTACK.as_ptr() as usize
+}
+
+fn kstack_top() -> usize {
+    return KSTACK.as_ptr() as usize + 65536
+}
+
+fn run_on_kernel_stack(entry: fn()) {
+    memset(KSTACK.as_mut_ptr(), 0xA5u8, 65536)
+    switch_stack(kstack_top(), entry)
+}
+
+fn kstack_used() -> usize {
+    let mut untouched: usize = 0
+    while untouched < 65536 && KSTACK[untouched] == 0xA5u8 {
+        untouched += 1
+    }
+    return 65536 - untouched
+}

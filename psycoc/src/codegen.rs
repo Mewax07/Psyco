@@ -1640,6 +1640,20 @@ impl<'a> Codegen<'a> {
             "hlt" => self.asm.hlt(),
             "pause" => self.asm.pause(),
             "int3" => self.asm.int3(),
+            "ud2" => self.asm.ud2(),
+            "read_cs" | "read_ds" | "read_ss" => {
+                let sreg = match name {
+                    "read_cs" => Sreg::Cs,
+                    "read_ds" => Sreg::Ds,
+                    _ => Sreg::Ss,
+                };
+                self.asm.zero(Rax);
+                self.asm.mov_from_sreg(Rax, sreg);
+            }
+            "read_tr" => {
+                self.asm.zero(Rax);
+                self.asm.str_r(Rax);
+            }
             "read_cr0" | "read_cr2" | "read_cr3" | "read_cr4" => {
                 let cr = name.as_bytes()[7] - b'0';
                 self.asm.mov_from_cr(Rax, cr);

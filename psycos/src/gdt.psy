@@ -1,0 +1,92 @@
+#![trusted]
+
+#[packed]
+struct DescriptorTablePointer {
+    limit: u16,
+    base: u64,
+}
+
+#[packed]
+struct Tss {
+    reserved0: u32,
+    rsp0: u64,
+    rsp1: u64,
+    rsp2: u64,
+    reserved1: u64,
+    ist1: u64,
+    ist2: u64,
+    ist3: u64,
+    ist4: u64,
+    ist5: u64,
+    ist6: u64,
+    ist7: u64,
+    reserved2: u64,
+    reserved3: u16,
+    iomap_base: u16,
+}
+
+static mut gdt: [u64; 8]
+static mut gdtr: DescriptorTablePointer
+static mut tss: Tss
+#[align(16)]
+static mut DF_STACK: [u8; 16384]
+static mut gdt_ready: bool = false
+
+fn gdt_init() {
+    if gdt_ready {
+        return
+    }
+
+    gdt[0] = 0
+    gdt[1] = 0x00AF9A000000FFFF
+    gdt[2] = 0x00CF92000000FFFF
+
+    tss.ist1 = DF_STACK.as_ptr() as u64 + 16384
+    tss.iomap_base = sizeof(Tss) as u16
+
+    let base = &mut tss as *mut Tss as u64
+    let limit = sizeof(Tss) as u64 - 1
+    gdt[3] = (limit & 0xFFFF) | ((base & 0xFFFFFF) << 16) | (0x89 << 40) | (((limit >> 16) & 0xF) << 48) | (((base >> 24) & 0xFF) << 56)
+    gdt[4] = base >> 32
+
+    gdtr.limit = (gdt.len() * 8 - 1) as u16
+    gdtr.base = gdt.as_ptr() as u64
+    lgdt(&gdtr)
+
+    load_cs(0x08)
+    load_ds(0x10)
+    ltr(0x18)
+    gdt_ready = true
+}
+
+fn gdt_loaded() -> bool {
+    return gdt_ready
+}
+
+fn tss_set_rsp0(top: u64) {
+    tss.rsp0 = top
+}
+
+fn df_stack_bottom() -> u64 {
+    return DF_STACK.as_ptr() as u64
+}
+
+fn df_stack_top() -> u64 {
+    return DF_STACK.as_ptr() as u64 + 16384
+}
+
+fn gdt_entry(i: usize) -> u64 {
+    return gdt[i]
+}
+
+fn tss_ist1() -> u64 {
+    return tss.ist1
+}
+
+fn tss_address() -> u64 {
+    return &mut tss as *mut Tss as u64
+}
+
+fn tss_size() -> usize {
+    return sizeof(Tss)
+}
