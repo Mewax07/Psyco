@@ -59,7 +59,11 @@ impl Parser {
                     self.no_attrs(&attrs, "impl")?;
                     self.parse_impl(&mut program)?;
                 }
-                TokenKind::Static => program.statics.push(self.parse_static(attrs)?),
+                TokenKind::Static => {
+                    let s = self.parse_static(attrs)?;
+                    program.functions.extend(self.static_accessors(&s));
+                    program.statics.push(s);
+                }
                 TokenKind::Const => {
                     self.no_attrs(&attrs, "const")?;
                     program.consts.push(self.parse_const()?);
@@ -191,24 +195,29 @@ impl Parser {
     fn parse_attrs(&mut self) -> ParserResult<Vec<Attr>> {
         let mut attrs = Vec::new();
         while self.check(&TokenKind::Hash) {
-            let span = self.advance().span;
+            self.advance();
             self.expect(TokenKind::LBracket, "'['")?;
-            let (name, _) = self.expect_ident()?;
-            let arg = if self.eat(&TokenKind::LParen) {
-                let token = self.advance();
-                let TokenKind::Int(n) = token.kind else {
-                    return Err(ParserError {
-                        message: "attribute argument must be an integer".into(),
-                        span: token.span,
-                    });
+            loop {
+                let (name, span) = self.expect_ident()?;
+                let arg = if self.eat(&TokenKind::LParen) {
+                    let token = self.advance();
+                    let TokenKind::Int(n) = token.kind else {
+                        return Err(ParserError {
+                            message: "attribute argument must be an integer".into(),
+                            span: token.span,
+                        });
+                    };
+                    self.expect(TokenKind::RParen, "')'")?;
+                    Some(n)
+                } else {
+                    None
                 };
-                self.expect(TokenKind::RParen, "')'")?;
-                Some(n)
-            } else {
-                None
-            };
+                attrs.push(Attr { name, arg, span });
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+            }
             self.expect(TokenKind::RBracket, "']'")?;
-            attrs.push(Attr { name, arg, span });
         }
         Ok(attrs)
     }
@@ -492,6 +501,55 @@ impl Parser {
             attrs,
             span,
         })
+    }
+
+    fn static_accessors(&self, s: &StaticDef) -> Vec<Function> {
+        let mut out = Vec::new();
+        let span = s.span;
+        let var = |name: &str| Expr::new(ExprKind::Var(name.to_string()), span);
+        if has_attr(&s.attrs, "getter") {
+            out.push(Function {
+                name: format!("get_{}", s.name),
+                params: Vec::new(),
+                return_type: Some(s.r#type.clone()),
+                body: Block {
+                    stmts: vec![Stmt::Return {
+                        value: Some(var(&s.name)),
+                        span,
+                    }],
+                    span,
+                },
+                attrs: Vec::new(),
+                trusted: self.trusted,
+                span,
+            });
+        }
+        if has_attr(&s.attrs, "setter") {
+            const PARAM: &str = "value$";
+            out.push(Function {
+                name: format!("set_{}", s.name),
+                params: vec![Param {
+                    name: PARAM.into(),
+                    mutable: false,
+                    r#type: s.r#type.clone(),
+                    span,
+                }],
+                return_type: None,
+                body: Block {
+                    stmts: vec![Stmt::Assign {
+                        target: var(&s.name),
+                        op: None,
+                        value: var(PARAM),
+                        span,
+                    }],
+                    span,
+                },
+                attrs: Vec::new(),
+                trusted: self.trusted,
+                span,
+            });
+        }
+        out
     }
 
     fn parse_const(&mut self) -> ParserResult<ConstDef> {

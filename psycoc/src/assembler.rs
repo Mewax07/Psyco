@@ -797,7 +797,10 @@ impl Assembler {
 
     /// `mov sreg, ax`
     pub fn mov_sreg(&mut self, sreg: Sreg, src: Reg) {
-        assert!(!matches!(sreg, Sreg::Cs), "ICE: cs can only be loaded with a far jump/return");
+        assert!(
+            !matches!(sreg, Sreg::Cs),
+            "ICE: cs can only be loaded with a far jump/return"
+        );
         self.rex(false, 0, src.ext());
         self.byte(0x8E);
         self.modrm_rr(sreg as u8, src);

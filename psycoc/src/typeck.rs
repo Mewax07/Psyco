@@ -161,7 +161,14 @@ pub struct TypeChecker {
     static_ids: HashMap<String, usize>,
     functions: HashMap<String, FnSig>,
     trusted_fns: HashSet<String>,
+    accessors: HashMap<String, Accessor>,
     ctx: FnCtx,
+}
+
+#[derive(Debug, Clone)]
+enum Accessor {
+    Get(String),
+    Set(String),
 }
 
 impl TypeChecker {
@@ -178,6 +185,7 @@ impl TypeChecker {
             static_ids: HashMap::new(),
             functions: HashMap::new(),
             trusted_fns: HashSet::new(),
+            accessors: HashMap::new(),
             ctx: FnCtx::default(),
         }
     }
@@ -412,6 +420,23 @@ impl TypeChecker {
                 ("align", Some(n)) if n.is_power_of_two() && n <= 4096 => align = align.max(n),
                 ("align", _) => {
                     return self.err("#[align(N)] needs a power of two <= 4096", a.span);
+                }
+                ("getter", None) => {
+                    self.accessors
+                        .insert(format!("get_{}", s.name), Accessor::Get(s.name.clone()));
+                }
+                ("setter", None) if s.mutable => {
+                    self.accessors
+                        .insert(format!("set_{}", s.name), Accessor::Set(s.name.clone()));
+                }
+                ("setter", None) => {
+                    return self.err(
+                        format!("#[setter] needs a mutable static (write 'static mut {}')", s.name),
+                        a.span,
+                    );
+                }
+                ("getter" | "setter", Some(_)) => {
+                    return self.err(format!("#[{}] takes no argument", a.name), a.span);
                 }
                 _ => return self.err(format!("unknown static attribute '{}'", a.name), a.span),
             }
@@ -866,6 +891,7 @@ impl TypeChecker {
         let n = stmts.len();
         let mut last = (Type::Unit, 1u8);
         for (i, stmt) in stmts.iter_mut().enumerate() {
+            self.inline_setter(stmt);
             if i + 1 == n {
                 if let Stmt::Expr(e) = stmt {
                     let t = self.check_expr(e, last_hint)?;
@@ -878,6 +904,39 @@ impl TypeChecker {
             diverges |= self.check_stmt(stmt)?;
         }
         Ok((diverges, last.0, last.1))
+    }
+
+    fn inline_setter(&self, stmt: &mut Stmt) {
+        let Stmt::Expr(e) = stmt else {
+            return;
+        };
+        let ExprKind::Call { callee, args, .. } = &e.kind else {
+            return;
+        };
+        let ExprKind::Var(name) = &callee.kind else {
+            return;
+        };
+        let Some(Accessor::Set(st)) = self.accessors.get(name) else {
+            return;
+        };
+        if args.len() != 1 || self.lookup_local(name).is_some() || self.lookup_local(st).is_some() {
+            return;
+        }
+        let span = e.span;
+        let st = st.clone();
+        let Stmt::Expr(e) = std::mem::replace(stmt, Stmt::Expr(Expr::new(ExprKind::Bool(false), span)))
+        else {
+            unreachable!()
+        };
+        let ExprKind::Call { mut args, .. } = e.kind else {
+            unreachable!()
+        };
+        *stmt = Stmt::Assign {
+            target: Expr::new(ExprKind::Var(st), span),
+            op: None,
+            value: args.pop().unwrap(),
+            span,
+        };
     }
 
     fn expr_diverges(&self, e: &Expr) -> bool {
@@ -1951,6 +2010,15 @@ impl TypeChecker {
             }
             _ => None,
         };
+        if let Some(name) = &direct {
+            if let Some(Accessor::Get(st)) = self.accessors.get(name) {
+                if args.is_empty() && self.lookup_local(st).is_none() {
+                    let mut e = Expr::new(ExprKind::Var(st.clone()), span);
+                    let t = self.check_expr(&mut e, None)?;
+                    return Ok((e.kind, t));
+                }
+            }
+        }
         let Type::Fn(ft) = ct else {
             return self.err(
                 format!("cannot call a value of type {}", self.type_name(&ct)),
