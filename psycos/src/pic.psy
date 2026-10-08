@@ -1,44 +1,80 @@
-/// I'm starting to write the docs, so this file is this: https://wiki.osdev.org/8259_PIC
+/// Wiki Doc sources:
+///   - https://wiki.osdev.org/8259_PIC
+///   - https://wiki.osdev.org/Programmable_Interval_Timer
+///
+/// 8259 PIC (master + slave) and 8254 PIT.
+/// IRQs 0 to 15 are remapped to vectors 32 to 47, above the CPU exceptions
+/// (0 to 31). At first every IRQ is masked: each driver unmasks its own
+/// with pic_unmask.
 
 #![trusted]
 
+const pic1_command: u16 = 0x20
+const pic1_data: u16 = 0x21
+const pic2_command: u16 = 0xA0
+const pic2_data: u16 = 0xA1
+
+const irq_base: u8 = 32
+const irq_cascade: u8 = 2
+
+// Initialization and operation command words.
+const icw1_init_with_icw4: u8 = 0x11
+const icw3_slave_on_irq2: u8 = 4
+const icw3_slave_identity: u8 = 2
+const icw4_8086_mode: u8 = 1
+const ocw3_read_isr: u8 = 0x0B
+const pic_eoi_command: u8 = 0x20
+
+const pit_channel0: u16 = 0x40
+const pit_command: u16 = 0x43
+const pit_mode2_lohi: u8 = 0x34
+const pit_base_hz: u64 = 1193182
+const pit_max_divisor: u64 = 65535
+
+const io_wait_port: u16 = 0x80
+
 static mut pic_mask_bits: u16 = 0xFFFF
 
+/// Short delay between two writes (the 8259 is slow on real hardware).
 fn io_wait() {
-    outb(0x80, 0)
+    outb(io_wait_port, 0)
 }
 
+/// Remaps both PICs to vectors 32-47 and masks every IRQ.
 fn pic_init() {
-    // ICW1
-    outb(0x20, 0x11)
+    // ICW1: start initialization, ICW4 will follow.
+    outb(pic1_command, icw1_init_with_icw4)
     io_wait()
-    outb(0xA0, 0x11)
+    outb(pic2_command, icw1_init_with_icw4)
     io_wait()
-    // ICW2
-    outb(0x21, 32)
+    // ICW2: vector base.
+    outb(pic1_data, irq_base)
     io_wait()
-    outb(0xA1, 40)
+    outb(pic2_data, irq_base + 8)
     io_wait()
-    // ICW3
-    outb(0x21, 4)
+    // ICW3: slave wired to IRQ 2 of the master.
+    outb(pic1_data, icw3_slave_on_irq2)
     io_wait()
-    outb(0xA1, 2)
+    outb(pic2_data, icw3_slave_identity)
     io_wait()
-    // ICW4
-    outb(0x21, 1)
+    // ICW4: 8086 mode.
+    outb(pic1_data, icw4_8086_mode)
     io_wait()
-    outb(0xA1, 1)
+    outb(pic2_data, icw4_8086_mode)
     io_wait()
 
-    pic_mask_bits = 0xFFFF & ~(1u16 << 2)
+    // Everything masked, except the cascade so the slave can get through.
+    pic_mask_bits = 0xFFFF & ~(1u16 << irq_cascade as u16)
     pic_write_mask()
 }
 
+/// Sends the mask bits to both PICs.
 fn pic_write_mask() {
-    outb(0x21, (pic_mask_bits & 0xFF) as u8)
-    outb(0xA1, (pic_mask_bits >> 8) as u8)
+    outb(pic1_data, (pic_mask_bits & 0xFF) as u8)
+    outb(pic2_data, (pic_mask_bits >> 8) as u8)
 }
 
+/// Lets an IRQ through.
 fn pic_unmask(irq: u8) {
     if irq >= 16 {
         panic("pic_unmask: irq out of range")
@@ -47,47 +83,56 @@ fn pic_unmask(irq: u8) {
     pic_write_mask()
 }
 
+/// Blocks an IRQ.
 fn pic_mask(irq: u8) {
     if irq >= 16 {
         panic("pic_mask: irq out of range")
     }
     pic_mask_bits |= 1u16 << irq as u16
+    pic_write_mask()
 }
 
+/// True if the IRQ is masked.
 fn pic_masked(irq: u8) -> bool {
     return (pic_mask_bits >> (irq & 15) as u16) & 1 == 1
 }
 
+/// End of interrupt. An IRQ from the slave is acknowledged on both PICs.
 fn pic_eoi(irq: u8) {
     if irq >= 8 {
-        outb(0xA0, 0x20)
+        outb(pic2_command, pic_eoi_command)
     }
-    outb(0x20, 0x20)
+    outb(pic1_command, pic_eoi_command)
 }
 
+/// True if IRQ 7 / 15 is a spurious one (its bit is not in the ISR).
+/// A spurious IRQ from the slave still needs an EOI on the master.
 fn pic_spurious(irq: u8) -> bool {
     if irq == 7 {
-        outb(0x20, 0x0B)
-        return inb(0x20) & 0x80 == 0
+        outb(pic1_command, ocw3_read_isr)
+        return inb(pic1_command) & 0x80 == 0
     }
     if irq == 15 {
-        outb(0xA0, 0x0B)
-        if inb(0xA0) & 0x80 == 0 {
-            outb(0x20, 0x20)
+        outb(pic2_command, ocw3_read_isr)
+        if inb(pic2_command) & 0x80 == 0 {
+            outb(pic1_command, pic_eoi_command)
             return true
         }
     }
     return false
 }
 
+/// Sets PIT channel 0 to `hz` (rate generator), returns the real rate.
 fn pit_set_frequency(hz: u64) -> u64 {
-    let pit_hz: u64 = 1193182
-    let mut divisor = pit_hz / hz
-    if divisor > 65535 {
-        divisor = 65535
+    let mut divisor = pit_base_hz / hz
+    if divisor < 1 {
+        divisor = 1
     }
-    outb(0x43, 0x34)
-    outb(0x40, (divisor & 0xFF) as u8)
-    outb(0x40, (divisor >> 8) as u8)
-    return pit_hz / divisor
+    if divisor > pit_max_divisor {
+        divisor = pit_max_divisor
+    }
+    outb(pit_command, pit_mode2_lohi)
+    outb(pit_channel0, (divisor & 0xFF) as u8)
+    outb(pit_channel0, (divisor >> 8) as u8)
+    return pit_base_hz / divisor
 }

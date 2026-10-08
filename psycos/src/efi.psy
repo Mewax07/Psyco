@@ -1,4 +1,25 @@
+/// Wiki Doc sources:
+///   - https://wiki.osdev.org/UEFI
+///   - https://uefi.org/specs/UEFI/2.10/04_EFI_System_Table.html
+///   - https://uefi.org/specs/UEFI/2.10/07_Services_Boot_Services.html
+///   - https://uefi.org/specs/UEFI/2.10/08_Services_Runtime_Services.html
+///
+/// UEFI tables and the few firmware services the kernel still needs.
+/// The memory map is read right before ExitBootServices and kept here:
+/// it is the only description of RAM the kernel has.
+
 #![trusted]
+
+const max_exit_attempts: i64 = 8
+
+const mem_loader_code: u32 = 1
+const mem_loader_data: u32 = 2
+const mem_boot_services_code: u32 = 3
+const mem_boot_services_data: u32 = 4
+const mem_conventional: u32 = 7
+
+const reset_cold: u32 = 0
+const reset_shutdown: u32 = 2
 
 struct TableHeader {
     signature: u64,
@@ -130,24 +151,29 @@ struct SystemTable {
     boot_services: *mut BootServices,
 }
 
-static mut st: *mut SystemTable
-static mut map: [u8; 16384]
-static mut map_size: usize = 0
-static mut map_desc_size: usize = 0
-static mut boot_services_done: bool = false
-
+// What the rest of the kernel sees of one memory map entry.
 struct MemRegion {
     kind: u32,
     start: u64,
     pages: u64,
 }
 
+static mut st: *mut SystemTable
+static mut map: [u8; 16384]
+static mut map_size: usize = 0
+static mut map_desc_size: usize = 0
+
+#[getter]
+static mut boot_services_done: bool = false
+
+/// Saves the system table and disables the firmware watchdog.
 fn efi_init() {
     st = efi_system_table() as *mut SystemTable
     let bs = (*st).boot_services
     (*bs).set_watchdog_timer(0, 0, 0, 0 as *const u16)
 }
 
+/// Reads the memory map into `map`, returns its key (-1 on error).
 fn read_memory_map() -> i64 {
     let bs = (*st).boot_services
     let mut size: usize = map.len()
@@ -164,13 +190,16 @@ fn read_memory_map() -> i64 {
     return key as i64
 }
 
+/// Leaves the firmware boot services, retrying if the map key changed.
+/// Nothing may allocate memory between GetMemoryMap and ExitBootServices.
+/// Afterwards only the runtime services (time, reset) are usable.
 fn exit_boot_services() -> bool {
     if boot_services_done {
         return true
     }
     let bs = (*st).boot_services
     let image = efi_image_handle()
-    for attempt in 0..8 {
+    for attempt in 0..max_exit_attempts {
         let key = read_memory_map()
         if key < 0 {
             return false
@@ -183,10 +212,7 @@ fn exit_boot_services() -> bool {
     return false
 }
 
-fn boot_services_exited() -> bool {
-    return boot_services_done
-}
-
+/// Number of entries in the saved memory map.
 fn memory_map_entries() -> usize {
     if map_desc_size == 0 {
         return 0
@@ -194,6 +220,7 @@ fn memory_map_entries() -> usize {
     return map_size / map_desc_size
 }
 
+/// Entry `i` of the saved memory map.
 fn memory_region(i: usize) -> MemRegion {
     if i >= memory_map_entries() {
         panic("memory_region: index out of bounds")
@@ -202,10 +229,11 @@ fn memory_region(i: usize) -> MemRegion {
     return MemRegion {
         kind: (*d).kind,
         start: (*d).physical_start,
-        pages: (*d).number_of_pages
+        pages: (*d).number_of_pages,
     }
 }
 
+/// Free 4 KiB pages reported by the firmware (EfiConventionalMemory only).
 fn free_pages() -> u64 {
     if !boot_services_done {
         read_memory_map()
@@ -213,13 +241,14 @@ fn free_pages() -> u64 {
     let mut pages: u64 = 0
     for i in 0..memory_map_entries() {
         let r = memory_region(i)
-        if r.kind == 7u32 {
+        if r.kind == mem_conventional {
             pages += r.pages
         }
     }
     return pages
 }
 
+/// Byte `i` of a string (bounds checked).
 fn str_byte(s: Str, i: usize) -> u8 {
     if i >= s.len() {
         panic("str_byte: index out of bounds")
@@ -227,6 +256,7 @@ fn str_byte(s: Str, i: usize) -> u8 {
     return s.as_ptr().add(i).read()
 }
 
+/// Current date and time from the firmware clock.
 fn now() -> Time {
     let mut t: Time
     let rt = (*st).runtime_services
@@ -234,6 +264,7 @@ fn now() -> Time {
     return t
 }
 
+/// Copies the firmware vendor name (UTF-16) as ASCII, returns its length.
 fn firmware_vendor(buf: &mut [u8]) -> usize {
     let name = (*st).firmware_vendor
     if name.is_null() {
@@ -255,16 +286,19 @@ fn firmware_vendor(buf: &mut [u8]) -> usize {
     return n
 }
 
+/// UEFI revision: major in the high 16 bits, minor * 10 in the low bits.
 fn uefi_revision() -> u32 {
     return (*st).hdr.revision
 }
 
+/// Restarts the machine.
 fn reboot() {
     let rt = (*st).runtime_services
-    (*rt).reset_system(0, 0, 0, 0 as *const u8)
+    (*rt).reset_system(reset_cold, 0, 0, 0 as *const u8)
 }
 
+/// Powers the machine off.
 fn shutdown() {
     let rt = (*st).runtime_services
-    (*rt).reset_system(2, 0, 0, 0 as *const u8)
+    (*rt).reset_system(reset_shutdown, 0, 0, 0 as *const u8)
 }

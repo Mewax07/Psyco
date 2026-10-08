@@ -1,25 +1,39 @@
+/// Wiki Doc sources:
+///   - https://wiki.osdev.org/Stack
+///
+/// Kernel stack. The firmware starts us on its own stack, in
+/// BootServicesData memory. After ExitBootServices, we switch to a stack
+/// that belongs to the kernel image (.bss section).
+
 #![trusted]
 
+const kstack_size: usize = 65536
+const kstack_fill: u8 = 0xA5
+
 #[align(4096)]
-static mut KSTACK: [u8; 65536]
+static mut kstack: [u8; 65536]
 
+/// Lowest address of the kernel stack.
 fn kstack_bottom() -> usize {
-    return KSTACK.as_ptr() as usize
+    return kstack.as_ptr() as usize
 }
 
+/// Address just above the kernel stack (initial rsp).
 fn kstack_top() -> usize {
-    return KSTACK.as_ptr() as usize + 65536
+    return kstack.as_ptr() as usize + kstack_size
 }
 
+/// Fills the stack with a pattern, then calls `entry` on it. Never returns.
 fn run_on_kernel_stack(entry: fn()) {
-    memset(KSTACK.as_mut_ptr(), 0xA5u8, 65536)
+    memset(kstack.as_mut_ptr(), kstack_fill, kstack_size)
     switch_stack(kstack_top(), entry)
 }
 
+/// Deepest stack use so far, in bytes (high-water mark).
 fn kstack_used() -> usize {
     let mut untouched: usize = 0
-    while untouched < 65536 && KSTACK[untouched] == 0xA5u8 {
+    while untouched < kstack_size && kstack[untouched] == kstack_fill {
         untouched += 1
     }
-    return 65536 - untouched
+    return kstack_size - untouched
 }

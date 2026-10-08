@@ -193,13 +193,20 @@ impl Analysis {
         if let TokenKind::Ident(name) = &t.kind {
             return name.chars().count();
         }
-        let n = self
+        let rest: Vec<char> = self
             .line(t.span.line)
             .chars()
             .skip(t.span.col.saturating_sub(1))
-            .take_while(|c| is_word(*c))
-            .count();
-        n.max(1)
+            .collect();
+        if rest.first() == Some(&'\'') {
+            // Character literal: up to the closing quote, skipping escapes.
+            let mut k = 1;
+            while k < rest.len() && rest[k] != '\'' {
+                k += if rest[k] == '\\' { 2 } else { 1 };
+            }
+            return (k + 1).min(rest.len()).max(1);
+        }
+        rest.iter().take_while(|c| is_word(**c)).count().max(1)
     }
 
     pub fn tok_range(&self, i: usize) -> Range {
@@ -220,6 +227,54 @@ impl Analysis {
                 && t.span.col <= col
                 && col <= t.span.col + self.tok_len(i)
                 && self.line(line).chars().nth(t.span.col - 1).is_some_and(is_word)
+        })
+    }
+
+    /// `{` minus `}` before token index `upto`.
+    pub fn brace_depth(&self, upto: usize) -> i32 {
+        self.tokens[..upto.min(self.tokens.len())]
+            .iter()
+            .map(|t| match t.kind {
+                TokenKind::LBrace => 1,
+                TokenKind::RBrace => -1,
+                _ => 0,
+            })
+            .sum()
+    }
+
+    /// Name inside `#[name]` or `#![name]`.
+    pub fn is_attribute_name(&self, tok: usize) -> bool {
+        if self.ident(tok).is_none() {
+            return false;
+        }
+        // Walk back over `name(arg),` items of a `#[a, b(1), c]` list.
+        let mut k = tok;
+        while *self.kind_before(k, 1) == TokenKind::Comma {
+            k -= 1;
+            if *self.kind_before(k, 1) == TokenKind::RParen {
+                k = k.saturating_sub(3);
+            }
+            if k == 0 || self.ident(k - 1).is_none() {
+                return false;
+            }
+            k -= 1;
+        }
+        *self.kind_before(k, 1) == TokenKind::LBracket
+            && (*self.kind_before(k, 2) == TokenKind::Hash
+                || (*self.kind_before(k, 2) == TokenKind::Bang
+                    && *self.kind_before(k, 3) == TokenKind::Hash))
+    }
+
+    /// Integer or character literal under the cursor.
+    pub fn literal_at(&self, p: Position) -> Option<usize> {
+        let (line, col) = self.line_col(p);
+        let after = self.cursor_index(line, col + 1);
+        (after.saturating_sub(2)..after).rev().find(|&i| {
+            let t = &self.tokens[i];
+            matches!(t.kind, TokenKind::Int(_) | TokenKind::IntSuffix(..))
+                && t.span.line == line
+                && t.span.col <= col
+                && col <= t.span.col + self.tok_len(i)
         })
     }
 
@@ -572,6 +627,76 @@ impl Analysis {
             scope: None,
             explicit_type: true,
         });
+
+        // `#[getter]` / `#[setter]` on a static generate `get_NAME()` / `set_NAME(value)`.
+        if *self.kind(i) != TokenKind::Static {
+            return;
+        }
+        let attrs = self.attributes_before(i);
+        let ty_start = j + 2;
+        let ty_end = (ty_start..self.tokens.len())
+            .find(|&k| {
+                self.tokens[k].span.line != line
+                    || matches!(self.tokens[k].kind, TokenKind::Eq | TokenKind::Eof)
+            })
+            .unwrap_or(self.tokens.len());
+        let ty = if *self.kind(j + 1) == TokenKind::Colon {
+            self.text(ty_start, ty_end)
+        } else {
+            "?".into()
+        };
+        let accessor = |name: String, detail: String, params: Vec<String>| Def {
+            name,
+            kind: DefKind::Function,
+            tok: j,
+            start_tok: i,
+            end_tok,
+            container: Some(self.ident(j).unwrap_or_default().to_string()),
+            detail,
+            params,
+            scope: None,
+            explicit_type: true,
+        };
+        let name = self.ident(j).unwrap_or_default().to_string();
+        let mut generated = Vec::new();
+        if attrs.iter().any(|a| a == "getter") {
+            generated.push(accessor(format!("get_{name}"), format!("fn get_{name}() -> {ty}"), Vec::new()));
+        }
+        if attrs.iter().any(|a| a == "setter") {
+            let param = format!("value: {ty}");
+            generated.push(accessor(
+                format!("set_{name}"),
+                format!("fn set_{name}({param})"),
+                vec![param],
+            ));
+        }
+        for def in generated {
+            self.push(def);
+        }
+    }
+
+    /// Names in the `#[...]` attributes right before token `i`.
+    fn attributes_before(&self, i: usize) -> Vec<String> {
+        let mut names = Vec::new();
+        let mut end = i;
+        while end >= 1 && *self.kind(end - 1) == TokenKind::RBracket {
+            let close = end - 1;
+            let Some(open) = (0..close).rev().find(|&k| *self.kind(k) == TokenKind::LBracket) else {
+                break;
+            };
+            if open == 0 || *self.kind(open - 1) != TokenKind::Hash {
+                break;
+            }
+            for k in open + 1..close {
+                if let Some(n) = self.ident(k) {
+                    if matches!(self.kind(k - 1), TokenKind::LBracket | TokenKind::Comma) {
+                        names.push(n.to_string());
+                    }
+                }
+            }
+            end = open - 1;
+        }
+        names
     }
 
     fn index_let(&mut self, i: usize) {
@@ -627,7 +752,7 @@ impl Analysis {
             detail: format!("for {name} in {range}"),
             params: Vec::new(),
             scope: Some((i + 1, body.map_or(i + 1, |b| self.close(b)))),
-            explicit_type: true,
+            explicit_type: false,
         });
     }
 

@@ -1,6 +1,20 @@
+/// Wiki Doc sources:
+///   - https://wiki.osdev.org/GOP
+///   - https://wiki.osdev.org/Drawing_In_a_Linear_Framebuffer
+///   - https://uefi.org/specs/UEFI/2.10/12_Protocols_Console_Support.html
+///
+/// Linear framebuffer from the UEFI Graphics Output Protocol (GOP).
+/// fb_init() must run before ExitBootServices: it only reads the address of
+/// the framebuffer. After that, drawing writes straight to video memory.
+/// Colors are always 0x00RRGGBB, whatever the byte order of the screen.
+
 #![trusted]
 
 import "efi.psy"
+
+const pixel_rgb: u32 = 0
+const pixel_bgr: u32 = 1
+const bytes_per_pixel: usize = 4
 
 struct GopModeInfo {
     version: u32,
@@ -10,7 +24,7 @@ struct GopModeInfo {
     red_mask: u32,
     green_mask: u32,
     blue_mask: u32,
-    reserved_mark: u32,
+    reserved_mask: u32,
     pixels_per_scan_line: u32,
 }
 
@@ -27,22 +41,27 @@ struct Gop {
     query_mode: *mut u8,
     set_mode: *mut u8,
     blt: *mut u8,
-    mode: *mut GopMode
+    mode: *mut GopMode,
 }
 
+#[getter]
 static mut fb_base: *mut u32
+#[getter]
 static mut fb_size: usize = 0
-static mut fb_w: usize = 0
-static mut fb_h: usize = 0
+#[getter]
+static mut fb_width: usize = 0
+#[getter]
+static mut fb_height: usize = 0
 static mut fb_stride: usize = 0
 static mut fb_rgb: bool = false
 
+/// Finds the GOP and saves the framebuffer (false if none is usable).
 fn fb_init() -> bool {
     let guid = Guid {
         d1: 0x9042a9de,
         d2: 0x23dc,
         d3: 0x4a38,
-        d4: [0x96, 0xfb, 0x7a, 0xde, 0xd0, 0x80, 0x51, 0x6a]
+        d4: [0x96, 0xfb, 0x7a, 0xde, 0xd0, 0x80, 0x51, 0x6a],
     }
     let bs = (*st).boot_services
     let mut gop = 0 as *mut u8
@@ -54,36 +73,20 @@ fn fb_init() -> bool {
     let mode = (*(gop as *mut Gop)).mode
     let info = (*mode).info
     let format = (*info).pixel_format
-    if format != 0u32 && format != 1u32 {
+    if format != pixel_rgb && format != pixel_bgr {
         return false
     }
 
     fb_base = (*mode).frame_buffer_base as *mut u32
     fb_size = (*mode).frame_buffer_size
-    fb_w = (*info).width as usize
-    fb_h = (*info).height as usize
+    fb_width = (*info).width as usize
+    fb_height = (*info).height as usize
     fb_stride = (*info).pixels_per_scan_line as usize
-    fb_rgb = format == 0u32
-    return !fb_base.is_null() && fb_w > 0 && fb_h > 0
+    fb_rgb = format == pixel_rgb
+    return !fb_base.is_null() && fb_width > 0 && fb_height > 0
 }
 
-fn fb_width() -> usize {
-    return fb_w
-}
-
-fn fb_height() -> usize {
-    return fb_h
-}
-
-fn fb_address() -> u64 {
-    return fb_base as u64
-}
-
-fn fb_bytes() -> usize {
-    return fb_size
-}
-
-// 0x00RRGGBB
+/// Converts 0x00RRGGBB to the framebuffer byte order (its own inverse).
 fn to_native(color: u32) -> u32 {
     if fb_rgb {
         return ((color & 0xFF) << 16) | (color & 0xFF00) | ((color >> 16) & 0xFF)
@@ -91,31 +94,34 @@ fn to_native(color: u32) -> u32 {
     return color & 0xFFFFFF
 }
 
+/// Draws one pixel (ignored outside the screen).
 fn put_pixel(x: usize, y: usize, color: u32) {
-    if x >= fb_w || y >= fb_h {
+    if x >= fb_width || y >= fb_height {
         return
     }
     fb_base.add(y * fb_stride + x).write(to_native(color))
 }
 
+/// Reads one pixel back (0 outside the screen).
 fn get_pixel(x: usize, y: usize) -> u32 {
-    if x >= fb_w || y >= fb_h {
+    if x >= fb_width || y >= fb_height {
         return 0
     }
     return to_native(fb_base.add(y * fb_stride + x).read())
 }
 
+/// Fills a rectangle, clipped to the screen.
 fn fill_rect(x: usize, y: usize, w: usize, h: usize, color: u32) {
-    if x >= fb_w || y >= fb_h {
+    if x >= fb_width || y >= fb_height {
         return
     }
     let mut cw = w
     let mut ch = h
-    if cw > fb_w - x {
-        cw = fb_w - x
+    if cw > fb_width - x {
+        cw = fb_width - x
     }
-    if ch > fb_h - y {
-        ch = fb_h - y
+    if ch > fb_height - y {
+        ch = fb_height - y
     }
     let c = to_native(color)
     let mut row = fb_base.add(y * fb_stride + x)
@@ -128,11 +134,11 @@ fn fill_rect(x: usize, y: usize, w: usize, h: usize, color: u32) {
 }
 
 fn fb_scroll_up(dy: usize, color: u32) {
-    if dy >= fb_h {
-        fill_rect(0, 0, fb_w, fb_h, color)
+    if dy >= fb_height {
+        fill_rect(0, 0, fb_width, fb_height, color)
         return
     }
-    let line = fb_stride * 4
-    memcpy(fb_base as *mut u8, fb_base.add(dy * fb_stride) as *const u8, (fb_h - dy) * line)
-    fill_rect(0, fb_h - dy, fb_w, dy, color)
+    let line = fb_stride * bytes_per_pixel
+    memcpy(fb_base as *mut u8, fb_base.add(dy * fb_stride) as *const u8, (fb_height - dy) * line)
+    fill_rect(0, fb_height - dy, fb_width, dy, color)
 }

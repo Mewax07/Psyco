@@ -71,7 +71,8 @@
 ; ---- attributes ---------------------------------------------------------
 
 (attribute) @attribute
-(attribute name: (identifier) @attribute)
+(attribute_item name: (identifier) @attribute)
+(attribute_item argument: (integer_literal) @number)
 (inner_attribute) @attribute
 (inner_attribute (identifier) @attribute)
 

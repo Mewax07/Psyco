@@ -1,7 +1,18 @@
+/// Wiki Doc sources:
+///   - https://wiki.osdev.org/Serial_Ports
+///
+/// COM1 serial port. The psycoc runtime already initializes it at boot
+/// (38400 baud, 8N1), so this file only reads and writes bytes.
+/// Works before and after ExitBootServices.
+
 #![trusted]
 
-const COM1: u16 = 0x3F8
+const com1: u16 = 0x3F8
+const com1_line_status: u16 = 0x3FD
+const lsr_data_ready: u8 = 0x01
+const lsr_transmit_empty: u8 = 0x20
 
+/// Sends one byte, turning '\n' into "\r\n".
 fn serial_putc(c: u8) {
     if c == '\n' {
         serial_raw('\r')
@@ -9,16 +20,18 @@ fn serial_putc(c: u8) {
     serial_raw(c)
 }
 
+/// Sends one byte as is, waiting for the transmitter.
 fn serial_raw(c: u8) {
-    while inb(COM1 + 5) & 0x20 == 0 {
+    while inb(com1_line_status) & lsr_transmit_empty == 0 {
         pause()
     }
-    outb(COM1, c)
+    outb(com1, c)
 }
 
+/// Received byte, or -1 if nothing arrived (non-blocking).
 fn serial_poll() -> i32 {
-    if inb(COM1 + 5) & 0x01 == 0 {
+    if inb(com1_line_status) & lsr_data_ready == 0 {
         return -1
     }
-    return inb(COM1) as i32
+    return inb(com1) as i32
 }

@@ -1,19 +1,42 @@
+/// Wiki Doc sources:
+///   - https://wiki.osdev.org/Exceptions
+///   - https://wiki.osdev.org/Exceptions#Page_Fault
+///   - https://wiki.osdev.org/Exceptions#Selector_Error_Code
+///   - https://wiki.osdev.org/Exceptions#Double_Fault
+///
+/// CPU exceptions (vectors 0 to 21) and the panic screen.
+/// Normal code: only idt.psy and gdt.psy are trusted.
+
 import "idt.psy"
 import "console.psy"
 
+const panic_background: u32 = 0x00002A
+const panic_title: u32 = 0xFF5555
+
+// Test exit code: 64 + vector.
+const panic_exit_base: i32 = 64
+
+const vector_double_fault: u64 = 8
+const vector_alignment_check: u64 = 17
+const vector_page_fault: u64 = 14
+const vector_control_protection: u64 = 21
+
+// Page fault error code bits.
+const pf_present: u64 = 1
+const pf_write: u64 = 2
+const pf_user: u64 = 4
+const pf_reserved: u64 = 8
+const pf_fetch: u64 = 16
+
+#[getter]
 static mut breakpoints: u64 = 0
+
+// For automatic tests: after the panic screen, quit QEMU with
+// 64 + vector instead of halting the machine.
+#[setter]
 static mut panic_exit: bool = false
 
-fn panic_set_exit(on: bool) {
-    panic_exit = on
-}
-
-fn breakpoint_count() -> u64 {
-    return breakpoints
-}
-
-// https://wiki.osdev.org/Exceptions
-// And promise I will add a understable doc with redirection to the wiki: https://wiki.osdev.org/Expanded_Main_Page
+/// Short name of an exception vector.
 fn exception_name(v: u64) -> Str {
     match v {
         0 => return "#DE divide error",
@@ -40,6 +63,7 @@ fn exception_name(v: u64) -> Str {
     }
 }
 
+/// Installs every exception handler and loads the IDT.
 fn exceptions_init() {
     idt_set_gate(0, exc_de as u64, 0)
     idt_set_gate(1, exc_db as u64, 0)
@@ -49,7 +73,7 @@ fn exceptions_init() {
     idt_set_gate(5, exc_br as u64, 0)
     idt_set_gate(6, exc_ud as u64, 0)
     idt_set_gate(7, exc_nm as u64, 0)
-    idt_set_gate(8, exc_df as u64, 1)
+    idt_set_gate(8, exc_df as u64, ist_double_fault)
     idt_set_gate(10, exc_ts as u64, 0)
     idt_set_gate(11, exc_np as u64, 0)
     idt_set_gate(12, exc_ss as u64, 0)
@@ -64,101 +88,121 @@ fn exceptions_init() {
     idt_load()
 }
 
+/// #DE divide error.
 #[interrupt]
 fn exc_de(frame: &Frame) {
     fatal(0, frame, 0, false)
 }
 
+/// #DB debug.
 #[interrupt]
 fn exc_db(frame: &Frame) {
     fatal(1, frame, 0, false)
 }
 
+/// NMI.
 #[interrupt]
 fn exc_nmi(frame: &Frame) {
     fatal(2, frame, 0, false)
 }
 
+/// #OF overflow.
 #[interrupt]
 fn exc_of(frame: &Frame) {
     fatal(4, frame, 0, false)
 }
 
+/// #BR bound range exceeded.
 #[interrupt]
 fn exc_br(frame: &Frame) {
     fatal(5, frame, 0, false)
 }
 
+/// #UD invalid opcode.
 #[interrupt]
 fn exc_ud(frame: &Frame) {
     fatal(6, frame, 0, false)
 }
 
+/// #NM device not available.
 #[interrupt]
 fn exc_nm(frame: &Frame) {
     fatal(7, frame, 0, false)
 }
 
+/// #DF double fault (runs on IST1).
 #[interrupt]
 fn exc_df(frame: &Frame, code: u64) {
     fatal(8, frame, code, true)
 }
 
+/// #TS invalid TSS.
 #[interrupt]
 fn exc_ts(frame: &Frame, code: u64) {
     fatal(10, frame, code, true)
 }
 
+/// #NP segment not present.
 #[interrupt]
 fn exc_np(frame: &Frame, code: u64) {
     fatal(11, frame, code, true)
 }
 
+/// #SS stack-segment fault.
 #[interrupt]
 fn exc_ss(frame: &Frame, code: u64) {
     fatal(12, frame, code, true)
 }
 
+/// #GP general protection fault.
 #[interrupt]
 fn exc_gp(frame: &Frame, code: u64) {
     fatal(13, frame, code, true)
 }
 
+/// #PF page fault.
 #[interrupt]
 fn exc_pf(frame: &Frame, code: u64) {
     fatal(14, frame, code, true)
 }
 
+/// #MF x87 floating-point error.
 #[interrupt]
 fn exc_mf(frame: &Frame) {
     fatal(16, frame, 0, false)
 }
 
+/// #AC alignment check.
 #[interrupt]
 fn exc_ac(frame: &Frame, code: u64) {
     fatal(17, frame, code, true)
 }
 
+/// #MC machine check.
 #[interrupt]
 fn exc_mc(frame: &Frame) {
     fatal(18, frame, 0, false)
 }
 
+/// #XM SIMD floating-point error.
 #[interrupt]
 fn exc_xm(frame: &Frame) {
     fatal(19, frame, 0, false)
 }
 
+/// #VE virtualization exception.
 #[interrupt]
 fn exc_ve(frame: &Frame) {
     fatal(20, frame, 0, false)
 }
 
+/// #CP control protection.
 #[interrupt]
 fn exc_cp(frame: &Frame, code: u64) {
     fatal(21, frame, code, true)
 }
 
+/// #BP (int3): counts it and resumes right after the instruction.
 #[interrupt]
 fn exc_bp(frame: &Frame) {
     breakpoints += 1
@@ -167,11 +211,13 @@ fn exc_bp(frame: &Frame) {
     putc('\n')
 }
 
+/// Approximate current rsp (address of a local).
 fn stack_pointer() -> u64 {
     let marker: u64 = 0
     return &marker as *const u64 as u64
 }
 
+/// Prints "NAME=0x0123456789ABCDEF  ".
 fn put_reg(name: Str, v: u64) {
     puts(name)
     puts("=0x")
@@ -179,39 +225,41 @@ fn put_reg(name: Str, v: u64) {
     puts("  ")
 }
 
+/// Explains an error code in words.
 fn put_error_code(vector: u64, code: u64) {
-    if vector == 14 {
-        if code & 1 != 0 {
+    if vector == vector_page_fault {
+        if code & pf_present != 0 {
             puts("protection violation")
         } else {
             puts("page not present")
         }
-        if code & 2 != 0 {
+        if code & pf_write != 0 {
             puts(", write")
         } else {
             puts(", read")
         }
-        if code & 4 != 0 {
+        if code & pf_user != 0 {
             puts(", user")
         } else {
             puts(", kernel")
         }
-        if code & 16 != 0 {
+        if code & pf_fetch != 0 {
             puts(", instruction fetch")
         }
-        if code & 8 != 0 {
+        if code & pf_reserved != 0 {
             puts(", reserved bit set")
         }
         return
     }
-    if vector == 8 || vector == 17 {
+    if vector == vector_double_fault || vector == vector_alignment_check {
         puts("always zero")
         return
     }
-    if vector == 21 {
+    if vector == vector_control_protection {
         puts("control-flow violation")
         return
     }
+    // Selector error code (#TS, #NP, #SS, #GP).
     if code == 0 {
         puts("no selector")
         return
@@ -219,14 +267,12 @@ fn put_error_code(vector: u64, code: u64) {
     let table = (code >> 1) & 3
     if table == 1 || table == 3 {
         puts("IDT vector ")
+        put_u64(code >> 3)
     } else if table == 0 {
         puts("GDT selector 0x")
+        put_hex_width(code & 0xFFF8, 4)
     } else {
         puts("LDT selector 0x")
-    }
-    if table == 1 || table == 3 {
-        put_u64(code >> 3)
-    } else {
         put_hex_width(code & 0xFFF8, 4)
     }
     if code & 1 != 0 {
@@ -234,14 +280,15 @@ fn put_error_code(vector: u64, code: u64) {
     }
 }
 
+/// Panic screen: exception, error code, registers, then halt.
 fn fatal(vector: u64, frame: &Frame, code: u64, has_code: bool) {
     cli()
     let regs = saved_regs(frame, has_code)
     let sp = stack_pointer()
 
-    set_colors(white, 0x00002A)
+    set_colors(white, panic_background)
     clear()
-    set_color(0xFF5555)
+    set_color(panic_title)
     puts("*** KERNEL PANIC ***\n")
     set_color(white)
     puts("Exception ")
@@ -256,7 +303,7 @@ fn fatal(vector: u64, frame: &Frame, code: u64, has_code: bool) {
         put_error_code(vector, code)
         puts(")\n")
     }
-    if vector == 14 {
+    if vector == vector_page_fault {
         puts("Faulting address (CR2): 0x")
         put_hex_width(read_cr2(), 16)
         putc('\n')
@@ -305,7 +352,7 @@ fn fatal(vector: u64, frame: &Frame, code: u64, has_code: bool) {
     set_color(white)
     puts("\nSystem halted.\n")
     if panic_exit {
-        exit(64 + vector as i32)
+        exit(panic_exit_base + vector as i32)
     }
     loop {
         cli()

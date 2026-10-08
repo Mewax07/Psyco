@@ -7,7 +7,7 @@ description = "Language support for Psyco"
 
 [grammars.psyco]
 repository = "https://github.com/Mewax07/psyco-tree-sitter"
-commit = "f2302f47c6614eb5178efa5b2ed4ebacb62379d6"
+commit = "470ef4cab3279cc061980a7aa12d44182233eaff"
 
 [language_servers.psyco-lsp]
 name = "Psyco LSP"

@@ -24,14 +24,20 @@ pub fn check(an: &Analysis, path: Option<&Path>, loader: &Loader) -> CheckResult
     let mut let_types = HashMap::new();
     let outcome = panic::catch_unwind(AssertUnwindSafe(|| run(an, path, loader, &mut let_types)));
     let diagnostics = match outcome {
-        Ok(Some((range, message))) => vec![Diagnostic {
-            range,
-            severity: Some(DiagnosticSeverity::ERROR),
-            source: Some("psycoc".into()),
-            message,
-            ..Default::default()
-        }],
-        Ok(None) => Vec::new(),
+        Ok(errors) => {
+            let mut seen = HashSet::new();
+            errors
+                .into_iter()
+                .filter(|(range, message)| seen.insert((range.start, message.clone())))
+                .map(|(range, message)| Diagnostic {
+                    range,
+                    severity: Some(DiagnosticSeverity::ERROR),
+                    source: Some("psycoc".into()),
+                    message,
+                    ..Default::default()
+                })
+                .collect()
+        }
         Err(_) => {
             eprintln!("psyco-lsp: the compiler panicked while checking the document");
             Vec::new()
@@ -48,16 +54,16 @@ fn run(
     path: Option<&Path>,
     loader: &Loader,
     let_types: &mut HashMap<(usize, usize), String>,
-) -> Option<(Range, String)> {
+) -> Vec<(Range, String)> {
     let at = |s: Span| an.word_range(s.line, s.col);
 
     let tokens = match Lexer::with_file(&an.text, 0).tokenize() {
         Ok(t) => t,
-        Err(e) => return Some((at(e.span), e.message)),
+        Err(e) => return vec![(at(e.span), e.message)],
     };
     let mut program = match Parser::new(tokens).parse_program() {
         Ok(p) => p,
-        Err(e) => return Some((at(e.span), e.message)),
+        Err(e) => return vec![(at(e.span), e.message)],
     };
 
     let mut paths: Vec<Option<PathBuf>> = vec![path.map(Path::to_path_buf)];
@@ -79,7 +85,7 @@ fn run(
         }
         let display = target.to_string_lossy().replace('\\', "/");
         let Some(src) = (loader.read)(&target) else {
-            return Some((at(root), format!("cannot read {display}")));
+            return vec![(at(root), format!("cannot read {display}"))];
         };
         let file = paths.len();
         paths.push(Some(target));
@@ -96,7 +102,7 @@ fn run(
                 program.merge(p);
             }
             Err((s, message)) => {
-                return Some((at(root), format!("{display}:{}:{}: {message}", s.line, s.col)));
+                return vec![(at(root), format!("{display}:{}:{}: {message}", s.line, s.col))];
             }
         }
     }
@@ -121,27 +127,60 @@ fn run(
         });
     }
 
-    match TypeChecker::new().check_program(&mut program) {
-        Err(e) if e.span.file == 0 => Some((at(e.span), e.message)),
-        Err(e) => {
+    // The checker stops at the first error. To report the others and still
+    // know the types everywhere else, replace the body of the function that
+    // failed with `loop {}` and check again.
+    let mut errors = Vec::new();
+    let mut stubbed = HashSet::new();
+    loop {
+        let mut attempt = program.clone();
+        let e = match TypeChecker::new().check_program(&mut attempt) {
+            Ok(_) => {
+                for f in &attempt.functions {
+                    collect_block(&f.body, &attempt, let_types);
+                }
+                break;
+            }
+            Err(e) => e,
+        };
+        errors.push(if e.span.file == 0 {
+            (at(e.span), e.message)
+        } else {
             let file = paths
                 .get(e.span.file)
                 .cloned()
                 .flatten()
                 .map_or_else(|| "<import>".into(), |p| p.to_string_lossy().replace('\\', "/"));
             let root = origin.get(e.span.file).copied().flatten().unwrap_or(e.span);
-            Some((
+            (
                 at(root),
                 format!("{file}:{}:{}: {}", e.span.line, e.span.col, e.message),
-            ))
-        }
-        Ok(_) => {
-            for f in &program.functions {
-                collect_block(&f.body, &program, let_types);
-            }
-            None
-        }
+            )
+        });
+
+        // The function whose `fn` comes last before the error.
+        let culprit = program
+            .functions
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| {
+                f.span.file == e.span.file && (f.span.line, f.span.col) <= (e.span.line, e.span.col)
+            })
+            .max_by_key(|(_, f)| (f.span.line, f.span.col))
+            .map(|(i, _)| i);
+        let Some(i) = culprit.filter(|&i| stubbed.insert(i)) else {
+            break;
+        };
+        let body = &mut program.functions[i].body;
+        body.stmts = vec![Stmt::Loop {
+            body: Block {
+                stmts: Vec::new(),
+                span: body.span,
+            },
+            span: body.span,
+        }];
     }
+    errors
 }
 
 fn collect_block(b: &Block, p: &Program, out: &mut HashMap<(usize, usize), String>) {
@@ -169,9 +208,16 @@ fn collect_stmt(s: &Stmt, p: &Program, out: &mut HashMap<(usize, usize), String>
                 collect_block(e, p, out);
             }
         }
-        Stmt::While { body, .. } | Stmt::Loop { body, .. } | Stmt::For { body, .. } => {
+        Stmt::For {
+            start, body, span, ..
+        } => {
+            // Keyed by the `for` keyword: the type of the loop variable.
+            if let (0, Some(t)) = (span.file, &start.r#type) {
+                out.insert((span.line, span.col), type_name(t, p));
+            }
             collect_block(body, p, out)
         }
+        Stmt::While { body, .. } | Stmt::Loop { body, .. } => collect_block(body, p, out),
         Stmt::Match { arms, .. } => {
             for arm in arms {
                 collect_block(&arm.body, p, out);

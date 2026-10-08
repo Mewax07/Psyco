@@ -1,3 +1,12 @@
+/// Wiki Doc sources:
+///   - https://wiki.osdev.org/UEFI
+///   - https://wiki.osdev.org/Interrupts
+///   - https://wiki.osdev.org/X86_Interrupts#From_the_CPU's_perspective
+///
+/// Kernel entry point and shell.
+/// Boot: efi_init -> fb_init -> con_init -> exit_boot_services -> cli ->
+/// gdt_init -> exceptions_init -> irq_init -> kbd_init -> kernel stack.
+
 import "efi.psy"
 import "fb.psy"
 import "console.psy"
@@ -8,10 +17,21 @@ import "exceptions.psy"
 import "debug.psy"
 import "timer.psy"
 
+const line_max: usize = 76
+const bytes_per_kib: u64 = 1024
+const bytes_per_mib: u64 = 1048576
+const page_bytes: u64 = 4096
+
+// Addresses used by `crash`: unmapped and non-canonical.
+const crash_unmapped: u64 = 0xFFFF800000000000
+const crash_non_canonical: u64 = 0x8000000000000000
+const page_fault_vector: usize = 14
+
 static mut line: [u8; 76]
 static mut line_len: usize = 0
 static mut has_fb: bool = false
 
+/// Logo and welcome text.
 fn banner() {
     set_color(cyan)
     puts(" ____                  ___  ____  \n")
@@ -24,12 +44,14 @@ fn banner() {
     puts("Type 'help' for the list of commands.\n\n")
 }
 
+/// Shell prompt.
 fn prompt() {
     set_color(green)
     puts("psycos> ")
     set_color(white)
 }
 
+/// True if the typed line is exactly `cmd`.
 fn line_is(cmd: Str) -> bool {
     if line_len != cmd.len() {
         return false
@@ -42,6 +64,7 @@ fn line_is(cmd: Str) -> bool {
     return true
 }
 
+/// True if the typed line starts with `prefix`.
 fn line_starts_with(prefix: Str) -> bool {
     if line_len < prefix.len() {
         return false
@@ -54,6 +77,7 @@ fn line_starts_with(prefix: Str) -> bool {
     return true
 }
 
+/// Prints a number on at least two digits.
 fn put2(n: u64) {
     if n < 10 {
         putc('0')
@@ -61,6 +85,7 @@ fn put2(n: u64) {
     put_u64(n)
 }
 
+/// `help`: list of commands.
 fn cmd_help() {
     set_color(yellow)
     puts("Commands:\n")
@@ -79,6 +104,7 @@ fn cmd_help() {
     puts("  shutdown   power off the machine\n")
 }
 
+/// `time`: date and time from the firmware clock.
 fn cmd_time() {
     let t = now()
     put_u64(t.year as u64)
@@ -95,6 +121,7 @@ fn cmd_time() {
     putc('\n')
 }
 
+/// `ver`: version, firmware, screen and CPU state.
 fn cmd_ver() {
     puts("PsycOS 0.1, written in psy\nFirmware: ")
     let mut vendor = [0u8; 64]
@@ -110,17 +137,17 @@ fn cmd_ver() {
     puts(")\n")
     if has_fb {
         puts("Screen: ")
-        put_u64(fb_width() as u64)
+        put_u64(get_fb_width() as u64)
         putc('x')
-        put_u64(fb_height() as u64)
+        put_u64(get_fb_height() as u64)
         puts(", console ")
-        put_u64(con_columns() as u64)
+        put_u64(get_con_cols() as u64)
         putc('x')
-        put_u64(con_lines() as u64)
+        put_u64(get_con_rows() as u64)
         putc('\n')
     }
     puts("Boot services: ")
-    if boot_services_exited() {
+    if get_boot_services_done() {
         puts("exited\n")
     } else {
         puts("active\n")
@@ -135,16 +162,17 @@ fn cmd_ver() {
     put_hex_width(read_tr() as u64, 2)
     putc('\n')
     puts("Keyboard: ")
-    if kbd_has_ps2() {
+    if get_kbd_ps2() {
         puts("PS/2 + serial\n")
     } else {
         puts("serial only\n")
     }
 }
 
+/// `mem`: free memory and kernel stack use.
 fn cmd_mem() {
     let pages = free_pages()
-    put_u64(pages * 4096 / 1048576)
+    put_u64(pages * page_bytes / bytes_per_mib)
     puts(" MiB free (")
     put_u64(pages)
     puts(" pages of 4 KiB, ")
@@ -153,26 +181,27 @@ fn cmd_mem() {
     puts("Kernel stack: ")
     put_u64(kstack_used() as u64)
     puts(" bytes used of ")
-    put_u64(65536 as u64 / 1024)
+    put_u64(kstack_size as u64 / bytes_per_kib)
     puts(" KiB, at 0x")
     put_hex(kstack_bottom() as u64)
     putc('\n')
 }
 
+/// `fb`: framebuffer info, color bars and a gray ramp.
 fn cmd_fb() {
     if !has_fb {
         puts("no linear framebuffer\n")
         return
     }
-    let w = fb_width()
-    let h = fb_height()
+    let w = get_fb_width()
+    let h = get_fb_height()
     put_u64(w as u64)
     putc('x')
     put_u64(h as u64)
     puts(" at 0x")
-    put_hex(fb_address())
+    put_hex(get_fb_base() as u64)
     puts(", ")
-    put_u64(fb_bytes() as u64 / 1024)
+    put_u64(get_fb_size() as u64 / bytes_per_kib)
     puts(" KiB\n")
 
     let colors = [0xFFFFFFu32, 0xFFFF00u32, 0x00FFFFu32, 0x00FF00u32, 0xFF00FFu32, 0xFF0000u32, 0x0000FFu32, 0x000000u32]
@@ -187,11 +216,17 @@ fn cmd_fb() {
     }
 }
 
+/// `uptime`: time since the timer started.
 fn cmd_uptime() {
     let ms = uptime_ms()
     let s = ms / 1000
-    put_u64(s / 3600); putc(':'); put2(s / 60 % 60); putc(':'); put2(s % 60)
-    putc('.'); put2(ms % 1000 / 10)
+    put_u64(s / 3600)
+    putc(':')
+    put2(s / 60 % 60)
+    putc(':')
+    put2(s % 60)
+    putc('.')
+    put2(ms % 1000 / 10)
     puts("  (")
     put_u64(get_ticks())
     puts(" ticks at ")
@@ -199,27 +234,29 @@ fn cmd_uptime() {
     puts(" Hz)\n")
 }
 
+/// `crash X`: triggers an exception on purpose.
 fn cmd_crash() {
     if line_is("crash pf") {
         puts("reading 0xFFFF800000000000...\n")
-        let v = debug_read_u64(0xFFFF800000000000)
+        let v = debug_read_u64(crash_unmapped)
         put_hex(v)
     } else if line_is("crash gp") {
         puts("reading non-canonical address 0x8000000000000000...\n")
-        let v = debug_read_u64(0x8000000000000000)
+        let v = debug_read_u64(crash_non_canonical)
         put_hex(v)
     } else if line_is("crash ud") {
         ud2()
     } else if line_is("crash df") {
         puts("removing the #PF handler, then faulting...\n")
-        idt_clear_gate(14)
-        let v = debug_read_u64(0xFFFF800000000000)
+        idt_clear_gate(page_fault_vector)
+        let v = debug_read_u64(crash_unmapped)
         put_hex(v)
     } else {
         puts("usage: crash pf|gp|ud|df\n")
     }
 }
 
+/// Runs the typed command.
 fn run_command() {
     if line_len == 0 {
         return
@@ -246,7 +283,7 @@ fn run_command() {
     } else if line_is("int3") {
         int3()
         puts("resumed after int3 (")
-        put_u64(breakpoint_count())
+        put_u64(get_breakpoints())
         puts(" so far)\n")
     } else if line_starts_with("crash") {
         cmd_crash()
@@ -265,31 +302,33 @@ fn run_command() {
     }
 }
 
+/// Reads one line with echo and backspace.
 fn read_line() {
     line_len = 0
     loop {
         let c = read_key()
-        if c == 13 {
+        if c == key_enter {
             putc('\n')
             return
         }
-        if c == 8 {
+        if c == key_backspace {
             if line_len > 0 {
                 line_len -= 1
-                putc(8)
+                putc(key_backspace)
                 putc(' ')
-                putc(8)
+                putc(key_backspace)
             }
             continue
         }
-        if c >= 32 && c < 127 && line_len < line.len() {
-            line[line_len] = c as u8
+        if c >= 32 && c < 127 && line_len < line_max {
+            line[line_len] = c
             line_len += 1
-            putc(c as u8)
+            putc(c)
         }
     }
 }
 
+/// UEFI entry point: takes over the machine, then switches stacks.
 fn main() {
     efi_init()
     has_fb = fb_init()
@@ -307,10 +346,9 @@ fn main() {
     run_on_kernel_stack(kmain)
 }
 
+/// Runs on the kernel stack: enables interrupts and starts the shell.
 fn kmain() {
-    // haha, I forgot to add the fucking sti instruction! (https://wiki.osdev.org/X86_Interrupts#From_the_CPU's_perspective)
     sti()
-    // so now I have an uptime
     print("PsycOS: boot ok")
     banner()
     loop {

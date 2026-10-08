@@ -138,3 +138,78 @@ pub fn keyword_doc(word: &str) -> Option<&'static str> {
         .find(|(k, _)| *k == word)
         .map(|(_, d)| *d)
 }
+
+pub struct Attribute {
+    pub name: &'static str,
+    /// What it goes on: `fn`, `struct`, `static` or `file` (`#![...]`).
+    pub target: &'static str,
+    pub snippet: &'static str,
+    pub doc: &'static str,
+}
+
+pub const ATTRIBUTES: &[Attribute] = &[
+    Attribute {
+        name: "interrupt",
+        target: "fn",
+        snippet: "interrupt",
+        doc: "Interrupt handler: takes `(frame: &Frame)` or `(frame: &Frame, code: u64)`, returns nothing, and ends with `iretq`.",
+    },
+    Attribute {
+        name: "packed",
+        target: "struct",
+        snippet: "packed",
+        doc: "Lays the fields out without padding.",
+    },
+    Attribute {
+        name: "align",
+        target: "static",
+        snippet: "align(${1:16})",
+        doc: "Aligns the static to `N` bytes: `#[align(N)]`, `N` a power of two <= 4096.",
+    },
+    Attribute {
+        name: "getter",
+        target: "static",
+        snippet: "getter",
+        doc: "Generates `fn get_NAME() -> T`, returning the value of the static. Combine with `#[getter, setter]`.",
+    },
+    Attribute {
+        name: "setter",
+        target: "static",
+        snippet: "setter",
+        doc: "Generates `fn set_NAME(value: T)`, assigning the static. Needs a `static mut`.",
+    },
+    Attribute {
+        name: "trusted",
+        target: "file",
+        snippet: "trusted",
+        doc: "`#![trusted]` at the top of a file allows low-level code in it: raw pointer access, port I/O, control registers, `memcpy`…",
+    },
+];
+
+pub fn attribute(name: &str) -> Option<&'static Attribute> {
+    ATTRIBUTES.iter().find(|a| a.name == name)
+}
+
+/// (label, description, body). `$1`… are tab stops, `$0` the final cursor.
+pub const SNIPPETS: &[(&str, &str, &str)] = &[
+    ("if", "if condition { }", "if ${1:condition} {\n\t$0\n}"),
+    ("if else", "if condition { } else { }", "if ${1:condition} {\n\t$2\n} else {\n\t$0\n}"),
+    ("else if", "else if condition { }", "else if ${1:condition} {\n\t$0\n}"),
+    ("while", "while condition { }", "while ${1:condition} {\n\t$0\n}"),
+    ("for", "for i in start..end { }", "for ${1:i} in ${2:0}..${3:n} {\n\t$0\n}"),
+    ("loop", "loop { }", "loop {\n\t$0\n}"),
+    ("match", "match value { pattern => ... }", "match ${1:value} {\n\t${2:pattern} => $3,\n\t_ => $0,\n}"),
+    ("let", "let name = value", "let ${1:name} = $0"),
+    ("let mut", "let mut name = value", "let mut ${1:name} = $0"),
+    ("fn", "fn name(params) { }", "fn ${1:name}($2) {\n\t$0\n}"),
+    ("fn ->", "fn name(params) -> T { }", "fn ${1:name}($2) -> ${3:i64} {\n\t$0\n}"),
+    ("main", "fn main() { }", "fn main() {\n\t$0\n}"),
+    ("struct", "struct Name { field: T }", "struct ${1:Name} {\n\t${2:field}: ${3:i64},\n}"),
+    ("enum", "enum Name { A, B }", "enum ${1:Name} {\n\t${2:A},\n\t${3:B},\n}"),
+    ("impl", "impl Type { }", "impl ${1:Type} {\n\t$0\n}"),
+    ("const", "const NAME: T = value", "const ${1:NAME}: ${2:usize} = $0"),
+    ("static", "static NAME: T = value", "static ${1:NAME}: ${2:u64} = $0"),
+    ("static mut", "static mut NAME: T = value", "static mut ${1:NAME}: ${2:u64} = $0"),
+    ("import", "import \"file.psy\"", "import \"${1:file}.psy\""),
+    ("print", "print(values...)", "print($0)"),
+];

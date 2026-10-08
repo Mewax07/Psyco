@@ -1,7 +1,24 @@
+/// Wiki Doc sources:
+///   - https://wiki.osdev.org/Interrupt_Descriptor_Table
+///   - https://wiki.osdev.org/Interrupt_Service_Routines
+///   - https://wiki.osdev.org/Interrupts
+///
+/// IDT: table of the 256 interrupt vectors.
+/// Handlers are written in normal code with #[interrupt]: the compiler
+/// generates the stub that saves the 15 general registers, calls the body
+/// with (frame) or (frame, code), restores and ends with iretq.
+/// This file only fills the table and reads the saved registers back.
+
 #![trusted]
 
 import "gdt.psy"
 
+const idt_vectors: usize = 256
+
+const gate_interrupt: u64 = 0x8E
+const gate_present_bit: u64 = 47
+
+// What the CPU pushes on an interrupt (increasing addresses).
 struct Frame {
     rip: u64,
     cs: u64,
@@ -10,6 +27,7 @@ struct Frame {
     ss: u64,
 }
 
+// General registers at the time of the interrupt.
 struct Regs {
     rax: u64,
     rbx: u64,
@@ -31,37 +49,44 @@ struct Regs {
 static mut idt: [u64; 512]
 static mut idtr: DescriptorTablePointer
 
+/// Installs `handler` (a #[interrupt] function) on `vector`.
+/// `ist` = 0 keeps the current stack, 1 to 7 picks a TSS stack.
 fn idt_set_gate(vector: usize, handler: u64, ist: u8) {
-    if vector >= 256 {
+    if vector >= idt_vectors {
         panic("idt_set_gate: vector out of range")
     }
-    let lo = (handler & 0xFFFF) | ((0x08u16 as u64) << 16) | (((ist & 7) as u64) << 32) | (0x8E << 40) | (((handler >> 16) & 0xFFFF) << 48)
+    let lo = (handler & 0xFFFF) | ((kernel_cs as u64) << 16) | (((ist & 7) as u64) << 32) | (gate_interrupt << 40) | (((handler >> 16) & 0xFFFF) << 48)
     idt[vector * 2] = lo
     idt[vector * 2 + 1] = handler >> 32
 }
 
+/// Removes a vector (the CPU raises #NP if it fires).
 fn idt_clear_gate(vector: usize) {
-    if vector >= 256 {
+    if vector >= idt_vectors {
         panic("idt_clear_gate: vector out of range")
     }
     idt[vector * 2] = 0
     idt[vector * 2 + 1] = 0
 }
 
+/// True if `vector` has a handler.
 fn idt_gate_present(vector: usize) -> bool {
-    if vector >= 256 {
+    if vector >= idt_vectors {
         return false
     }
-    return (idt[vector * 2] >> 47) & 1 == 1
+    return (idt[vector * 2] >> gate_present_bit) & 1 == 1
 }
 
+/// Loads the IDT into the CPU.
 fn idt_load() {
     idtr.limit = (idt.len() * 8 - 1) as u16
     idtr.base = idt.as_ptr() as u64
     lidt(&idtr)
 }
 
-// [frame - 8] = rax, rcx, rdx, rbx, rbp, rsi, rdi, r8 ... r15 = [frame - 120]
+/// Reads back the registers saved by the stub, just below the CPU frame
+/// (and below the error code if any), rax first:
+/// [frame - 8] = rax, rcx, rdx, rbx, rbp, rsi, rdi, r8 ... r15 = [frame - 120]
 fn saved_regs(frame: &Frame, has_code: bool) -> Regs {
     let mut p = frame as *const Frame as *const u64
     if has_code {

@@ -1,4 +1,35 @@
+/// Wiki Doc sources:
+///   - https://wiki.osdev.org/Global_Descriptor_Table
+///   - https://wiki.osdev.org/GDT_Tutorial
+///   - https://wiki.osdev.org/Task_State_Segment
+///
+/// Kernel GDT and TSS.
+///
+///   0x00  null descriptor
+///   0x08  kernel code, 64 bits (DPL 0)
+///   0x10  kernel data (DPL 0)
+///   0x18  TSS (16-byte descriptor: also uses entry 0x20)
+///   0x28  reserved: 32-bit user code, expected by sysret (phase 4)
+///   0x30  reserved: user data (phase 4)
+///   0x38  reserved: 64-bit user code (phase 4)
+///
+/// With STAR[63:48] = 0x28, sysret will load SS = 0x30 and CS = 0x38.
+/// In 64-bit mode the TSS only gives the stacks used on interrupts:
+/// rsp0 (coming from ring 3) and IST1, a spare stack for double faults.
+
 #![trusted]
+
+const kernel_cs: u16 = 0x08
+const kernel_ds: u16 = 0x10
+const tss_selector: u16 = 0x18
+
+// Present, DPL 0, base 0, limit 4 GiB.
+const gdt_kernel_code: u64 = 0x00AF9A000000FFFF
+const gdt_kernel_data: u64 = 0x00CF92000000FFFF
+const gdt_tss_available: u64 = 0x89
+
+const ist_double_fault: u8 = 1
+const df_stack_size: usize = 16384
 
 #[packed]
 struct DescriptorTablePointer {
@@ -29,64 +60,69 @@ static mut gdt: [u64; 8]
 static mut gdtr: DescriptorTablePointer
 static mut tss: Tss
 #[align(16)]
-static mut DF_STACK: [u8; 16384]
+static mut df_stack: [u8; 16384]
+#[getter]
 static mut gdt_ready: bool = false
 
+/// Builds and loads the GDT and the TSS (only once).
 fn gdt_init() {
     if gdt_ready {
         return
     }
 
     gdt[0] = 0
-    gdt[1] = 0x00AF9A000000FFFF
-    gdt[2] = 0x00CF92000000FFFF
+    gdt[1] = gdt_kernel_code
+    gdt[2] = gdt_kernel_data
 
-    tss.ist1 = DF_STACK.as_ptr() as u64 + 16384
+    tss.ist1 = df_stack_top()
     tss.iomap_base = sizeof(Tss) as u16
 
     let base = &mut tss as *mut Tss as u64
     let limit = sizeof(Tss) as u64 - 1
-    gdt[3] = (limit & 0xFFFF) | ((base & 0xFFFFFF) << 16) | (0x89 << 40) | (((limit >> 16) & 0xF) << 48) | (((base >> 24) & 0xFF) << 56)
+    gdt[3] = (limit & 0xFFFF) | ((base & 0xFFFFFF) << 16) | (gdt_tss_available << 40) | (((limit >> 16) & 0xF) << 48) | (((base >> 24) & 0xFF) << 56)
     gdt[4] = base >> 32
 
     gdtr.limit = (gdt.len() * 8 - 1) as u16
     gdtr.base = gdt.as_ptr() as u64
     lgdt(&gdtr)
 
-    load_cs(0x08)
-    load_ds(0x10)
-    ltr(0x18)
+    load_cs(kernel_cs)
+    load_ds(kernel_ds)
+    ltr(tss_selector)
     gdt_ready = true
 }
 
-fn gdt_loaded() -> bool {
-    return gdt_ready
-}
-
+/// Stack used when an interrupt comes from ring 3 (phase 4).
 fn tss_set_rsp0(top: u64) {
     tss.rsp0 = top
 }
 
+/// Lowest address of the double fault stack.
 fn df_stack_bottom() -> u64 {
-    return DF_STACK.as_ptr() as u64
+    return df_stack.as_ptr() as u64
 }
 
+/// Top of the double fault stack (IST1).
 fn df_stack_top() -> u64 {
-    return DF_STACK.as_ptr() as u64 + 16384
+    return df_stack.as_ptr() as u64 + df_stack_size as u64
 }
 
+/// Raw GDT entry, for tests and diagnostics.
 fn gdt_entry(i: usize) -> u64 {
     return gdt[i]
 }
 
+/// IST1 value stored in the TSS.
 fn tss_ist1() -> u64 {
     return tss.ist1
 }
 
+/// Address of the TSS.
 fn tss_address() -> u64 {
     return &mut tss as *mut Tss as u64
 }
 
+/// Size of the TSS in bytes (104).
 fn tss_size() -> usize {
     return sizeof(Tss)
 }

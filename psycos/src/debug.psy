@@ -1,7 +1,12 @@
+/// Wiki Doc sources:
+///   - https://wiki.osdev.org/Exceptions
+///
+/// Diagnostic tools for the shell (`crash` command): reading an arbitrary
+/// address, which normal code is not allowed to do.
+
 #![trusted]
 
-// Diagnostic tools for the shell (`crash` command)
-// read an arbitrary address, which normal code is not allowed to do.
+/// Reads 8 bytes at any address (may fault on purpose).
 fn debug_read_u64(addr: u64) -> u64 {
     return (addr as *const u64).read()
 }

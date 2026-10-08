@@ -1,7 +1,17 @@
+/// Wiki Doc sources:
+///   - https://wiki.osdev.org/Drawing_In_a_Linear_Framebuffer
+///   - https://wiki.osdev.org/VGA_Fonts
+///
+/// Text console drawn in the framebuffer (normal code, not trusted).
+/// Grid of font_w x font_h cells, underline cursor, line wrap and scrolling.
+/// Everything is also copied to the serial port, so the kernel can be
+/// followed from a terminal (and tested automatically).
+
 import "fb.psy"
 import "font.psy"
 import "serial.psy"
 
+// Palette (0xRRGGBB), close to the 16 VGA colors.
 const black: u32 = 0x000000
 const gray: u32 = 0xAAAAAA
 const dark_gray: u32 = 0x555555
@@ -13,69 +23,64 @@ const magenta: u32 = 0xFF55FF
 const yellow: u32 = 0xFFFF55
 const white: u32 = 0xFFFFFF
 
+const cursor_height: usize = 2
+const tab_width: usize = 8
+const key_backspace_code: u8 = 8
+
+#[getter]
 static mut con_cols: usize = 0
+#[getter]
 static mut con_rows: usize = 0
+#[getter]
 static mut con_x: usize = 0
+#[getter]
 static mut con_y: usize = 0
 static mut con_fg: u32 = gray
 static mut con_bg: u32 = black
 static mut con_ready: bool = false
+#[setter]
 static mut con_mirror: bool = true
 
+/// Sets up the grid; without a framebuffer, only the serial copy works.
 fn con_init(has_fb: bool) {
     if has_fb {
-        con_cols = fb_width() / font_w
-        con_rows = fb_height() / font_h
+        con_cols = get_fb_width() / font_w
+        con_rows = get_fb_height() / font_h
         con_ready = con_cols > 0 && con_rows > 0
     }
     clear()
 }
 
-fn con_set_mirror(on: bool) {
-    con_mirror = on
-}
-
-fn con_columns() -> usize {
-    return con_cols
-}
-
-fn con_lines() -> usize {
-    return con_rows
-}
-
-fn cursor_x() -> usize {
-    return con_x
-}
-
-fn cursor_y() -> usize {
-    return con_y
-}
-
+/// Clears the screen and moves the cursor home.
 fn clear() {
     con_x = 0
     con_y = 0
     if con_ready {
-        fill_rect(0, 0, fb_width(), fb_height(), con_bg)
+        fill_rect(0, 0, get_fb_width(), get_fb_height(), con_bg)
         draw_cursor(con_fg)
     }
 }
 
+/// Sets the text color.
 fn set_color(fg: u32) {
     con_fg = fg
 }
 
+/// Sets the text and background colors.
 fn set_colors(fg: u32, bg: u32) {
     con_fg = fg
     con_bg = bg
 }
 
+/// Draws (or erases) the underline cursor.
 fn draw_cursor(color: u32) {
     if !con_ready {
         return
     }
-    fill_rect(con_x * font_w, con_y * font_h + font_h - 2usize, font_w, 2usize, color)
+    fill_rect(con_x * font_w, con_y * font_h + font_h - cursor_height, font_w, cursor_height, color)
 }
 
+/// Draws one character in a cell.
 fn draw_glyph(c: u8, col: usize, row: usize) {
     let mut code = c as usize
     if code >= 128 {
@@ -95,6 +100,7 @@ fn draw_glyph(c: u8, col: usize, row: usize) {
     }
 }
 
+/// Goes to the next line, scrolling at the bottom.
 fn newline() {
     con_x = 0
     if con_y + 1 < con_rows {
@@ -104,6 +110,7 @@ fn newline() {
     }
 }
 
+/// Prints one character (\n, \r, \t and backspace included).
 fn putc(c: u8) {
     if con_mirror {
         serial_putc(c)
@@ -116,12 +123,12 @@ fn putc(c: u8) {
         newline()
     } else if c == '\r' {
         con_x = 0
-    } else if c == 8 {
+    } else if c == key_backspace_code {
         if con_x > 0 {
             con_x -= 1
         }
     } else if c == '\t' {
-        con_x = (con_x / 8 + 1) * 8
+        con_x = (con_x / tab_width + 1) * tab_width
         if con_x >= con_cols {
             newline()
         }
@@ -135,12 +142,14 @@ fn putc(c: u8) {
     draw_cursor(con_fg)
 }
 
+/// Prints a string.
 fn puts(s: Str) {
     for i in 0..s.len() {
         putc(str_byte(s, i))
     }
 }
 
+/// Prints an unsigned number in decimal.
 fn put_u64(n: u64) {
     let mut digits = [0u8; 20]
     let mut count: usize = 0
@@ -159,15 +168,18 @@ fn put_u64(n: u64) {
     }
 }
 
+/// Prints a signed number in decimal.
 fn put_i64(n: i64) {
     if n < 0 {
         putc('-')
+        // -(n + 1) + 1 avoids overflowing on i64::MIN.
         put_u64((-(n + 1)) as u64 + 1)
     } else {
         put_u64(n as u64)
     }
 }
 
+/// Prints a number in hex, without leading zeros.
 fn put_hex(n: u64) {
     let mut shift: u64 = 64
     let mut started = false
@@ -181,6 +193,7 @@ fn put_hex(n: u64) {
     }
 }
 
+/// Prints a number in hex on exactly `digits` digits.
 fn put_hex_width(n: u64, digits: u64) {
     let mut shift = digits * 4
     while shift > 0 {
@@ -189,6 +202,7 @@ fn put_hex_width(n: u64, digits: u64) {
     }
 }
 
+/// Prints one hex digit.
 fn put_hex_digit(d: u8) {
     if d < 10 {
         putc('0' + d)

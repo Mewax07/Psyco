@@ -1,8 +1,39 @@
+/// Wiki Doc sources:
+///   - https://wiki.osdev.org/I8042_PS/2_Controller
+///   - https://wiki.osdev.org/PS/2_Keyboard
+///
+/// PS/2 controller (i8042). The keyboard is read either by polling
+/// (ps2_poll) or on IRQ 1 (ps2_init(true) + ps2_read_data in the handler,
+/// see keyboard.psy).
+
 #![trusted]
 
+const ps2_data: u16 = 0x60
+const ps2_status: u16 = 0x64
+const ps2_command: u16 = 0x64
+
+// Status register bits.
+const status_output_full: u8 = 0x01
+const status_input_full: u8 = 0x02
+const status_from_mouse: u8 = 0x20
+
+// Controller commands.
+const cmd_read_config: u8 = 0x20
+const cmd_write_config: u8 = 0x60
+const cmd_inject_keyboard_byte: u8 = 0xD2
+
+// Configuration byte bits.
+const config_keyboard_irq: u8 = 0x01
+const config_mouse_irq: u8 = 0x02
+const config_translation: u8 = 0x40
+
+const ps2_timeout: i64 = 100000
+const max_stale_bytes: i64 = 32
+
+/// Waits until the controller accepts a byte (false on timeout).
 fn ps2_wait_write() -> bool {
-    for i in 0..100000 {
-        if inb(0x64) & 0x02 == 0 {
+    for i in 0..ps2_timeout {
+        if inb(ps2_status) & status_input_full == 0 {
             return true
         }
         pause()
@@ -10,9 +41,10 @@ fn ps2_wait_write() -> bool {
     return false
 }
 
+/// Waits until the controller has a byte for us (false on timeout).
 fn ps2_wait_read() -> bool {
-    for i in 0..100000 {
-        if inb(0x64) & 0x01 != 0 {
+    for i in 0..ps2_timeout {
+        if inb(ps2_status) & status_output_full != 0 {
             return true
         }
         pause()
@@ -20,63 +52,70 @@ fn ps2_wait_read() -> bool {
     return false
 }
 
+/// Configures the controller: scancode set 1 translation, mouse IRQ off,
+/// keyboard IRQ on if `irq`. False if there is no PS/2 controller.
 fn ps2_init(irq: bool) -> bool {
-    if inb(0x64) == 0xFF {
+    if inb(ps2_status) == 0xFF {
         return false
     }
-    for i in 0..32 {
-        if inb(0x64) & 0x01 == 0 {
+    // Drop whatever is left in the output buffer.
+    for i in 0..max_stale_bytes {
+        if inb(ps2_status) & status_output_full == 0 {
             break
         }
-        inb(0x60)
+        inb(ps2_data)
     }
     if !ps2_wait_write() {
         return false
     }
-    outb(0x64, 0x20)
+    outb(ps2_command, cmd_read_config)
     if !ps2_wait_read() {
         return false
     }
-    let config = inb(0x60)
-    let mut wanted = (config & 0xFC) | 0x40
+    let config = inb(ps2_data)
+    let mut wanted = (config & ~(config_keyboard_irq | config_mouse_irq)) | config_translation
     if irq {
-        wanted |= 0x01
+        wanted |= config_keyboard_irq
     }
     if !ps2_wait_write() {
         return false
     }
-    outb(0x64, 0x60)
+    outb(ps2_command, cmd_write_config)
     if !ps2_wait_write() {
         return false
     }
-    outb(0x60, wanted)
+    outb(ps2_data, wanted)
     return true
 }
 
+/// Next keyboard scancode, or -1 if none (mouse bytes are ignored).
 fn ps2_poll() -> i32 {
-    let status = inb(0x64)
-    if status & 0x01 == 0 {
+    let status = inb(ps2_status)
+    if status & status_output_full == 0 {
         return -1
     }
-    let data = inb(0x60)
-    if status & 0x20 != 0 {
+    let data = inb(ps2_data)
+    if status & status_from_mouse != 0 {
         return -1
     }
     return data as i32
 }
 
+/// Reads the data port directly (for the IRQ 1 handler).
 fn ps2_read_data() -> u8 {
-    return inb(0x60)
+    return inb(ps2_data)
 }
 
+/// Makes the controller send `byte` as if it came from the keyboard
+/// (and raise IRQ 1). Used by automatic tests.
 fn ps2_inject(byte: u8) -> bool {
-    for i in 0..100000 {
-        if inb(0x64) & 0x03 == 0 {
-            outb(0x64, 0xD2)
+    for i in 0..ps2_timeout {
+        if inb(ps2_status) & (status_output_full | status_input_full) == 0 {
+            outb(ps2_command, cmd_inject_keyboard_byte)
             if !ps2_wait_write() {
                 return false
             }
-            outb(0x60, byte)
+            outb(ps2_data, byte)
             return true
         }
         pause()

@@ -1,6 +1,7 @@
 mod analysis;
 mod builtins;
 mod check;
+mod literal;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -362,6 +363,25 @@ impl Server {
         let pos = p.text_document_position_params;
         let world = self.world(&pos.text_document.uri)?;
         let an = &world.units[0].an;
+
+        // Numbers and characters: the value in every base.
+        if let Some(i) = an.literal_at(pos.position) {
+            let (value, suffix) = match &an.tokens[i].kind {
+                psycoc::TokenKind::IntSuffix(v, s) => (*v, Some(s.as_str())),
+                psycoc::TokenKind::Int(v) => (*v, None),
+                _ => unreachable!(),
+            };
+            let s = an.tokens[i].span;
+            let is_char = an.line(s.line).chars().nth(s.col - 1) == Some('\'');
+            return Ok(Some(Hover {
+                contents: HoverContents::Markup(MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value: literal::describe(value, suffix, is_char),
+                }),
+                range: Some(an.tok_range(i)),
+            }));
+        }
+
         let Some(tok) = an.token_at(pos.position) else {
             return Ok(None);
         };
@@ -376,6 +396,25 @@ impl Server {
             })
         };
 
+        if an.is_attribute_name(tok) {
+            let name = an.ident(tok).unwrap_or_default();
+            return Ok(builtins::attribute(name).and_then(|a| {
+                let usage = if a.target == "file" {
+                    format!("#![{}]", a.name)
+                } else {
+                    format!("#[{}]", a.snippet.replace("${1:16}", "N"))
+                };
+                let on = if a.target == "file" {
+                    "first line of a file".to_string()
+                } else {
+                    format!("`{}`", a.target)
+                };
+                markdown(format!(
+                    "```psyco\n{usage}\n```\n\n*attribute on {on}*\n\n{}",
+                    a.doc
+                ))
+            }));
+        }
         if let Some(target) = world.resolve(0, tok).first() {
             return Ok(markdown(describe(&world, *target)));
         }
@@ -503,6 +542,7 @@ impl Server {
             .defs
             .iter()
             .filter(|d| d.kind.is_item() || d.kind == DefKind::Method)
+            .filter(|d| !(d.kind == DefKind::Function && d.container.is_some()))
             .map(|d| {
                 let children: Vec<DocumentSymbol> = an
                     .defs
@@ -552,7 +592,29 @@ impl Server {
             ..Default::default()
         };
 
-        if let Some(path) = before.strip_suffix("::") {
+        // Inside `#[...` or `#![...`, possibly after other attributes and commas.
+        let open_attr = before.rfind("#[").or_else(|| before.rfind("#!["));
+        let in_attr = open_attr.is_some_and(|i| {
+            let inside = &before[i..];
+            !inside.contains(']') && (inside.ends_with('[') || inside.ends_with(','))
+        });
+        let file_attr = in_attr && before[open_attr.unwrap_or(0)..].starts_with("#![");
+        if in_attr {
+            for a in builtins::ATTRIBUTES {
+                if (a.target == "file") != file_attr {
+                    continue;
+                }
+                add(CompletionItem {
+                    label: a.name.into(),
+                    kind: Some(CompletionItemKind::PROPERTY),
+                    detail: Some(format!("attribute on {}", a.target)),
+                    documentation: Some(Documentation::String(a.doc.into())),
+                    insert_text: Some(a.snippet.into()),
+                    insert_text_format: Some(InsertTextFormat::SNIPPET),
+                    ..Default::default()
+                });
+            }
+        } else if let Some(path) = before.strip_suffix("::") {
             let owner: String = path
                 .chars()
                 .rev()
@@ -588,7 +650,35 @@ impl Server {
                 });
             }
         } else {
-            let at = an.cursor_index(line, col).saturating_sub(1);
+            let cursor_tok = an.cursor_index(line, col);
+            // Snippets only where a statement or an item can start.
+            let starts_statement = before.is_empty()
+                || ["{", "}", ";", "=>"].iter().any(|t| before.ends_with(t));
+            let mut snippet_labels = HashSet::new();
+            if starts_statement {
+                let top_level = an.brace_depth(cursor_tok) == 0;
+                for (label, description, body) in builtins::SNIPPETS {
+                    let item_snippet = matches!(
+                        *label,
+                        "fn" | "fn ->" | "main" | "struct" | "enum" | "impl" | "const" | "static"
+                            | "static mut" | "import"
+                    );
+                    let in_body_too = matches!(*label, "fn" | "fn ->");
+                    if item_snippet != top_level && !in_body_too {
+                        continue;
+                    }
+                    snippet_labels.insert(*label);
+                    add(CompletionItem {
+                        label: (*label).into(),
+                        kind: Some(CompletionItemKind::SNIPPET),
+                        detail: Some((*description).into()),
+                        insert_text: Some((*body).into()),
+                        insert_text_format: Some(InsertTextFormat::SNIPPET),
+                        ..Default::default()
+                    });
+                }
+            }
+            let at = cursor_tok.saturating_sub(1);
             for d in an.locals_at(at) {
                 add(def_item(d, d.name.clone()));
             }
@@ -613,6 +703,9 @@ impl Server {
                 });
             }
             for (word, doc) in builtins::KEYWORDS {
+                if snippet_labels.contains(word) {
+                    continue;
+                }
                 add(CompletionItem {
                     label: (*word).into(),
                     kind: Some(CompletionItemKind::KEYWORD),
@@ -775,7 +868,8 @@ fn location(world: &World, unit: usize, tok: usize) -> Option<Location> {
 fn describe(world: &World, target: Target) -> String {
     let unit = &world.units[target.unit];
     let d = world.def(target);
-    let mut code = d.detail.clone();
+    let loop_var = d.kind == DefKind::Local && *unit.an.kind(d.start_tok) == psycoc::TokenKind::For;
+    let mut code = if loop_var { d.name.clone() } else { d.detail.clone() };
     if d.kind == DefKind::Local && !d.explicit_type {
         let s = unit.an.tokens[d.start_tok].span;
         if let Some(ty) = unit.let_types.get(&(s.line, s.col)) {
@@ -789,6 +883,11 @@ fn describe(world: &World, target: Target) -> String {
         DefKind::Variant => format!("variant of `{owner}`"),
         DefKind::Method => format!("method of `{owner}`"),
         DefKind::Param => "parameter".into(),
+        DefKind::Function if d.container.is_some() => {
+            let attr = if d.name.starts_with("set_") { "setter" } else { "getter" };
+            format!("generated by `#[{attr}]` on `static {owner}`")
+        }
+        DefKind::Local if loop_var => format!("loop variable of `{} {{ }}`", d.detail),
         _ => String::new(),
     };
     if !note.is_empty() {
