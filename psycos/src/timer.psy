@@ -1,0 +1,77 @@
+import "idt.psy"
+import "pic.psy"
+
+const timer_hz: u64 = 100
+
+static mut ticks: u64 = 0
+static mut spurious_irqs: u64 = 0
+static mut other_irqs: u64 = 0
+
+fn irq_init() {
+    pic_init()
+    for v in 32..48 {
+        idt_set_gate(v as usize, irq_other as u64, 0)
+    }
+    idt_set_gate(32, irq_timer as u64, 0)
+    idt_set_gate(39, irq_spurious7 as u64, 0)
+    idt_set_gate(47, irq_spurious15 as u64, 0)
+    idt_load()
+
+    pit_set_frequency(timer_hz)
+    pic_unmask(0)
+}
+
+#[interrupt]
+fn irq_timer(frame: &Frame) {
+    ticks += 1
+    pic_eoi(0)
+}
+
+#[interrupt]
+fn irq_spurious7(frame: &Frame) {
+    if pic_spurious(7) {
+        spurious_irqs += 1
+    } else {
+        other_irqs += 1
+        pic_eoi(7)
+    }
+}
+
+#[interrupt]
+fn irq_spurious15(frame: &Frame) {
+    if pic_spurious(15) {
+        spurious_irqs += 1
+    } else {
+        other_irqs += 1
+        pic_eoi(15)
+    }
+}
+
+#[interrupt]
+fn irq_other(frame: &Frame) {
+    other_irqs += 1
+    pic_eoi(8)
+}
+
+fn get_ticks() -> u64 {
+    return ticks
+}
+
+fn uptime_ms() -> u64 {
+    return ticks * 1000 / timer_hz
+}
+
+fn spurious_irq_count() -> u64 {
+    return spurious_irqs
+}
+
+fn unexpected_irq_count() -> u64 {
+    return other_irqs
+}
+
+fn sleep_ms(ms: u64) {
+    let target = ticks + (ms * timer_hz + 999) / 1000
+    while ticks < target {
+        hlt()
+    }
+}

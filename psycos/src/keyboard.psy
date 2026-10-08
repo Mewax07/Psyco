@@ -1,5 +1,7 @@
 import "ps2.psy"
 import "serial.psy"
+import "idt.psy"
+import "pic.psy"
 
 const KEY_ENTER: u8 = 13
 const KEY_BACKSPACE: u8 = 8
@@ -25,8 +27,59 @@ static mut kbd_caps: bool = false
 static mut kbd_extended: bool = false
 static mut kbd_ps2: bool = false
 
+static mut kbd_buf: [u8; 64]
+static mut kbd_head: usize = 0
+static mut kbd_tail: usize = 0
+static mut kbd_dropped: u64 = 0
+static mut kbd_irqs: u64 = 0
+
 fn kbd_init() {
-    kbd_ps2 = ps2_init()
+    kbd_ps2 = ps2_init(true)
+    if kbd_ps2 {
+        idt_set_gate(33, irq_keyboard as u64, 0)
+        pic_unmask(1)
+    }
+}
+
+#[interrupt]
+fn irq_keyboard(frame: &Frame) {
+    kbd_irqs += 1
+    let c = kbd_translate(ps2_read_data())
+    if c != 0 {
+        kbd_push(c)
+    }
+    pic_eoi(1)
+}
+
+fn kbd_push(c: u8) {
+    let next = (kbd_head + 1) % 64
+    if next == kbd_tail {
+        kbd_dropped += 1
+        return
+    }
+    kbd_buf[kbd_head] = c
+    kbd_head = next
+}
+
+fn kbd_try_read() -> i32 {
+    if kbd_tail == kbd_head {
+        return -1
+    }
+    let c = kbd_buf[kbd_tail]
+    kbd_tail = (kbd_tail + 1) % 64
+    return c as i32
+}
+
+fn kbd_pending() -> usize {
+    return (kbd_head + 64 - kbd_tail) % 64
+}
+
+fn kbd_dropped_count() -> u64 {
+    return kbd_dropped
+}
+
+fn kbd_irq_count() -> u64 {
+    return kbd_irqs
 }
 
 fn kbd_has_ps2() -> bool {
@@ -52,7 +105,9 @@ fn kbd_translate(sc: u8) -> u8 {
             return 0
         }
         let mut bit: u8 = 2
-        if code == 0x2A { bit = 1 }
+        if code == 0x2A {
+            bit = 1
+        }
         if release {
             kbd_shift &= ~bit
         } else {
@@ -88,24 +143,27 @@ fn kbd_translate(sc: u8) -> u8 {
     if kbd_shift != 0 {
         c = KEYMAP_SHIFT[code as usize]
     }
-    if kbd_caps && is_letter(c) { c ^= 0x20 }
-    if kbd_ctrl && is_letter(c) { c = (c | 0x20) - 'a' + 1 }
+    if kbd_caps && is_letter(c) {
+        c ^= 0x20
+    }
+    if kbd_ctrl && is_letter(c) {
+        c = (c | 0x20) - 'a' + 1
+    }
     return c
 }
 
 fn read_key() -> u8 {
     loop {
-        if kbd_ps2 {
-            let sc = ps2_poll()
-            if sc >= 0 {
-                let c = kbd_translate(sc as u8)
-                if c != 0 {
-                    return c
-                }
-            }
+        cli()
+        let k = kbd_try_read()
+        if k >= 0 {
+            // I hope I never forget sti again
+            sti()
+            return k as u8
         }
         let s = serial_poll()
         if s >= 0 {
+            sti()
             let c = s as u8
             if c == '\n' {
                 return KEY_ENTER
@@ -115,6 +173,7 @@ fn read_key() -> u8 {
             }
             return c
         }
-        pause()
+        sti()
+        hlt()
     }
 }

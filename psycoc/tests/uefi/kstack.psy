@@ -1,0 +1,45 @@
+import "../../../psycos/src/efi.psy"
+import "../../../psycos/src/stack.psy"
+
+fn stack_pointer() -> usize {
+    let marker: u64 = 0
+    return &marker as *const u64 as usize
+}
+
+fn depth(n: u64) -> u64 {
+    let pad = [n; 32]
+    if n == 0 { return 0 }
+    return pad[31] + depth(n - 1)
+}
+
+fn on_kernel_stack() -> bool {
+    let sp = stack_pointer()
+    return sp > kstack_bottom() && sp < kstack_top()
+}
+
+fn kmain() {
+    print("on kernel stack:", on_kernel_stack())
+    let before = kstack_used()
+    print("small use:", before > 0, before < 4096)
+    print("recursion:", depth(100))
+    print("deeper:", kstack_used() > before + 100 * 256, kstack_used() < KSTACK_SIZE)
+    exit(14)
+}
+
+fn main() {
+    efi_init()
+    print("aligned:", kstack_bottom() % 4096 == 0, kstack_top() - kstack_bottom() == 65536)
+    print("firmware stack:", on_kernel_stack())
+    print("exit:", exit_boot_services())
+    cli()
+    run_on_kernel_stack(kmain)
+}
+
+//> aligned: true true
+//> firmware stack: false
+//> exit: true
+//> on kernel stack: true
+//> small use: true true
+//> recursion: 5050
+//> deeper: true true
+// exit: 14

@@ -111,8 +111,12 @@ fn fill_rect(x: usize, y: usize, w: usize, h: usize, color: u32) {
     }
     let mut cw = w
     let mut ch = h
-    if cw > fb_w - x { cw = fb_w - x }
-    if ch > fb_h - y { ch = fb_h - y }
+    if cw > fb_w - x {
+        cw = fb_w - x
+    }
+    if ch > fb_h - y {
+        ch = fb_h - y
+    }
     let c = to_native(color)
     let mut row = fb_base.add(y * fb_stride + x)
     for j in 0..ch {

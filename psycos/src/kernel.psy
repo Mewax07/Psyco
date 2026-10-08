@@ -4,6 +4,9 @@ import "console.psy"
 import "keyboard.psy"
 import "stack.psy"
 import "gdt.psy"
+import "exceptions.psy"
+import "debug.psy"
+import "timer.psy"
 
 static mut line: [u8; 76]
 static mut line_len: usize = 0
@@ -28,23 +31,33 @@ fn prompt() {
 }
 
 fn line_is(cmd: Str) -> bool {
-    if line_len != cmd.len() { return false }
+    if line_len != cmd.len() {
+        return false
+    }
     for i in 0..line_len {
-        if line[i] != str_byte(cmd, i) { return false }
+        if line[i] != str_byte(cmd, i) {
+            return false
+        }
     }
     return true
 }
 
 fn line_starts_with(prefix: Str) -> bool {
-    if line_len < prefix.len() { return false }
+    if line_len < prefix.len() {
+        return false
+    }
     for i in 0..prefix.len() {
-        if line[i] != str_byte(prefix, i) { return false }
+        if line[i] != str_byte(prefix, i) {
+            return false
+        }
     }
     return true
 }
 
 fn put2(n: u64) {
-    if n < 10 { putc('0') }
+    if n < 10 {
+        putc('0')
+    }
     put_u64(n)
 }
 
@@ -57,8 +70,11 @@ fn cmd_help() {
     puts("  ver        version and firmware\n")
     puts("  time       date and time\n")
     puts("  mem        free memory\n")
+    puts("  uptime     time since boot\n")
     puts("  fb         framebuffer info and test pattern\n")
     puts("  echo TXT   print TXT\n")
+    puts("  int3       trigger a breakpoint (execution resumes)\n")
+    puts("  crash X    trigger an exception: pf, gp, ud, df\n")
     puts("  reboot     restart the machine\n")
     puts("  shutdown   power off the machine\n")
 }
@@ -103,6 +119,27 @@ fn cmd_ver() {
         put_u64(con_lines() as u64)
         putc('\n')
     }
+    puts("Boot services: ")
+    if boot_services_exited() {
+        puts("exited\n")
+    } else {
+        puts("active\n")
+    }
+    puts("Segments: cs=0x")
+    put_hex_width(read_cs() as u64, 2)
+    puts(" ds=0x")
+    put_hex_width(read_ds() as u64, 2)
+    puts(" ss=0x")
+    put_hex_width(read_ss() as u64, 2)
+    puts(" tr=0x")
+    put_hex_width(read_tr() as u64, 2)
+    putc('\n')
+    puts("Keyboard: ")
+    if kbd_has_ps2() {
+        puts("PS/2 + serial\n")
+    } else {
+        puts("serial only\n")
+    }
 }
 
 fn cmd_mem() {
@@ -110,7 +147,16 @@ fn cmd_mem() {
     put_u64(pages * 4096 / 1048576)
     puts(" MiB free (")
     put_u64(pages)
-    puts(" pages of 4 KiB)\n")
+    puts(" pages of 4 KiB, ")
+    put_u64(memory_map_entries() as u64)
+    puts(" map entries)\n")
+    puts("Kernel stack: ")
+    put_u64(kstack_used() as u64)
+    puts(" bytes used of ")
+    put_u64(65536 as u64 / 1024)
+    puts(" KiB, at 0x")
+    put_hex(kstack_bottom() as u64)
+    putc('\n')
 }
 
 fn cmd_fb() {
@@ -141,8 +187,43 @@ fn cmd_fb() {
     }
 }
 
+fn cmd_uptime() {
+    let ms = uptime_ms()
+    let s = ms / 1000
+    put_u64(s / 3600); putc(':'); put2(s / 60 % 60); putc(':'); put2(s % 60)
+    putc('.'); put2(ms % 1000 / 10)
+    puts("  (")
+    put_u64(get_ticks())
+    puts(" ticks at ")
+    put_u64(timer_hz)
+    puts(" Hz)\n")
+}
+
+fn cmd_crash() {
+    if line_is("crash pf") {
+        puts("reading 0xFFFF800000000000...\n")
+        let v = debug_read_u64(0xFFFF800000000000)
+        put_hex(v)
+    } else if line_is("crash gp") {
+        puts("reading non-canonical address 0x8000000000000000...\n")
+        let v = debug_read_u64(0x8000000000000000)
+        put_hex(v)
+    } else if line_is("crash ud") {
+        ud2()
+    } else if line_is("crash df") {
+        puts("removing the #PF handler, then faulting...\n")
+        idt_clear_gate(14)
+        let v = debug_read_u64(0xFFFF800000000000)
+        put_hex(v)
+    } else {
+        puts("usage: crash pf|gp|ud|df\n")
+    }
+}
+
 fn run_command() {
-    if line_len == 0 { return }
+    if line_len == 0 {
+        return
+    }
     if line_is("help") {
         cmd_help()
     } else if line_is("clear") {
@@ -156,8 +237,19 @@ fn run_command() {
     } else if line_is("fb") {
         cmd_fb()
     } else if line_starts_with("echo ") {
-        for i in 5..line_len { putc(line[i]) }
+        for i in 5..line_len {
+            putc(line[i])
+        }
         putc('\n')
+    } else if line_is("uptime") {
+        cmd_uptime()
+    } else if line_is("int3") {
+        int3()
+        puts("resumed after int3 (")
+        put_u64(breakpoint_count())
+        puts(" so far)\n")
+    } else if line_starts_with("crash") {
+        cmd_crash()
     } else if line_is("reboot") {
         reboot()
     } else if line_is("shutdown") {
@@ -165,7 +257,9 @@ fn run_command() {
     } else {
         set_color(red)
         puts("unknown command: ")
-        for i in 0..line_len { putc(line[i]) }
+        for i in 0..line_len {
+            putc(line[i])
+        }
         putc('\n')
         set_color(white)
     }
@@ -206,12 +300,17 @@ fn main() {
     }
     cli()
     gdt_init()
+    exceptions_init()
+    irq_init()
     kbd_init()
 
     run_on_kernel_stack(kmain)
 }
 
 fn kmain() {
+    // haha, I forgot to add the fucking sti instruction! (https://wiki.osdev.org/X86_Interrupts#From_the_CPU's_perspective)
+    sti()
+    // so now I have an uptime
     print("PsycOS: boot ok")
     banner()
     loop {

@@ -1,0 +1,65 @@
+import "../../../psycos/src/console.psy"
+import "../../../psycos/src/keyboard.psy"
+
+fn type_keys(codes: &[u8]) {
+    for i in 0..codes.len() {
+        let c = kbd_translate(codes[i])
+        if c == KEY_ENTER { puts("<enter>") } else if c != 0 { putc(c) }
+    }
+    putc('\n')
+}
+
+fn main() {
+    efi_init()
+    con_init(fb_init())
+    print("before:", boot_services_exited(), free_pages() > 0)
+
+    print("exit:", exit_boot_services())
+    cli()
+    print("after:", boot_services_exited(), exit_boot_services())
+
+    let n = memory_map_entries()
+    let mut conventional: u64 = 0
+    let mut sorted = true
+    for i in 0..n {
+        let r = memory_region(i)
+        if r.kind == 7u32 {
+            conventional += r.pages
+        }
+        if i > 0 && memory_region(i - 1).start > r.start {
+            sorted = false
+        }
+    }
+    print("map:", n > 4, conventional == free_pages(), free_pages() * 4096 > 64 * 1048576)
+    print("sorted:", sorted)
+
+    print("time:", now().year >= 2024)
+
+    puts("console ")
+    put_hex(0xC0FFEE)
+    putc('\n')
+
+    type_keys(&[0x23u8, 0x17, 0x39, 0x2A, 0x11, 0xAA, 0x18, 0x02])
+    type_keys(&[0x3Au8, 0xBA, 0x1E, 0x2A, 0x1E, 0xAA, 0x3A, 0xBA, 0x1E])
+    type_keys(&[0x36u8, 0x02, 0x28, 0x35, 0xB6, 0x35, 0xE0, 0x35, 0x1C])
+    print("ps2:", kbd_init_result())
+    exit(13)
+}
+
+fn kbd_init_result() -> bool {
+    kbd_init()
+    return kbd_has_ps2()
+}
+
+//> before: false true
+//> exit: true
+//> after: true true
+//> map: true true true
+//> sorted: true
+//> time: true
+//> console C0FFEE
+//> hi Wo1
+//> Aaa
+//> !"?//<enter>
+//> ps2: true
+// exit: 13

@@ -54,17 +54,19 @@
   (#any-of? @function.builtin
     "print" "panic" "exit"
     "outb" "outw" "outl" "inb" "inw" "inl"
-    "cli" "sti" "hlt" "pause" "int3"
+    "cli" "sti" "hlt" "pause" "int3" "ud2"
+    "read_cs" "read_ds" "read_ss" "read_tr"
     "read_cr0" "read_cr2" "read_cr3" "read_cr4" "rdtsc"
     "write_cr0" "write_cr3" "write_cr4"
     "rdmsr" "wrmsr" "invlpg" "load_cs" "load_ds" "ltr"
     "memcpy" "memset" "efi_image_handle" "efi_system_table"
     "switch_stack" "lgdt" "lidt"))
 
-; Methods built into arrays and slices.
+; Methods built into arrays, slices, strings and raw pointers.
 (call_expression
   function: (field_expression field: (field_identifier) @function.builtin)
-  (#eq? @function.builtin "len"))
+  (#any-of? @function.builtin
+    "len" "as_ptr" "as_mut_ptr" "is_null" "add" "sub" "offset" "read" "write"))
 
 ; ---- attributes ---------------------------------------------------------
 

@@ -1,0 +1,93 @@
+/// I'm starting to write the docs, so this file is this: https://wiki.osdev.org/8259_PIC
+
+#![trusted]
+
+static mut pic_mask_bits: u16 = 0xFFFF
+
+fn io_wait() {
+    outb(0x80, 0)
+}
+
+fn pic_init() {
+    // ICW1
+    outb(0x20, 0x11)
+    io_wait()
+    outb(0xA0, 0x11)
+    io_wait()
+    // ICW2
+    outb(0x21, 32)
+    io_wait()
+    outb(0xA1, 40)
+    io_wait()
+    // ICW3
+    outb(0x21, 4)
+    io_wait()
+    outb(0xA1, 2)
+    io_wait()
+    // ICW4
+    outb(0x21, 1)
+    io_wait()
+    outb(0xA1, 1)
+    io_wait()
+
+    pic_mask_bits = 0xFFFF & ~(1u16 << 2)
+    pic_write_mask()
+}
+
+fn pic_write_mask() {
+    outb(0x21, (pic_mask_bits & 0xFF) as u8)
+    outb(0xA1, (pic_mask_bits >> 8) as u8)
+}
+
+fn pic_unmask(irq: u8) {
+    if irq >= 16 {
+        panic("pic_unmask: irq out of range")
+    }
+    pic_mask_bits &= ~(1u16 << irq as u16)
+    pic_write_mask()
+}
+
+fn pic_mask(irq: u8) {
+    if irq >= 16 {
+        panic("pic_mask: irq out of range")
+    }
+    pic_mask_bits |= 1u16 << irq as u16
+}
+
+fn pic_masked(irq: u8) -> bool {
+    return (pic_mask_bits >> (irq & 15) as u16) & 1 == 1
+}
+
+fn pic_eoi(irq: u8) {
+    if irq >= 8 {
+        outb(0xA0, 0x20)
+    }
+    outb(0x20, 0x20)
+}
+
+fn pic_spurious(irq: u8) -> bool {
+    if irq == 7 {
+        outb(0x20, 0x0B)
+        return inb(0x20) & 0x80 == 0
+    }
+    if irq == 15 {
+        outb(0xA0, 0x0B)
+        if inb(0xA0) & 0x80 == 0 {
+            outb(0x20, 0x20)
+            return true
+        }
+    }
+    return false
+}
+
+fn pit_set_frequency(hz: u64) -> u64 {
+    let pit_hz: u64 = 1193182
+    let mut divisor = pit_hz / hz
+    if divisor > 65535 {
+        divisor = 65535
+    }
+    outb(0x43, 0x34)
+    outb(0x40, (divisor & 0xFF) as u8)
+    outb(0x40, (divisor >> 8) as u8)
+    return pit_hz / divisor
+}

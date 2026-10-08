@@ -1,0 +1,7 @@
+#![trusted]
+
+// Diagnostic tools for the shell (`crash` command)
+// read an arbitrary address, which normal code is not allowed to do.
+fn debug_read_u64(addr: u64) -> u64 {
+    return (addr as *const u64).read()
+}

@@ -38,6 +38,11 @@ pub const BUILTINS: &[Builtin] = &[
     builtin!("hlt"(), "", false, "Halts the CPU until the next interrupt."),
     builtin!("pause"(), "", false, "Spin-loop hint."),
     builtin!("int3"(), "", false, "Breakpoint trap."),
+    builtin!("ud2"(), "", false, "Raises an invalid-opcode exception (#UD)."),
+    builtin!("read_cs"(), "u16", false, "Reads the code segment selector."),
+    builtin!("read_ds"(), "u16", false, "Reads the data segment selector."),
+    builtin!("read_ss"(), "u16", false, "Reads the stack segment selector."),
+    builtin!("read_tr"(), "u16", false, "Reads the task register selector."),
     builtin!("read_cr0"(), "u64", false, "Reads control register CR0."),
     builtin!("read_cr2"(), "u64", false, "Reads control register CR2 (page fault address)."),
     builtin!("read_cr3"(), "u64", false, "Reads control register CR3 (page table root)."),
@@ -63,6 +68,23 @@ pub const BUILTINS: &[Builtin] = &[
 
 pub fn builtin(name: &str) -> Option<&'static Builtin> {
     BUILTINS.iter().find(|b| b.name == name)
+}
+
+/// Methods the compiler provides on arrays, slices, strings and raw pointers.
+pub const METHODS: &[Builtin] = &[
+    builtin!("len"(), "usize", false, "Number of elements of an array, slice or string."),
+    builtin!("as_ptr"(), "*const T", false, "Pointer to the first element of an array, slice or string."),
+    builtin!("as_mut_ptr"(), "*mut T", false, "Mutable pointer to the first element of a mutable array or `&mut [T]` slice."),
+    builtin!("is_null"(), "bool", false, "Whether a raw pointer is null."),
+    builtin!("add"("count: usize"), "*T", true, "Pointer `count` elements further."),
+    builtin!("sub"("count: usize"), "*T", true, "Pointer `count` elements back."),
+    builtin!("offset"("count: isize"), "*T", true, "Pointer moved by a signed number of elements."),
+    builtin!("read"(), "T", true, "Reads the value a raw pointer points to."),
+    builtin!("write"("value: T"), "", true, "Writes a value through a `*mut T` pointer."),
+];
+
+pub fn method(name: &str) -> Option<&'static Builtin> {
+    METHODS.iter().find(|b| b.name == name)
 }
 
 pub const KEYWORDS: &[(&str, &str)] = &[

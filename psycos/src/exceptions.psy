@@ -1,0 +1,314 @@
+import "idt.psy"
+import "console.psy"
+
+static mut breakpoints: u64 = 0
+static mut panic_exit: bool = false
+
+fn panic_set_exit(on: bool) {
+    panic_exit = on
+}
+
+fn breakpoint_count() -> u64 {
+    return breakpoints
+}
+
+// https://wiki.osdev.org/Exceptions
+// And promise I will add a understable doc with redirection to the wiki: https://wiki.osdev.org/Expanded_Main_Page
+fn exception_name(v: u64) -> Str {
+    match v {
+        0 => return "#DE divide error",
+        1 => return "#DB debug",
+        2 => return "NMI non-maskable interrupt",
+        3 => return "#BP breakpoint",
+        4 => return "#OF overflow",
+        5 => return "#BR bound range exceeded",
+        6 => return "#UD invalid opcode",
+        7 => return "#NM device not available",
+        8 => return "#DF double fault",
+        10 => return "#TS invalid TSS",
+        11 => return "#NP segment not present",
+        12 => return "#SS stack-segment fault",
+        13 => return "#GP general protection fault",
+        14 => return "#PF page fault",
+        16 => return "#MF x87 floating-point error",
+        17 => return "#AC alignment check",
+        18 => return "#MC machine check",
+        19 => return "#XM SIMD floating-point error",
+        20 => return "#VE virtualization exception",
+        21 => return "#CP control protection",
+        _ => return "unknown exception",
+    }
+}
+
+fn exceptions_init() {
+    idt_set_gate(0, exc_de as u64, 0)
+    idt_set_gate(1, exc_db as u64, 0)
+    idt_set_gate(2, exc_nmi as u64, 0)
+    idt_set_gate(3, exc_bp as u64, 0)
+    idt_set_gate(4, exc_of as u64, 0)
+    idt_set_gate(5, exc_br as u64, 0)
+    idt_set_gate(6, exc_ud as u64, 0)
+    idt_set_gate(7, exc_nm as u64, 0)
+    idt_set_gate(8, exc_df as u64, 1)
+    idt_set_gate(10, exc_ts as u64, 0)
+    idt_set_gate(11, exc_np as u64, 0)
+    idt_set_gate(12, exc_ss as u64, 0)
+    idt_set_gate(13, exc_gp as u64, 0)
+    idt_set_gate(14, exc_pf as u64, 0)
+    idt_set_gate(16, exc_mf as u64, 0)
+    idt_set_gate(17, exc_ac as u64, 0)
+    idt_set_gate(18, exc_mc as u64, 0)
+    idt_set_gate(19, exc_xm as u64, 0)
+    idt_set_gate(20, exc_ve as u64, 0)
+    idt_set_gate(21, exc_cp as u64, 0)
+    idt_load()
+}
+
+#[interrupt]
+fn exc_de(frame: &Frame) {
+    fatal(0, frame, 0, false)
+}
+
+#[interrupt]
+fn exc_db(frame: &Frame) {
+    fatal(1, frame, 0, false)
+}
+
+#[interrupt]
+fn exc_nmi(frame: &Frame) {
+    fatal(2, frame, 0, false)
+}
+
+#[interrupt]
+fn exc_of(frame: &Frame) {
+    fatal(4, frame, 0, false)
+}
+
+#[interrupt]
+fn exc_br(frame: &Frame) {
+    fatal(5, frame, 0, false)
+}
+
+#[interrupt]
+fn exc_ud(frame: &Frame) {
+    fatal(6, frame, 0, false)
+}
+
+#[interrupt]
+fn exc_nm(frame: &Frame) {
+    fatal(7, frame, 0, false)
+}
+
+#[interrupt]
+fn exc_df(frame: &Frame, code: u64) {
+    fatal(8, frame, code, true)
+}
+
+#[interrupt]
+fn exc_ts(frame: &Frame, code: u64) {
+    fatal(10, frame, code, true)
+}
+
+#[interrupt]
+fn exc_np(frame: &Frame, code: u64) {
+    fatal(11, frame, code, true)
+}
+
+#[interrupt]
+fn exc_ss(frame: &Frame, code: u64) {
+    fatal(12, frame, code, true)
+}
+
+#[interrupt]
+fn exc_gp(frame: &Frame, code: u64) {
+    fatal(13, frame, code, true)
+}
+
+#[interrupt]
+fn exc_pf(frame: &Frame, code: u64) {
+    fatal(14, frame, code, true)
+}
+
+#[interrupt]
+fn exc_mf(frame: &Frame) {
+    fatal(16, frame, 0, false)
+}
+
+#[interrupt]
+fn exc_ac(frame: &Frame, code: u64) {
+    fatal(17, frame, code, true)
+}
+
+#[interrupt]
+fn exc_mc(frame: &Frame) {
+    fatal(18, frame, 0, false)
+}
+
+#[interrupt]
+fn exc_xm(frame: &Frame) {
+    fatal(19, frame, 0, false)
+}
+
+#[interrupt]
+fn exc_ve(frame: &Frame) {
+    fatal(20, frame, 0, false)
+}
+
+#[interrupt]
+fn exc_cp(frame: &Frame, code: u64) {
+    fatal(21, frame, code, true)
+}
+
+#[interrupt]
+fn exc_bp(frame: &Frame) {
+    breakpoints += 1
+    puts("breakpoint at 0x")
+    put_hex_width(frame.rip - 1, 16)
+    putc('\n')
+}
+
+fn stack_pointer() -> u64 {
+    let marker: u64 = 0
+    return &marker as *const u64 as u64
+}
+
+fn put_reg(name: Str, v: u64) {
+    puts(name)
+    puts("=0x")
+    put_hex_width(v, 16)
+    puts("  ")
+}
+
+fn put_error_code(vector: u64, code: u64) {
+    if vector == 14 {
+        if code & 1 != 0 {
+            puts("protection violation")
+        } else {
+            puts("page not present")
+        }
+        if code & 2 != 0 {
+            puts(", write")
+        } else {
+            puts(", read")
+        }
+        if code & 4 != 0 {
+            puts(", user")
+        } else {
+            puts(", kernel")
+        }
+        if code & 16 != 0 {
+            puts(", instruction fetch")
+        }
+        if code & 8 != 0 {
+            puts(", reserved bit set")
+        }
+        return
+    }
+    if vector == 8 || vector == 17 {
+        puts("always zero")
+        return
+    }
+    if vector == 21 {
+        puts("control-flow violation")
+        return
+    }
+    if code == 0 {
+        puts("no selector")
+        return
+    }
+    let table = (code >> 1) & 3
+    if table == 1 || table == 3 {
+        puts("IDT vector ")
+    } else if table == 0 {
+        puts("GDT selector 0x")
+    } else {
+        puts("LDT selector 0x")
+    }
+    if table == 1 || table == 3 {
+        put_u64(code >> 3)
+    } else {
+        put_hex_width(code & 0xFFF8, 4)
+    }
+    if code & 1 != 0 {
+        puts(", external event")
+    }
+}
+
+fn fatal(vector: u64, frame: &Frame, code: u64, has_code: bool) {
+    cli()
+    let regs = saved_regs(frame, has_code)
+    let sp = stack_pointer()
+
+    set_colors(white, 0x00002A)
+    clear()
+    set_color(0xFF5555)
+    puts("*** KERNEL PANIC ***\n")
+    set_color(white)
+    puts("Exception ")
+    put_u64(vector)
+    puts(": ")
+    puts(exception_name(vector))
+    putc('\n')
+    if has_code {
+        puts("Error code: 0x")
+        put_hex_width(code, 16)
+        puts(" (")
+        put_error_code(vector, code)
+        puts(")\n")
+    }
+    if vector == 14 {
+        puts("Faulting address (CR2): 0x")
+        put_hex_width(read_cr2(), 16)
+        putc('\n')
+    }
+    puts("Handler stack: ")
+    if sp >= df_stack_bottom() && sp < df_stack_top() {
+        puts("IST1 (double fault stack)\n")
+    } else {
+        puts("current kernel stack\n")
+    }
+
+    set_color(gray)
+    putc('\n')
+    put_reg("RIP", frame.rip)
+    put_reg("CS ", frame.cs)
+    put_reg("RFL", frame.rflags)
+    putc('\n')
+    put_reg("RSP", frame.rsp)
+    put_reg("SS ", frame.ss)
+    put_reg("RBP", regs.rbp)
+    putc('\n')
+    put_reg("RAX", regs.rax)
+    put_reg("RBX", regs.rbx)
+    put_reg("RCX", regs.rcx)
+    putc('\n')
+    put_reg("RDX", regs.rdx)
+    put_reg("RSI", regs.rsi)
+    put_reg("RDI", regs.rdi)
+    putc('\n')
+    put_reg("R8 ", regs.r8)
+    put_reg("R9 ", regs.r9)
+    put_reg("R10", regs.r10)
+    putc('\n')
+    put_reg("R11", regs.r11)
+    put_reg("R12", regs.r12)
+    put_reg("R13", regs.r13)
+    putc('\n')
+    put_reg("R14", regs.r14)
+    put_reg("R15", regs.r15)
+    putc('\n')
+    put_reg("CR0", read_cr0())
+    put_reg("CR3", read_cr3())
+    put_reg("CR4", read_cr4())
+    putc('\n')
+
+    set_color(white)
+    puts("\nSystem halted.\n")
+    if panic_exit {
+        exit(64 + vector as i32)
+    }
+    loop {
+        cli()
+        hlt()
+    }
+}

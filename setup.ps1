@@ -1,3 +1,6 @@
 cd .\psycoc
 cargo build --release
-mkdir .\esp\EFI\BOOT
+if (-not (Test-Path .\esp)) {
+    mkdir .\esp\EFI\BOOT | Out-Null
+}
+cd ..

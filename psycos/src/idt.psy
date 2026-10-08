@@ -1,0 +1,87 @@
+#![trusted]
+
+import "gdt.psy"
+
+struct Frame {
+    rip: u64,
+    cs: u64,
+    rflags: u64,
+    rsp: u64,
+    ss: u64,
+}
+
+struct Regs {
+    rax: u64,
+    rbx: u64,
+    rcx: u64,
+    rdx: u64,
+    rsi: u64,
+    rdi: u64,
+    rbp: u64,
+    r8: u64,
+    r9: u64,
+    r10: u64,
+    r11: u64,
+    r12: u64,
+    r13: u64,
+    r14: u64,
+    r15: u64,
+}
+
+static mut idt: [u64; 512]
+static mut idtr: DescriptorTablePointer
+
+fn idt_set_gate(vector: usize, handler: u64, ist: u8) {
+    if vector >= 256 {
+        panic("idt_set_gate: vector out of range")
+    }
+    let lo = (handler & 0xFFFF) | ((0x08u16 as u64) << 16) | (((ist & 7) as u64) << 32) | (0x8E << 40) | (((handler >> 16) & 0xFFFF) << 48)
+    idt[vector * 2] = lo
+    idt[vector * 2 + 1] = handler >> 32
+}
+
+fn idt_clear_gate(vector: usize) {
+    if vector >= 256 {
+        panic("idt_clear_gate: vector out of range")
+    }
+    idt[vector * 2] = 0
+    idt[vector * 2 + 1] = 0
+}
+
+fn idt_gate_present(vector: usize) -> bool {
+    if vector >= 256 {
+        return false
+    }
+    return (idt[vector * 2] >> 47) & 1 == 1
+}
+
+fn idt_load() {
+    idtr.limit = (idt.len() * 8 - 1) as u16
+    idtr.base = idt.as_ptr() as u64
+    lidt(&idtr)
+}
+
+// [frame - 8] = rax, rcx, rdx, rbx, rbp, rsi, rdi, r8 ... r15 = [frame - 120]
+fn saved_regs(frame: &Frame, has_code: bool) -> Regs {
+    let mut p = frame as *const Frame as *const u64
+    if has_code {
+        p = p.sub(1)
+    }
+    return Regs {
+        rax: p.sub(1).read(),
+        rcx: p.sub(2).read(),
+        rdx: p.sub(3).read(),
+        rbx: p.sub(4).read(),
+        rbp: p.sub(5).read(),
+        rsi: p.sub(6).read(),
+        rdi: p.sub(7).read(),
+        r8: p.sub(8).read(),
+        r9: p.sub(9).read(),
+        r10: p.sub(10).read(),
+        r11: p.sub(11).read(),
+        r12: p.sub(12).read(),
+        r13: p.sub(13).read(),
+        r14: p.sub(14).read(),
+        r15: p.sub(15).read(),
+    }
+}

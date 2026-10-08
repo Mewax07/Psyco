@@ -20,7 +20,7 @@ fn ps2_wait_read() -> bool {
     return false
 }
 
-fn ps2_init() -> bool {
+fn ps2_init(irq: bool) -> bool {
     if inb(0x64) == 0xFF {
         return false
     }
@@ -38,7 +38,10 @@ fn ps2_init() -> bool {
         return false
     }
     let config = inb(0x60)
-    let wanted = (config & 0xFC) | 0x40
+    let mut wanted = (config & 0xFC) | 0x40
+    if irq {
+        wanted |= 0x01
+    }
     if !ps2_wait_write() {
         return false
     }
@@ -52,8 +55,31 @@ fn ps2_init() -> bool {
 
 fn ps2_poll() -> i32 {
     let status = inb(0x64)
-    if status & 0x01 == 0 { return -1 }
+    if status & 0x01 == 0 {
+        return -1
+    }
     let data = inb(0x60)
-    if status & 0x20 != 0 { return -1 }
+    if status & 0x20 != 0 {
+        return -1
+    }
     return data as i32
+}
+
+fn ps2_read_data() -> u8 {
+    return inb(0x60)
+}
+
+fn ps2_inject(byte: u8) -> bool {
+    for i in 0..100000 {
+        if inb(0x64) & 0x03 == 0 {
+            outb(0x64, 0xD2)
+            if !ps2_wait_write() {
+                return false
+            }
+            outb(0x60, byte)
+            return true
+        }
+        pause()
+    }
+    return false
 }

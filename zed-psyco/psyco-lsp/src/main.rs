@@ -387,17 +387,17 @@ impl Server {
                 .take_while(|c| analysis::is_word(*c))
                 .collect()
         });
-        if let Some(b) = builtins::builtin(&word) {
+        let builtin = if an.is_member(tok) {
+            builtins::method(&word)
+        } else {
+            builtins::builtin(&word)
+        };
+        if let Some(b) = builtin {
             let mut text = format!("```psyco\n{}\n```\n\n{}", b.signature(), b.doc);
             if b.trusted {
                 text.push_str("\n\nOnly available in `#![trusted]` files.");
             }
             return Ok(markdown(text));
-        }
-        if word == "len" && an.is_member(tok) {
-            return Ok(markdown(
-                "```psyco\nfn len() -> usize\n```\n\nNumber of elements of an array or slice.".into(),
-            ));
         }
         Ok(builtins::keyword_doc(&word).and_then(|doc| markdown(format!("`{word}`: {doc}"))))
     }
@@ -578,12 +578,15 @@ impl Server {
                 });
                 add(item);
             }
-            add(CompletionItem {
-                label: "len".into(),
-                kind: Some(CompletionItemKind::METHOD),
-                detail: Some("fn len() -> usize".into()),
-                ..Default::default()
-            });
+            for b in builtins::METHODS {
+                add(CompletionItem {
+                    label: b.name.into(),
+                    kind: Some(CompletionItemKind::METHOD),
+                    detail: Some(b.signature()),
+                    documentation: Some(Documentation::String(b.doc.into())),
+                    ..Default::default()
+                });
+            }
         } else {
             let at = an.cursor_index(line, col).saturating_sub(1);
             for d in an.locals_at(at) {
@@ -650,7 +653,11 @@ impl Server {
                     (d.detail.clone(), params, None)
                 }
             }
-            None => match builtins::builtin(an.ident(callee).unwrap_or_default()) {
+            None => match if an.is_member(callee) {
+                builtins::method(an.ident(callee).unwrap_or_default())
+            } else {
+                builtins::builtin(an.ident(callee).unwrap_or_default())
+            } {
                 Some(b) => (
                     b.signature(),
                     b.params.iter().map(|s| s.to_string()).collect(),
