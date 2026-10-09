@@ -1,0 +1,255 @@
+/// Wiki Doc sources:
+///   - https://wiki.osdev.org/Paging
+///   - https://wiki.osdev.org/Identity_Paging
+///   - https://wiki.osdev.org/Higher_Half_Kernel
+///   - https://wiki.osdev.org/X86_Page_Tables
+///
+/// The kernel's own 4-level page tables (x86-64 long mode).
+///
+///   0x0000000000000000  identity map of physical memory (2 MiB pages)
+///   0xFFFF800000000000  same physical memory again ("direct map"), shares
+///                       the identity tables; it will stay when the low half
+///                       goes to user programs (phase 4)
+///   0xFFFFFFFF80000000  the kernel image (4 KiB pages), where the kernel
+///                       runs after enter_higher_half()
+///
+/// Page tables are reached through the identity map, which is valid with
+/// both the firmware tables and ours.
+
+#![trusted]
+
+import "efi.psy"
+import "fb.psy"
+import "pmm.psy"
+import "stack.psy"
+
+const kernel_virt_base: u64 = 0xFFFFFFFF80000000
+const direct_map_base: u64 = 0xFFFF800000000000
+
+const pte_present: u64 = 0x1
+const pte_writable: u64 = 0x2
+const pte_user: u64 = 0x4
+const pte_huge: u64 = 0x80
+const pte_global: u64 = 0x100
+const pte_addr_mask: u64 = 0x000FFFFFFFFFF000
+
+const entries_per_table: u64 = 512
+const size_4k: u64 = 0x1000
+const size_2m: u64 = 0x200000
+const size_1g: u64 = 0x40000000
+
+// The identity map covers at least 4 GiB (MMIO hole, framebuffer, APICs)
+// and at most 512 GiB (one PDPT).
+const identity_min: u64 = 0x100000000
+const identity_max: u64 = 0x8000000000
+
+const mem_first_ram_kind: u32 = 1
+const mem_last_ram_kind: u32 = 10
+const mem_persistent: u32 = 14
+
+const pml4_identity_slot: usize = 0
+const pml4_direct_map_slot: usize = 256
+
+const not_mapped: u64 = 0xFFFFFFFFFFFFFFFF
+
+#[getter]
+static mut pml4_phys: u64 = 0
+#[getter]
+static mut identity_limit: u64 = 0
+#[getter]
+static mut table_pages: u64 = 0
+#[getter]
+static mut paging_ready: bool = false
+
+/// Allocates a zeroed page for a page table.
+fn new_table() -> u64 {
+    let page = pmm_alloc_page()
+    if page == 0 {
+        panic("paging: out of memory for page tables")
+    }
+    memset(page as *mut u8, 0, size_4k as usize)
+    table_pages += 1
+    return page
+}
+
+/// Entry `index` of the table at physical address `table`.
+fn entry(table: u64, index: u64) -> *mut u64 {
+    return (table as *mut u64).add(index as usize)
+}
+
+/// Index into the table of `level` (3 = PML4, 2 = PDPT, 1 = PD, 0 = PT).
+fn table_index(virt: u64, level: u64) -> u64 {
+    return (virt >> (12 + 9 * level)) & (entries_per_table - 1)
+}
+
+/// Next-level table of an entry, created if missing (0 if it is a huge page).
+fn next_table(table: u64, index: u64, create: bool) -> u64 {
+    let e = entry(table, index)
+    let value = e.read()
+    if value & pte_present == 0 {
+        if !create {
+            return 0
+        }
+        let t = new_table()
+        e.write(t | pte_present | pte_writable)
+        return t
+    }
+    if value & pte_huge != 0 {
+        return 0
+    }
+    return value & pte_addr_mask
+}
+
+/// Flushes one address from the TLB once our tables are live.
+fn flush(virt: u64) {
+    if paging_ready {
+        invlpg(virt as usize)
+    }
+}
+
+/// Maps one 4 KiB page `virt` -> `phys` (extra `flags`, e.g. pte_user).
+/// False if the address is already covered by a 2 MiB page.
+fn map_page(virt: u64, phys: u64, flags: u64) -> bool {
+    if virt % size_4k != 0 || phys % size_4k != 0 {
+        panic("map_page: unaligned address")
+    }
+    let pdpt = next_table(pml4_phys, table_index(virt, 3), true)
+    let pd = next_table(pdpt, table_index(virt, 2), true)
+    if pd == 0 {
+        return false
+    }
+    let pt = next_table(pd, table_index(virt, 1), true)
+    if pt == 0 {
+        return false
+    }
+    entry(pt, table_index(virt, 0)).write(phys | flags | pte_present | pte_writable)
+    flush(virt)
+    return true
+}
+
+/// Removes the 4 KiB mapping of `virt` (false if it was not mapped).
+fn unmap_page(virt: u64) -> bool {
+    let pdpt = next_table(pml4_phys, table_index(virt, 3), false)
+    if pdpt == 0 {
+        return false
+    }
+    let pd = next_table(pdpt, table_index(virt, 2), false)
+    if pd == 0 {
+        return false
+    }
+    let pt = next_table(pd, table_index(virt, 1), false)
+    if pt == 0 {
+        return false
+    }
+    let e = entry(pt, table_index(virt, 0))
+    if e.read() & pte_present == 0 {
+        return false
+    }
+    e.write(0)
+    flush(virt)
+    return true
+}
+
+/// Physical address behind `virt`, or not_mapped.
+fn translate(virt: u64) -> u64 {
+    let mut table = pml4_phys
+    let mut level: u64 = 3
+    loop {
+        let value = entry(table, table_index(virt, level)).read()
+        if value & pte_present == 0 {
+            return not_mapped
+        }
+        let page_bits = 12 + 9 * level
+        if level == 0 || value & pte_huge != 0 {
+            let offset_mask = (1u64 << page_bits) - 1
+            return (value & pte_addr_mask & ~offset_mask) | (virt & offset_mask)
+        }
+        table = value & pte_addr_mask
+        level -= 1
+    }
+}
+
+/// End of the physical range to identity map: RAM, firmware areas and
+/// the framebuffer (not reserved ranges or MMIO windows), rounded up to
+/// 1 GiB, between 4 GiB and 512 GiB.
+fn physical_limit() -> u64 {
+    let mut limit = identity_min
+    for i in 0..memory_map_entries() {
+        let r = memory_region(i)
+        let ram_like = (r.kind >= mem_first_ram_kind && r.kind <= mem_last_ram_kind) || r.kind == mem_persistent
+        if !ram_like {
+            continue
+        }
+        let end = r.start + r.pages * size_4k
+        if end > limit {
+            limit = end
+        }
+    }
+    let fb_end = get_fb_base() as u64 + get_fb_size() as u64
+    if fb_end > limit {
+        limit = fb_end
+    }
+    limit = (limit + size_1g - 1) / size_1g * size_1g
+    if limit > identity_max {
+        limit = identity_max
+    }
+    return limit
+}
+
+/// Builds the kernel page tables and loads them into CR3.
+fn paging_init() {
+    pml4_phys = new_table()
+
+    // Identity map with 2 MiB pages, one page directory per GiB.
+    identity_limit = physical_limit()
+    let pdpt = new_table()
+    for gib in 0..identity_limit / size_1g {
+        let pd = new_table()
+        entry(pdpt, gib).write(pd | pte_present | pte_writable)
+        for i in 0..entries_per_table {
+            let phys = gib * size_1g + i * size_2m
+            entry(pd, i).write(phys | pte_present | pte_writable | pte_huge)
+        }
+    }
+    entry(pml4_phys, pml4_identity_slot as u64).write(pdpt | pte_present | pte_writable)
+    entry(pml4_phys, pml4_direct_map_slot as u64).write(pdpt | pte_present | pte_writable)
+
+    // The kernel image again, at the top of the address space.
+    let pages = (get_image_size() + size_4k - 1) / size_4k
+    for p in 0..pages {
+        let offset = p * size_4k
+        map_page(kernel_virt_base + offset, get_image_base() + offset, 0)
+    }
+
+    write_cr3(pml4_phys)
+    paging_ready = true
+}
+
+/// Higher-half alias of an address inside the kernel image.
+fn kernel_high(addr: u64) -> u64 {
+    let base = get_image_base()
+    if addr >= kernel_virt_base {
+        return addr
+    }
+    if addr < base || addr >= base + get_image_size() {
+        panic("kernel_high: address outside the kernel image")
+    }
+    return addr - base + kernel_virt_base
+}
+
+/// Direct-map alias of a physical address.
+fn phys_to_virt(phys: u64) -> u64 {
+    return direct_map_base + phys
+}
+
+/// Jumps to the higher-half alias of `entry`, on the kernel stack. The code
+/// only uses rip-relative addresses, so it runs unchanged up there.
+fn enter_higher_half(entry: fn()) {
+    if !paging_ready {
+        panic("enter_higher_half: paging is not set up")
+    }
+    memset(kstack.as_mut_ptr(), kstack_fill, kstack_size)
+    let top = kernel_high(kstack_top() as u64)
+    let high_entry = kernel_high(entry as u64) as fn()
+    switch_stack(top as usize, high_entry)
+}

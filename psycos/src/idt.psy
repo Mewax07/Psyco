@@ -77,6 +77,12 @@ fn idt_gate_present(vector: usize) -> bool {
     return (idt[vector * 2] >> gate_present_bit) & 1 == 1
 }
 
+/// Handler address stored in a gate (for tests and diagnostics).
+fn idt_gate_address(vector: usize) -> u64 {
+    let lo = idt[vector * 2]
+    return (lo & 0xFFFF) | (((lo >> 48) & 0xFFFF) << 16) | (idt[vector * 2 + 1] << 32)
+}
+
 /// Loads the IDT into the CPU.
 fn idt_load() {
     idtr.limit = (idt.len() * 8 - 1) as u16

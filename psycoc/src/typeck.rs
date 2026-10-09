@@ -1478,6 +1478,9 @@ impl TypeChecker {
                         span,
                     );
                 }
+                if matches!(to, Type::Fn(_)) && from != to {
+                    self.need_trusted("casting an address to a function", span)?;
+                }
                 Ok((ExprKind::Cast { expr, r#type }, to))
             }
 
@@ -1967,6 +1970,7 @@ impl TypeChecker {
             (Ref(a, m), Raw(b, m2)) => a == b && (*m || !*m2),
             (Fn(_), t) if ptr_int(t) => true,
             (Fn(_), Raw(..)) => true,
+            (t, Fn(_)) if ptr_int(t) => true,
             (Str, Raw(t, false)) => **t == Type::U8,
             _ => false,
         }

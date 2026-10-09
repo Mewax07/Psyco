@@ -3,6 +3,7 @@
 ///   - https://uefi.org/specs/UEFI/2.10/04_EFI_System_Table.html
 ///   - https://uefi.org/specs/UEFI/2.10/07_Services_Boot_Services.html
 ///   - https://uefi.org/specs/UEFI/2.10/08_Services_Runtime_Services.html
+///   - https://uefi.org/specs/UEFI/2.10/09_Protocols_EFI_Loaded_Image.html
 ///
 /// UEFI tables and the few firmware services the kernel still needs.
 /// The memory map is read right before ExitBootServices and kept here:
@@ -106,7 +107,7 @@ struct BootServices {
     install_protocol_interface: *mut u8,
     reinstall_protocol_interface: *mut u8,
     uninstall_protocol_interface: *mut u8,
-    handle_protocol: *mut u8,
+    handle_protocol: extern fn(*mut u8, *const Guid, *mut *mut u8) -> u64,
     reserved: *mut u8,
     register_protocol_notify: *mut u8,
     locate_handle: *mut u8,
@@ -151,6 +152,22 @@ struct SystemTable {
     boot_services: *mut BootServices,
 }
 
+struct LoadedImage {
+    revision: u32,
+    parent_handle: *mut u8,
+    system_table: *mut u8,
+    device_handle: *mut u8,
+    file_path: *mut u8,
+    reserved: *mut u8,
+    load_options_size: u32,
+    load_options: *mut u8,
+    image_base: *mut u8,
+    image_size: u64,
+    image_code_type: u32,
+    image_data_type: u32,
+    unload: *mut u8,
+}
+
 // What the rest of the kernel sees of one memory map entry.
 struct MemRegion {
     kind: u32,
@@ -166,11 +183,37 @@ static mut map_desc_size: usize = 0
 #[getter]
 static mut boot_services_done: bool = false
 
-/// Saves the system table and disables the firmware watchdog.
+// Where the firmware loaded our PE image (physical, page aligned).
+#[getter]
+static mut image_base: u64 = 0
+#[getter]
+static mut image_size: u64 = 0
+
+/// Saves the system table, disables the watchdog, finds our own image.
 fn efi_init() {
     st = efi_system_table() as *mut SystemTable
     let bs = (*st).boot_services
     (*bs).set_watchdog_timer(0, 0, 0, 0 as *const u16)
+    read_loaded_image()
+}
+
+/// Reads the base address and size of the kernel image (LoadedImage).
+fn read_loaded_image() {
+    let guid = Guid {
+        d1: 0x5B1B31A1,
+        d2: 0x9562,
+        d3: 0x11d2,
+        d4: [0x8E, 0x3F, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B],
+    }
+    let bs = (*st).boot_services
+    let mut li = 0 as *mut u8
+    let status = (*bs).handle_protocol(efi_image_handle(), &guid as *const Guid, &mut li as *mut *mut u8)
+    if status != 0 || li.is_null() {
+        return
+    }
+    let image = li as *mut LoadedImage
+    image_base = (*image).image_base as u64
+    image_size = (*image).image_size
 }
 
 /// Reads the memory map into `map`, returns its key (-1 on error).

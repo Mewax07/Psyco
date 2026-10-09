@@ -1,0 +1,225 @@
+/// Wiki Doc sources:
+///   - https://wiki.osdev.org/Page_Frame_Allocation
+///   - https://wiki.osdev.org/Writing_A_Page_Frame_Allocator
+///   - https://wiki.osdev.org/Detecting_Memory_(x86)
+///
+/// Physical page allocator (normal code: it only handles addresses).
+/// One bit per 4 KiB page, 1 = used. Built from the UEFI memory map:
+/// only EfiConventionalMemory (type 7) is free at first, and the first
+/// MiB stays reserved (null page, legacy areas, future SMP trampoline).
+/// Allocation always returns the lowest free page.
+
+import "efi.psy"
+
+const page_size: u64 = 4096
+const page_shift: u64 = 12
+
+// The bitmap covers the first 16 GiB of physical memory.
+const pmm_max_pages: u64 = 4194304
+const pmm_words: usize = 65536
+const bits_per_word: u64 = 64
+const full_word: u64 = 0xFFFFFFFFFFFFFFFF
+
+// Below this address, nothing is ever handed out.
+const pmm_reserved_low: u64 = 0x100000
+
+static mut pmm_bitmap: [u64; 65536]
+
+// Lowest page index that may be free (everything below is used).
+static mut pmm_hint: u64 = 0
+
+#[getter]
+static mut pmm_total_pages: u64 = 0
+#[getter]
+static mut pmm_free_pages: u64 = 0
+// Free pages above pmm_max_pages, that the bitmap cannot track.
+#[getter]
+static mut pmm_ignored_pages: u64 = 0
+#[getter]
+static mut pmm_ready: bool = false
+
+/// True if page `index` is used.
+fn page_used(index: u64) -> bool {
+    return (pmm_bitmap[(index / bits_per_word) as usize] >> (index % bits_per_word)) & 1 == 1
+}
+
+/// Marks page `index` as used.
+fn mark_used(index: u64) {
+    let w = (index / bits_per_word) as usize
+    pmm_bitmap[w] |= 1u64 << (index % bits_per_word)
+}
+
+/// Marks page `index` as free.
+fn mark_free(index: u64) {
+    let w = (index / bits_per_word) as usize
+    pmm_bitmap[w] &= ~(1u64 << (index % bits_per_word))
+}
+
+/// Page index of a page-aligned physical address (panics otherwise).
+fn page_index(addr: u64) -> u64 {
+    if addr % page_size != 0 {
+        panic("pmm: address is not page aligned")
+    }
+    let index = addr >> page_shift
+    if index >= pmm_max_pages {
+        panic("pmm: address beyond the tracked memory")
+    }
+    return index
+}
+
+/// Builds the bitmap from the saved memory map (after ExitBootServices).
+fn pmm_init() {
+    for i in 0..pmm_words {
+        pmm_bitmap[i] = full_word
+    }
+    pmm_total_pages = 0
+    pmm_free_pages = 0
+    pmm_ignored_pages = 0
+    for i in 0..memory_map_entries() {
+        let r = memory_region(i)
+        if r.kind == mem_conventional {
+            pmm_add_region(r.start, r.pages)
+        }
+    }
+    pmm_hint = pmm_reserved_low >> page_shift
+    pmm_ready = true
+}
+
+/// Marks a region as free, skipping the first MiB and untracked memory.
+fn pmm_add_region(start: u64, pages: u64) {
+    for p in 0..pages {
+        let addr = start + p * page_size
+        if addr < pmm_reserved_low {
+            continue
+        }
+        let index = addr >> page_shift
+        if index >= pmm_max_pages {
+            pmm_ignored_pages += 1
+            continue
+        }
+        if page_used(index) {
+            mark_free(index)
+            pmm_total_pages += 1
+            pmm_free_pages += 1
+        }
+    }
+}
+
+/// Adds more free memory later (e.g. boot services memory once the kernel
+/// has its own page tables). Returns the number of pages added.
+fn pmm_release_region(start: u64, pages: u64) -> u64 {
+    let before = pmm_free_pages
+    pmm_add_region(start, pages)
+    let index = start >> page_shift
+    if index < pmm_hint {
+        pmm_hint = index
+    }
+    if pmm_hint < (pmm_reserved_low >> page_shift) {
+        pmm_hint = pmm_reserved_low >> page_shift
+    }
+    return pmm_free_pages - before
+}
+
+/// Allocates one page; returns its physical address, or 0 if memory is full.
+fn pmm_alloc_page() -> u64 {
+    let mut w = (pmm_hint / bits_per_word) as usize
+    while w < pmm_words {
+        let word = pmm_bitmap[w]
+        if word != full_word {
+            for b in 0..bits_per_word {
+                if (word >> b) & 1 == 0 {
+                    let index = w as u64 * bits_per_word + b
+                    mark_used(index)
+                    pmm_free_pages -= 1
+                    pmm_hint = index + 1
+                    return index << page_shift
+                }
+            }
+        }
+        w += 1
+    }
+    pmm_hint = pmm_max_pages
+    return 0
+}
+
+/// Allocates `count` contiguous pages; returns the first address, or 0.
+fn pmm_alloc_pages(count: u64) -> u64 {
+    if count == 0 {
+        return 0
+    }
+    if count == 1 {
+        return pmm_alloc_page()
+    }
+    let mut start = pmm_hint
+    let mut run: u64 = 0
+    let mut index = pmm_hint
+    while index < pmm_max_pages {
+        // Skip fully used words quickly.
+        if index % bits_per_word == 0 && pmm_bitmap[(index / bits_per_word) as usize] == full_word {
+            index += bits_per_word
+            run = 0
+            continue
+        }
+        if page_used(index) {
+            run = 0
+        } else {
+            if run == 0 {
+                start = index
+            }
+            run += 1
+            if run == count {
+                for i in start..start + count {
+                    mark_used(i)
+                }
+                pmm_free_pages -= count
+                if start == pmm_hint {
+                    pmm_hint = start + count
+                }
+                return start << page_shift
+            }
+        }
+        index += 1
+    }
+    return 0
+}
+
+/// Gives back one page (panics on a double free).
+fn pmm_free_page(addr: u64) {
+    let index = page_index(addr)
+    if !page_used(index) {
+        panic("pmm_free_page: page already free")
+    }
+    if addr < pmm_reserved_low {
+        panic("pmm_free_page: reserved page")
+    }
+    mark_free(index)
+    pmm_free_pages += 1
+    if index < pmm_hint {
+        pmm_hint = index
+    }
+}
+
+/// Gives back `count` contiguous pages.
+fn pmm_free_pages_at(addr: u64, count: u64) {
+    for i in 0..count {
+        pmm_free_page(addr + i * page_size)
+    }
+}
+
+/// True if the page at `addr` is currently allocated or reserved.
+fn pmm_is_used(addr: u64) -> bool {
+    return page_used(page_index(addr))
+}
+
+/// Frees the firmware boot services memory (types 3 and 4). Only safe once
+/// the kernel runs on its own page tables, GDT, IDT and stack.
+fn pmm_reclaim_boot_services() -> u64 {
+    let mut added: u64 = 0
+    for i in 0..memory_map_entries() {
+        let r = memory_region(i)
+        if r.kind == mem_boot_services_code || r.kind == mem_boot_services_data {
+            added += pmm_release_region(r.start, r.pages)
+        }
+    }
+    return added
+}

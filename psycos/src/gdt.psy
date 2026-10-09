@@ -64,12 +64,10 @@ static mut df_stack: [u8; 16384]
 #[getter]
 static mut gdt_ready: bool = false
 
-/// Builds and loads the GDT and the TSS (only once).
+/// Builds and loads the GDT and the TSS (only once). Can run again (after moving to
+/// the higher half): the TSS descriptor is rewritten as "available", so
+/// ltr does not fault on a busy TSS.
 fn gdt_init() {
-    if gdt_ready {
-        return
-    }
-
     gdt[0] = 0
     gdt[1] = gdt_kernel_code
     gdt[2] = gdt_kernel_data
