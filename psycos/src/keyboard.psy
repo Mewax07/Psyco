@@ -65,6 +65,9 @@ static mut kbd_dropped: u64 = 0
 #[getter]
 static mut kbd_irqs: u64 = 0
 
+#[setter]
+static mut key_wait_hook: fn()
+
 /// Installs vector 33 and unmasks IRQ 1 (call after irq_init).
 fn kbd_init() {
     kbd_ps2 = ps2_init(true)
@@ -206,9 +209,15 @@ fn read_key() -> u8 {
             }
             return c
         }
-        // sti then hlt with nothing in between: no IRQ can slip between
-        // the buffer check and going to sleep.
-        sti()
-        hlt()
+        if key_wait_hook as u64 != 0 {
+            sti()
+            let wait = key_wait_hook
+            wait()
+        } else {
+            // sti then hlt with nothing in between: no IRQ can slip between
+            // the buffer check and going to sleep.
+            sti()
+            hlt()
+        }
     }
 }

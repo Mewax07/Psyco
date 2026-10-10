@@ -22,6 +22,9 @@ static mut spurious_irqs: u64 = 0
 #[getter]
 static mut other_irqs: u64 = 0
 
+#[setter]
+static mut tick_hook: fn()
+
 /// Installs the 16 IRQ vectors and starts the timer. Interrupts stay off:
 /// the caller does sti() once everything is ready.
 fn irq_init() {
@@ -38,11 +41,16 @@ fn irq_init() {
     pic_unmask(timer_irq)
 }
 
-/// IRQ 0: one timer tick.
+/// IRQ 0: one timer tick. The EOI goes first, because the hook may switch
+/// to another task and only come back much later.
 #[interrupt]
 fn irq_timer(frame: &Frame) {
     ticks += 1
     pic_eoi(timer_irq)
+    if tick_hook as u64 != 0 {
+        let hook = tick_hook
+        hook()
+    }
 }
 
 /// IRQ 7: real or spurious.

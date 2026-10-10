@@ -8,7 +8,8 @@
 /// exit_boot_services -> cli -> cpu_init -> pmm_init -> paging_init ->
 /// enter_higher_half(kmain).
 /// kmain (our tables, higher half, kernel stack): cpu_init again ->
-/// reclaim boot services memory -> irq_init -> kbd_init -> sti -> shell.
+/// reclaim boot services memory -> heap_init -> irq_init -> sched_init ->
+/// kbd_init -> sti -> shell.
 
 import "efi.psy"
 import "fb.psy"
@@ -21,13 +22,18 @@ import "debug.psy"
 import "timer.psy"
 import "pmm.psy"
 import "paging.psy"
+import "heap.psy"
+import "sched.psy"
 
 const line_max: usize = 76
 const bytes_per_kib: u64 = 1024
 const bytes_per_mib: u64 = 1048576
 const page_bytes: u64 = 4096
 
-// Addresses used by `crash`: unmapped and non-canonical.
+const spinner_size: usize = 16
+const spinner_gap: usize = 24
+const spinner_frame_ms: u64 = 60
+
 const crash_unmapped: u64 = 0xFFFFC00000000000
 const crash_non_canonical: u64 = 0x8000000000000000
 const page_fault_vector: usize = 14
@@ -102,6 +108,9 @@ fn cmd_help() {
     puts("  time       date and time\n")
     puts("  mem        free memory\n")
     puts("  uptime     time since boot\n")
+    puts("  ps         list tasks\n")
+    puts("  spin       start a demo task (animated square, top right)\n")
+    puts("  kill N     stop the task in slot N\n")
     puts("  fb         framebuffer info and test pattern\n")
     puts("  echo TXT   print TXT\n")
     puts("  int3       trigger a breakpoint (execution resumes)\n")
@@ -205,6 +214,15 @@ fn cmd_mem() {
         put_u64(get_pmm_ignored_pages())
         puts(" pages above 16 GiB are not tracked yet\n")
     }
+    puts("Heap: ")
+    put_u64(get_heap_used_bytes())
+    puts(" bytes in ")
+    put_u64(get_heap_allocations())
+    puts(" blocks, ")
+    put_u64(heap_mapped_bytes() / bytes_per_kib)
+    puts(" KiB mapped at 0x")
+    put_hex(heap_base)
+    putc('\n')
     puts("Kernel stack: ")
     put_u64(kstack_used() as u64)
     puts(" bytes used of ")
@@ -261,6 +279,125 @@ fn cmd_uptime() {
     puts(" Hz)\n")
 }
 
+/// Prints `s` padded with spaces to `width` columns.
+fn put_padded(s: Str, width: usize) {
+    puts(s)
+    for i in s.len()..width {
+        putc(' ')
+    }
+}
+
+/// Prints a number padded with spaces to `width` columns.
+fn put_u64_padded(n: u64, width: usize) {
+    let mut digits: usize = 1
+    let mut v = n
+    while v >= 10 {
+        v /= 10
+        digits += 1
+    }
+    put_u64(n)
+    for i in digits..width {
+        putc(' ')
+    }
+}
+
+/// `ps`: list of tasks.
+fn cmd_ps() {
+    set_color(yellow)
+    puts("SLOT  ID    STATE     SWITCHES  TICKS       NAME\n")
+    set_color(gray)
+    let mut name = [0u8; 16]
+    for slot in 0..max_tasks {
+        let state = task_state(slot)
+        if state == TaskState::Free {
+            continue
+        }
+        put_u64_padded(slot as u64, 6)
+        put_u64_padded(task_id(slot), 6)
+        put_padded(state_name(state), 10)
+        put_u64_padded(task_switches(slot), 10)
+        put_u64_padded(task_run_ticks(slot), 10)
+        let n = task_name(slot, &mut name)
+        for i in 0..n {
+            putc(name[i])
+        }
+        putc('\n')
+    }
+    puts("context switches: ")
+    put_u64(get_context_switches())
+    puts(", preemptions: ")
+    put_u64(get_preemptions())
+    putc('\n')
+}
+
+/// Demo task: animates a colored square, one position per task slot.
+fn spinner_main() {
+    let x = get_fb_width() - (get_current() + 1) * spinner_gap
+    let colors = [0xFF5555u32, 0xFFFF55u32, 0x55FF55u32, 0x55FFFFu32, 0x5555FFu32, 0xFF55FFu32]
+    let mut frame: usize = 0
+    loop {
+        let size = 4 + frame % 4 * 4
+        fill_rect(x, 4, spinner_size, spinner_size, black)
+        fill_rect(x + (spinner_size - size) / 2, 4 + (spinner_size - size) / 2, size, size, colors[frame % colors.len()])
+        frame += 1
+        task_sleep(spinner_frame_ms)
+    }
+}
+
+/// `spin`: starts one more spinner task
+fn cmd_spin() {
+    if !has_fb {
+        puts("no framebuffer\n")
+        return
+    }
+    let slot = spawn("spinner", spinner_main)
+    if slot < 0 {
+        puts("no free task slot\n")
+    }
+    puts("spinner started in slot ")
+    put_u64(slot as u64)
+    putc('\n')
+}
+
+/// Decimal number typed after `start` in the line (-1 if none).
+fn line_number(start: usize) -> i64 {
+    let mut n: i64 = 0
+    let mut digits = 0
+    for i in start..line_len {
+        let c = line[i]
+        if c < '0' || c > '9' {
+            return -1
+        }
+        n = n *10 + (c - '0') as i64
+        digits += 1
+    }
+    if digits == 0 {
+        return -1
+    }
+    return n
+}
+
+/// `kill N`: stops a task.
+fn cmd_kill() {
+    let n = line_number(5)
+    if n < 0 || n >= max_tasks as i64 {
+        puts("usage: kill N (see ps)")
+        return
+    }
+    let slot = n as usize
+    let mut name = [0u8; 16]
+    let len = task_name(slot, &mut name)
+    let was_spinner = len == 7 && name[0] == 's' && name[1] == 'p'
+    if !task_kill(slot) {
+        puts("cannot kill this task\n")
+        return
+    }
+    if was_spinner && has_fb {
+        fill_rect(get_fb_width() - (slot + 1) * spinner_gap, 4, spinner_size, spinner_size, black)
+    }
+    puts("killed\n")
+}
+
 /// `crash X`: triggers an exception on purpose.
 fn cmd_crash() {
     if line_is("crash pf") {
@@ -307,6 +444,12 @@ fn run_command() {
         putc('\n')
     } else if line_is("uptime") {
         cmd_uptime()
+    } else if line_is("ps") {
+        cmd_ps()
+    } else if line_is("spin") {
+        cmd_spin()
+    } else if line_starts_with("kill ") {
+        cmd_kill()
     } else if line_is("int3") {
         int3()
         puts("resumed after int3 (")
@@ -383,8 +526,11 @@ fn main() {
 /// starts the shell.
 fn kmain() {
     cpu_init()
+    // Firmware page tables, GDT, IDT and stack are no longer used.
     reclaimed_pages = pmm_reclaim_boot_services()
+    heap_init()
     irq_init()
+    sched_init()
     kbd_init()
     sti()
     print("PsycOS: boot ok")

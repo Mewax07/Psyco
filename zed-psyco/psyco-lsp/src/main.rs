@@ -465,6 +465,31 @@ impl Server {
             }
         }
 
+        // `include_bytes("f")` / `include_program("f.psy")` open the file.
+        let include = (0..an.tokens.len()).find_map(|i| {
+            let named = matches!(an.ident(i), Some("include_bytes" | "include_program"));
+            match (named, an.kind(i + 1), an.kind(i + 2)) {
+                (true, psycoc::TokenKind::LParen, psycoc::TokenKind::Str(path))
+                    if an.tokens[i].span.line == line =>
+                {
+                    Some(String::from_utf8_lossy(path).into_owned())
+                }
+                _ => None,
+            }
+        });
+        if let Some(include) = include {
+            let dir = world.units[0].path.as_deref().and_then(Path::parent);
+            let path = normalize(&dir.unwrap_or(Path::new("")).join(include));
+            if path.exists() {
+                if let Some(uri) = parse_uri(&path_to_uri(&path)) {
+                    return Ok(Some(GotoDefinitionResponse::Scalar(Location {
+                        uri,
+                        range: Range::default(),
+                    })));
+                }
+            }
+        }
+
         let Some(tok) = an.token_at(pos.position) else {
             return Ok(None);
         };

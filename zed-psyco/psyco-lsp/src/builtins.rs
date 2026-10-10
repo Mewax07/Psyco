@@ -48,6 +48,7 @@ pub const BUILTINS: &[Builtin] = &[
     builtin!("read_cr3"(), "u64", false, "Reads control register CR3 (page table root)."),
     builtin!("read_cr4"(), "u64", false, "Reads control register CR4."),
     builtin!("rdtsc"(), "u64", false, "Reads the time-stamp counter."),
+    builtin!("read_rflags"(), "u64", false, "Reads the RFLAGS register (interrupt flag = bit 9)."),
     builtin!("write_cr0"("value: u64"), "", true, "Writes control register CR0."),
     builtin!("write_cr3"("value: u64"), "", true, "Writes control register CR3."),
     builtin!("write_cr4"("value: u64"), "", true, "Writes control register CR4."),
@@ -64,6 +65,12 @@ pub const BUILTINS: &[Builtin] = &[
     builtin!("switch_stack"("stack: usize", "f: fn()"), "", true, "Switches to a new stack and calls `f` on it. Never returns."),
     builtin!("lgdt"("descriptor: &T"), "", true, "Loads the global descriptor table register."),
     builtin!("lidt"("descriptor: &T"), "", true, "Loads the interrupt descriptor table register."),
+    builtin!("set_syscall_stack"("stack: u64"), "", true, "Sets the kernel stack that `#[syscall]` handlers switch to on entry."),
+    builtin!("syscall"("number: u64", "a1: u64", "a2: u64", "a3: u64"), "i64", false, "Makes a system call: `number` in rax, the arguments in rdi, rsi and rdx. Returns rax."),
+    builtin!("iret_to"("rip: u64", "cs: u64", "rflags: u64", "rsp: u64", "ss: u64"), "", true, "Pushes an interrupt frame and runs `iretq` (e.g. to enter user mode). Never returns."),
+    builtin!("include_bytes"("path: Str"), "Str", false, "Embeds the bytes of a file, read at compile time. `path` is a string literal relative to the source file."),
+    builtin!("include_program"("path: Str"), "Str", false, "Compiles another Psyco program and embeds the resulting executable. `path` is a string literal relative to the source file."),
+    builtin!("context_switch"("save: *mut u64", "next_rsp: u64"), "", true, "Saves the callee-saved registers and the resume address on the current stack, stores its `rsp` in `*save`, then switches to the stack `next_rsp` and resumes the context saved there."),
 ];
 
 pub fn builtin(name: &str) -> Option<&'static Builtin> {
@@ -104,7 +111,7 @@ pub const KEYWORDS: &[(&str, &str)] = &[
     ("struct", "Declares a structure."),
     ("enum", "Declares an enumeration, optionally with an integer representation."),
     ("impl", "Adds methods to a type."),
-    ("as", "Casts a value to another type."),
+    ("as", "Casts a value to another type: integers, pointers, enums, and an address to a function (`addr as fn()`, only in `#![trusted]` files)."),
     ("static", "Declares a global variable."),
     ("const", "Declares a compile-time constant."),
     ("extern", "Uses the UEFI (Microsoft x64) calling convention for a function type."),
@@ -153,6 +160,12 @@ pub const ATTRIBUTES: &[Attribute] = &[
         target: "fn",
         snippet: "interrupt",
         doc: "Interrupt handler: takes `(frame: &Frame)` or `(frame: &Frame, code: u64)`, returns nothing, and ends with `iretq`.",
+    },
+    Attribute {
+        name: "syscall",
+        target: "fn",
+        snippet: "syscall",
+        doc: "System call entry point (`syscall` instruction): takes `(regs: &mut Regs)` with the saved user registers, returns nothing. The stub switches to the stack given to `set_syscall_stack` and ends with `sysretq`. Cannot be combined with `#[interrupt]` or called directly.",
     },
     Attribute {
         name: "packed",

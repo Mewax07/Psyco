@@ -648,7 +648,6 @@ impl Assembler {
         pos
     }
 
-    /// `xchg rax, r`
     pub fn xchg_rax(&mut self, r: Reg) {
         self.rex(true, 0, r.ext());
         self.byte(0x90 + r.low());
@@ -676,7 +675,6 @@ impl Assembler {
         }
     }
 
-    /// `setcc r8`
     pub fn setcc(&mut self, cc: Cond, dst: Reg) {
         self.rex_byte(0, dst.ext(), dst);
         self.bytes(&[0x0F, 0x90 + cc as u8]);
@@ -689,12 +687,10 @@ impl Assembler {
         self.modrm_rr(dst as u8, src);
     }
 
-    /// `rep movsb`
     pub fn rep_movsb(&mut self) {
         self.bytes(&[0xF3, 0xA4]);
     }
 
-    /// `rep stosb`
     pub fn rep_stosb(&mut self) {
         self.bytes(&[0xF3, 0xAA]);
     }
@@ -755,47 +751,40 @@ impl Assembler {
         self.bytes(&[0x48, 0xCF]);
     }
 
-    /// `retfq`
     pub fn retfq(&mut self) {
         self.bytes(&[0x48, 0xCB]);
     }
 
-    /// `lgdt [r]`
     pub fn lgdt(&mut self, r: Reg) {
         self.rex(false, 0, r.ext());
         self.bytes(&[0x0F, 0x01]);
         self.modrm_mem(2, r, 0);
     }
 
-    /// `lidt [r]`
     pub fn lidt(&mut self, r: Reg) {
         self.rex(false, 0, r.ext());
         self.bytes(&[0x0F, 0x01]);
         self.modrm_mem(3, r, 0);
     }
 
-    /// `invlpg [r]`
     pub fn invlpg(&mut self, r: Reg) {
         self.rex(false, 0, r.ext());
         self.bytes(&[0x0F, 0x01]);
         self.modrm_mem(7, r, 0);
     }
 
-    /// `mov dst, crN`
     pub fn mov_from_cr(&mut self, dst: Reg, cr: u8) {
         self.rex(false, 0, dst.ext());
         self.bytes(&[0x0F, 0x20]);
         self.modrm_rr(cr, dst);
     }
 
-    /// `mov crN, src`
     pub fn mov_to_cr(&mut self, cr: u8, src: Reg) {
         self.rex(false, 0, src.ext());
         self.bytes(&[0x0F, 0x22]);
         self.modrm_rr(cr, src);
     }
 
-    /// `mov sreg, ax`
     pub fn mov_sreg(&mut self, sreg: Sreg, src: Reg) {
         assert!(
             !matches!(sreg, Sreg::Cs),
@@ -806,26 +795,44 @@ impl Assembler {
         self.modrm_rr(sreg as u8, src);
     }
 
-    /// `mov r32, sreg` (les bits hauts de la destination sont mis à zéro)
     pub fn mov_from_sreg(&mut self, dst: Reg, sreg: Sreg) {
         self.rex(false, 0, dst.ext());
         self.byte(0x8C);
         self.modrm_rr(sreg as u8, dst);
     }
 
-    /// `str r32` : sélecteur du TSS courant
     pub fn str_r(&mut self, dst: Reg) {
         self.rex(false, 0, dst.ext());
         self.bytes(&[0x0F, 0x00]);
         self.modrm_rr(1, dst);
     }
 
-    /// `ud2` : instruction invalide garantie (#UD)
+    pub fn store_rw(&mut self, data: RwLabel, src: Reg) {
+        self.rex(true, src.ext(), 0);
+        self.byte(0x89);
+        self.byte(src.low() << 3 | 0b101);
+        self.rel32(Target::Rw(data));
+    }
+
+    pub fn load_rw(&mut self, dst: Reg, data: RwLabel) {
+        self.rex(true, dst.ext(), 0);
+        self.byte(0x8B);
+        self.byte(dst.low() << 3 | 0b101);
+        self.rel32(Target::Rw(data));
+    }
+
+    pub fn sysretq(&mut self) {
+        self.bytes(&[0x48, 0x0F, 0x07]);
+    }
+
+    pub fn pushfq(&mut self) {
+        self.byte(0x9C);
+    }
+
     pub fn ud2(&mut self) {
         self.bytes(&[0x0F, 0x0B]);
     }
 
-    /// `ltr r16`
     pub fn ltr(&mut self, src: Reg) {
         self.rex(false, 0, src.ext());
         self.bytes(&[0x0F, 0x00]);

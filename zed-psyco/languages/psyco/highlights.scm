@@ -56,11 +56,12 @@
     "outb" "outw" "outl" "inb" "inw" "inl"
     "cli" "sti" "hlt" "pause" "int3" "ud2"
     "read_cs" "read_ds" "read_ss" "read_tr"
-    "read_cr0" "read_cr2" "read_cr3" "read_cr4" "rdtsc"
+    "read_cr0" "read_cr2" "read_cr3" "read_cr4" "rdtsc" "read_rflags"
     "write_cr0" "write_cr3" "write_cr4"
     "rdmsr" "wrmsr" "invlpg" "load_cs" "load_ds" "ltr"
     "memcpy" "memset" "efi_image_handle" "efi_system_table"
-    "switch_stack" "lgdt" "lidt"))
+    "switch_stack" "context_switch" "lgdt" "lidt"
+    "set_syscall_stack" "syscall" "iret_to" "include_bytes" "include_program"))
 
 ; Methods built into arrays, slices, strings and raw pointers.
 (call_expression

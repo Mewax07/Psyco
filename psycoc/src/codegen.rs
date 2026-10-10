@@ -313,8 +313,14 @@ impl<'a> Codegen<'a> {
         use Reg::*;
         let sig = self.info.functions[&f.name].clone();
         let interrupt = has_attr(&f.attrs, "interrupt");
+        let syscall = has_attr(&f.attrs, "syscall");
 
-        let body_label = if interrupt {
+        let body_label = if syscall {
+            let stub = self.functions[&f.name];
+            let body = self.asm.new_label();
+            self.gen_syscall_stub(stub, body);
+            body
+        } else if interrupt {
             let stub = self.functions[&f.name];
             let body = self.asm.new_label();
             self.gen_interrupt_stub(stub, body, sig.params.len() == 2);
@@ -359,6 +365,34 @@ impl<'a> Codegen<'a> {
         let frame = (self.frame_size + 15) / 16 * 16;
         self.asm.patch_i32(frame_patch, frame);
         self.scopes.clear();
+    }
+
+    fn gen_syscall_stub(&mut self, stub: Label, body: Label) {
+        use Reg::*;
+        const SAVED: [Reg; 15] = [
+            Rcx, R11, Rax, Rdi, Rsi, Rdx, R10, R8, R9, Rbx, Rbp, R12, R13, R14, R15,
+        ];
+        let rt = self.rt;
+        let a = &mut self.asm;
+        a.bind(stub);
+        a.store_rw(rt.syscall_user_rsp, Rsp);
+        a.load_rw(Rsp, rt.syscall_kernel_rsp);
+        a.alu_ri(Alu::Sub, Rsp, 8); // slot for the user rsp
+        for r in SAVED {
+            a.push(r);
+        }
+        a.load_rw(Rax, rt.syscall_user_rsp);
+        a.store(Rsp, 8 * SAVED.len() as i32, Rax);
+        a.cld();
+        a.mov_rr(Rax, Rsp);
+        a.push(Rax);
+        a.call(body);
+        a.alu_ri(Alu::Add, Rsp, 8);
+        for r in SAVED.iter().rev() {
+            a.pop(*r);
+        }
+        a.pop(Rsp); // user stack
+        a.sysretq();
     }
 
     fn gen_interrupt_stub(&mut self, stub: Label, body: Label, has_code: bool) {
@@ -940,6 +974,10 @@ impl<'a> Codegen<'a> {
             ExprKind::Bool(true) => self.asm.mov_ri(Rax, 1),
             ExprKind::Str(s) => {
                 let l = self.intern_str(s);
+                self.asm.lea_data(Rax, l);
+            }
+            ExprKind::Bytes(b) => {
+                let l = self.intern_str(b);
                 self.asm.lea_data(Rax, l);
             }
             ExprKind::CStr(s) => {
@@ -1641,6 +1679,10 @@ impl<'a> Codegen<'a> {
             "pause" => self.asm.pause(),
             "int3" => self.asm.int3(),
             "ud2" => self.asm.ud2(),
+            "read_rflags" => {
+                self.asm.pushfq();
+                self.asm.pop(Rax);
+            }
             "read_cs" | "read_ds" | "read_ss" => {
                 let sreg = match name {
                     "read_cs" => Sreg::Cs,
@@ -1731,6 +1773,44 @@ impl<'a> Codegen<'a> {
                 self.asm.pop(Rax);
                 self.asm.pop(Rdi);
                 self.asm.rep_stosb();
+            }
+            "context_switch" => {
+                self.gen_operands(&args[0], &args[1]); // rcx = save, rax = next rsp
+                let resume = self.asm.new_label();
+                self.asm.lea_code(Rdx, resume);
+                self.asm.push(Rdx);
+                for r in [Rbp, Rbx, R12, R13, R14, R15] {
+                    self.asm.push(r);
+                }
+                self.asm.store(Rcx, 0, Rsp);
+                self.asm.mov_rr(Rsp, Rax);
+                for r in [R15, R14, R13, R12, Rbx, Rbp] {
+                    self.asm.pop(r);
+                }
+                self.asm.ret();
+                self.asm.bind(resume);
+            }
+            "syscall" => {
+                for arg in args.iter().rev() {
+                    self.gen_expr(arg);
+                    self.asm.push(Rax);
+                }
+                self.asm.pop(Rax);
+                self.asm.pop(Rdi);
+                self.asm.pop(Rsi);
+                self.asm.pop(Rdx);
+                self.asm.syscall();
+            }
+            "set_syscall_stack" => {
+                self.gen_expr(&args[0]);
+                self.asm.store_rw(rt.syscall_kernel_rsp, Rax);
+            }
+            "iret_to" => {
+                for arg in args.iter().rev() {
+                    self.gen_expr(arg);
+                    self.asm.push(Rax);
+                }
+                self.asm.iretq();
             }
             "efi_image_handle" => {
                 self.asm.lea_rw(Rax, rt.efi_image_handle);

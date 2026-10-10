@@ -55,6 +55,7 @@ pub fn compile_program(
     target: Target,
 ) -> Result<Vec<u8>, String> {
     let info = TypeChecker::new()
+        .with_files(sources.paths.clone())
         .check_program(&mut program)
         .map_err(|e| sources.describe(e.span, "type", &e.message))?;
     Ok(Codegen::new(&info).generate(&program, target))

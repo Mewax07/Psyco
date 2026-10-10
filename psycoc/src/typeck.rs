@@ -1,6 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
-    mem::replace,
+    cell::Cell, collections::{HashMap, HashSet}, mem::replace, path::Path,
 };
 
 use crate::*;
@@ -162,6 +161,7 @@ pub struct TypeChecker {
     functions: HashMap<String, FnSig>,
     trusted_fns: HashSet<String>,
     accessors: HashMap<String, Accessor>,
+    files: Vec<String>,
     ctx: FnCtx,
 }
 
@@ -186,7 +186,49 @@ impl TypeChecker {
             functions: HashMap::new(),
             trusted_fns: HashSet::new(),
             accessors: HashMap::new(),
+            files: Vec::new(),
             ctx: FnCtx::default(),
+        }
+    }
+
+    pub fn with_files(mut self, files: Vec<String>) -> Self {
+        self.files = files;
+        self
+    }
+
+    fn check_include(&mut self, name: &str, args: &[Expr], span: Span) -> TypeResult<ExprKind> {
+        let [arg] = args else {
+            return self.err(format!("'{name}' expects one string literal"), span);
+        };
+        let ExprKind::Str(path) = &arg.kind else {
+            return self.err(format!("'{name}' expects a string literal path"), arg.span);
+        };
+        let rel = String::from_utf8_lossy(path).to_string();
+        let base = self
+            .files
+            .get(span.file)
+            .and_then(|f| Path::new(f).parent().map(|d| d.to_path_buf()))
+            .unwrap_or_default();
+        let full = base.join(&rel);
+        let full_str = full.to_string_lossy().to_string();
+        if name == "include_bytes" {
+            return match std::fs::read(&full) {
+                Ok(bytes) => Ok(ExprKind::Bytes(bytes)),
+                Err(e) => self.err(format!("cannot read {full_str}: {e}"), arg.span),
+            };
+        }
+        thread_local! {
+            static DEPTH: Cell<u32> = const { Cell::new(0) };
+        }
+        if DEPTH.with(|d| d.get()) >= 8 {
+            return self.err("include_program nested too deeply (does a program include itself?)", span);
+        }
+        DEPTH.with(|d| d.set(d.get() + 1));
+        let result = crate::compile_file(&full_str, crate::Target::Linux);
+        DEPTH.with(|d| d.set(d.get() - 1));
+        match result {
+            Ok(bytes) => Ok(ExprKind::Bytes(bytes)),
+            Err(e) => self.err(format!("in program {full_str}:\n{e}"), arg.span),
         }
     }
 
@@ -381,12 +423,26 @@ impl TypeChecker {
         };
 
         let interrupt = has_attr(&f.attrs, "interrupt");
+        let syscall = has_attr(&f.attrs, "syscall");
         for a in &f.attrs {
-            if a.name != "interrupt" {
+            if a.name != "interrupt" && a.name != "syscall" {
                 return self.err(format!("unknown function attribute '{}'", a.name), a.span);
             }
         }
-        let abi = if interrupt {
+        if interrupt && syscall {
+            return self.err("a function cannot be both #[interrupt] and #[syscall]", f.span);
+        }
+        let abi = if syscall {
+            let ok = params.len() == 1
+                && matches!(&params[0], Type::Ref(t, true) | Type::Raw(t, true) if matches!(**t, Type::Struct(_)));
+            if !ok || ret != Type::Unit {
+                return self.err(
+                    "#[syscall] functions take (regs: &mut Regs) and return nothing",
+                    f.span,
+                );
+            }
+            Abi::Interrupt
+        } else if interrupt {
             let ok_frame = matches!(params.first(), Some(Type::Ref(t, false)) | Some(Type::Raw(t, _)) if matches!(**t, Type::Struct(_)));
             let ok_code = params.len() == 1 || (params.len() == 2 && params[1] == Type::U64);
             if !ok_frame || !ok_code || ret != Type::Unit {
@@ -1381,6 +1437,7 @@ impl TypeChecker {
             }
             ExprKind::Bool(b) => Ok((ExprKind::Bool(b), Type::Bool)),
             ExprKind::Str(s) => Ok((ExprKind::Str(s), Type::Str)),
+            ExprKind::Bytes(b) => Ok((ExprKind::Bytes(b), Type::Str)),
             ExprKind::CStr(s) => Ok((ExprKind::CStr(s), Type::raw(Type::U8, false))),
             ExprKind::WStr(s) => Ok((ExprKind::WStr(s), Type::raw(Type::Int(IntType::U16), false))),
 
@@ -1990,6 +2047,13 @@ impl TypeChecker {
         }
 
         if let ExprKind::Var(name) = &callee.kind {
+            if self.lookup_local(name).is_none()
+                && (name == "include_bytes" || name == "include_program")
+            {
+                let name = name.clone();
+                let kind = self.check_include(&name, &args, span)?;
+                return Ok((kind, Type::Str));
+            }
             if self.lookup_local(name).is_none() && is_builtin(name) {
                 let name = name.clone();
                 let ret = self.check_builtin(&name, &mut args, span)?;
@@ -2031,7 +2095,7 @@ impl TypeChecker {
         };
         match ft.abi {
             Abi::Interrupt => {
-                return self.err("interrupt handlers cannot be called directly", span);
+                return self.err("interrupt and syscall handlers cannot be called directly", span);
             }
             Abi::Efi => self.need_trusted("calling an 'extern fn' (firmware code)", span)?,
             _ => {}
@@ -2169,7 +2233,7 @@ impl TypeChecker {
         };
         match ft.abi {
             Abi::Interrupt => {
-                return self.err("interrupt handlers cannot be called directly", span);
+                return self.err("interrupt and syscall handlers cannot be called directly", span);
             }
             Abi::Efi => self.need_trusted("calling an 'extern fn' (firmware code)", span)?,
             _ => {}
@@ -2556,7 +2620,9 @@ fn builtin_sig(name: &str) -> Option<(Vec<Type>, Type, bool)> {
         "inl" => (vec![u(U16)], u(U32), true),
         "cli" | "sti" | "hlt" | "pause" | "int3" | "ud2" => (vec![], Type::Unit, false),
         "read_cs" | "read_ds" | "read_ss" | "read_tr" => (vec![], u(U16), false),
-        "read_cr0" | "read_cr2" | "read_cr3" | "read_cr4" | "rdtsc" => (vec![], u(U64), false),
+        "read_cr0" | "read_cr2" | "read_cr3" | "read_cr4" | "rdtsc" | "read_rflags" => {
+            (vec![], u(U64), false)
+        }
         "write_cr0" | "write_cr3" | "write_cr4" => (vec![u(U64)], Type::Unit, true),
         "rdmsr" => (vec![u(U32)], u(U64), true),
         "wrmsr" => (vec![u(U32), u(U64)], Type::Unit, true),
@@ -2578,6 +2644,10 @@ fn builtin_sig(name: &str) -> Option<(Vec<Type>, Type, bool)> {
             true,
         ),
         "lgdt" | "lidt" => (vec![], Type::Unit, true),
+        "context_switch" => (vec![Type::raw(Type::U64, true), u(U64)], Type::Unit, true),
+        "set_syscall_stack" => (vec![u(U64)], Type::Unit, true),
+        "syscall" => (vec![u(U64), u(U64), u(U64), u(U64)], u(I64), false),
+        "iret_to" => (vec![u(U64), u(U64), u(U64), u(U64), u(U64)], Type::Unit, true),
         _ => return None,
     })
 }
@@ -2587,7 +2657,7 @@ pub fn is_builtin(name: &str) -> bool {
 }
 
 fn diverging_builtin(name: &str) -> bool {
-    matches!(name, "panic" | "exit" | "switch_stack")
+    matches!(name, "panic" | "exit" | "switch_stack" | "iret_to")
 }
 
 fn take(e: &mut Expr) -> Expr {

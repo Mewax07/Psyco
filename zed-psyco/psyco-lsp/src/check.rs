@@ -134,7 +134,12 @@ fn run(
     let mut stubbed = HashSet::new();
     loop {
         let mut attempt = program.clone();
-        let e = match TypeChecker::new().check_program(&mut attempt) {
+        // `include_bytes` / `include_program` resolve paths from the file names.
+        let files = paths
+            .iter()
+            .map(|p| p.as_ref().map_or_else(String::new, |p| p.to_string_lossy().into_owned()))
+            .collect();
+        let e = match TypeChecker::new().with_files(files).check_program(&mut attempt) {
             Ok(_) => {
                 for f in &attempt.functions {
                     collect_block(&f.body, &attempt, let_types);

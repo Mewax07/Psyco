@@ -1,0 +1,377 @@
+/// Wiki Doc sources:
+///   - https://wiki.osdev.org/Scheduling_Algorithms
+///   - https://wiki.osdev.org/Kernel_Multitasking
+///   - https://wiki.osdev.org/Brendan%27s_Multi-tasking_Tutorial
+///
+/// Tasks and the round-robin scheduler (normal code).
+/// Task 0 is the boot context (kmain, the shell) on the kernel stack.
+/// Task 1 is the idle task: it only runs when nobody else can.
+/// Every other task gets a 16 KiB stack in its own 64 KiB window of the
+/// stack area, with unmapped pages below it: an overflow hits a guard page
+/// (#PF) instead of silently overwriting another task.
+/// The scheduler state is only touched with interrupts off.
+
+import "context.psy"
+import "paging.psy"
+import "timer.psy"
+import "sync.psy"
+import "exceptions.psy"
+import "keyboard.psy"
+
+const max_tasks: usize = 16
+const task_stack_pages: u64 = 4
+const task_stack_size: u64 = 16384
+const task_name_max: usize = 16
+
+const stack_area_base: u64 = 0xFFFFE00000000000
+const stack_window: u64 = 0x10000
+
+const boot_task: usize = 0
+const idle_task: usize = 1
+
+const time_slice: u64 = 2
+
+enum TaskState: u8 {
+	Free,
+	Ready,
+	Running,
+	Sleeping,
+	Dead,
+}
+
+struct Task {
+	id: u64,
+	state: TaskState,
+	rsp: u64,
+	has_stack: bool,
+	entry: fn(),
+	name: [u8; 16],
+	name_len: usize,
+	wake_tick: u64,
+	run_ticks: u64,
+	switches: u64,
+	cr3: u64,
+}
+
+static mut tasks: [Task; 16]
+#[getter]
+static mut current: usize = 0
+#[getter]
+static mut sched_ready: bool = false
+#[getter]
+static mut context_switches: u64 = 0
+#[getter]
+static mut preemptions: u64 = 0
+static mut slice_left: u64 = 2
+static mut next_task_id: u64 = 0
+
+/// Copies a name into a task slot (truncated)
+fn set_name(slot: usize, name: Str) {
+    let mut n = name.len()
+    if n > task_name_max {
+        n = task_name_max
+    }
+    for i in 0..n {
+        tasks[slot].name[i] = str_byte(name, i)
+    }
+    tasks[slot].name_len = n
+}
+
+/// Fills a slot with a fresh task in `state`
+fn init_slot(slot: usize, name: Str, state: TaskState) {
+    tasks[slot].id = next_task_id
+    next_task_id += 1
+    tasks[slot].state = state
+    tasks[slot].wake_tick = 0
+    tasks[slot].run_ticks = 0
+    tasks[slot].switches = 0
+    tasks[slot].cr3 = read_cr3()
+    set_name(slot, name)
+}
+
+/// The idle task: frees dead tasks, then sleeps until the next interrupt.
+fn idle_main() {
+    loop {
+        let was_on = irq_save()
+        reap()
+        irq_restore(was_on)
+        sti()
+        hlt()
+        yield_now()
+    }
+}
+
+/// Waits for the next timer tick without holding the CPU.
+fn wait_one_tick() {
+    task_sleep(1)
+}
+
+/// Turns the boot context into task 0 and creates the idle task.
+fn sched_init() {
+    for i in 0..max_tasks {
+        tasks[i].state = TaskState::Free
+        tasks[i].has_stack = false
+    }
+    next_task_id = 0
+    init_slot(boot_task, "kernel", TaskState::Running)
+    current = boot_task
+    slice_left = time_slice
+    sched_ready = true
+    set_tick_hook(sched_tick)
+    set_key_wait_hook(wait_one_tick)
+    set_stack_guard_check(is_stack_guard)
+    if spawn("idle", idle_main) != idle_task as i64 {
+        panic("sched_init: idle task is not task 1")
+    }
+}
+
+/// Top of the stack of `slot` (its window's end).
+fn stack_top(slot: usize) -> u64 {
+    return stack_area_base + (slot as u64 + 1) * stack_window
+}
+
+/// Maps the stack pages of `slot` (false if memory is full).
+fn stack_map(slot: usize) -> bool {
+    let bottom = stack_top(slot) - task_stack_size
+    for i in 0..task_stack_pages {
+        let phys = pmm_alloc_page()
+        if phys == 0 {
+            return false
+        }
+        map_page(bottom + i * size_4k, phys, 0)
+    }
+    return true
+}
+
+/// Unmaps the stack pages of `slot` and gives them back to the PMM.
+fn stack_unmap(slot: usize) {
+    let bottom = stack_top(slot) - task_stack_size
+    for i in 0..task_stack_pages {
+        let va = bottom + i * size_4k
+        let phys = translate(va)
+        if phys != not_mapped {
+            unmap_page(va)
+            pmm_free_page(phys)
+        }
+    }
+}
+
+/// True if `addr` is in the guard area below one of the task stacks.
+fn is_stack_guard(addr: u64) -> bool {
+    if addr < stack_area_base || addr >= stack_area_base + max_tasks as u64 * stack_window {
+        return false
+    }
+    let offset = (addr - stack_area_base) % stack_window
+    return offset < stack_window - task_stack_size
+}
+
+/// Frees the stacks of dead tasks (never the current one).
+fn reap() {
+    for i in 0..max_tasks {
+        if i != current && tasks[i].state == TaskState::Dead {
+            if tasks[i].has_stack {
+                stack_unmap(i)
+                tasks[i].has_stack = false
+            }
+            tasks[i].state = TaskState::Free
+        }
+    }
+}
+
+/// First instructions of every new task.
+fn task_start() {
+    sti()
+    let entry = tasks[current].entry
+    entry()
+    task_exit()
+}
+
+/// Creates a task running `entry`; returns its slot, or -1 if full.
+fn spawn(name: Str, entry: fn()) -> i64 {
+    let was_on = irq_save()
+    reap()
+    let mut slot = max_tasks
+    for i in 0..max_tasks {
+        if tasks[i].state == TaskState::Free {
+            slot = i
+            break
+        }
+    }
+    if slot == max_tasks {
+        irq_restore(was_on)
+        return -1
+    }
+    if !stack_map(slot) {
+        stack_unmap(slot)
+        irq_restore(was_on)
+        return -1
+    }
+    tasks[slot].has_stack = true
+    tasks[slot].entry = entry
+    tasks[slot].rsp = context_new(stack_top(slot), task_start)
+    init_slot(slot, name, TaskState::Ready)
+    irq_restore(was_on)
+    return slot as i64
+}
+
+/// True if the task in `slot` can run now.
+fn runnable(slot: usize) -> bool {
+    return tasks[slot].state == TaskState::Ready || tasks[slot].state == TaskState::Running
+}
+
+/// Timer ticks the task in `slot` has run.
+fn task_run_ticks(slot: usize) -> u64 {
+    return tasks[slot].run_ticks
+}
+
+/// Next task to run after the current one (round robin, idle last).
+fn pick_next() -> usize {
+    for step in 1..max_tasks + 1 {
+        let i = (current + step) % max_tasks
+        if i != idle_task && runnable(i) {
+            return i
+        }
+    }
+    return idle_task
+}
+
+/// Switches to the next runnable task. Interrupts must be off.
+fn schedule() {
+    if !sched_ready {
+        return
+    }
+    let next = pick_next()
+    if next == current {
+        return
+    }
+    let prev = current
+    if tasks[prev].state == TaskState::Running {
+        tasks[prev].state = TaskState::Ready
+    }
+    tasks[next].state = TaskState::Running
+    tasks[next].switches += 1
+    context_switches += 1
+    current = next
+    if tasks[next].cr3 != tasks[prev].cr3 {
+        switch_address_space(tasks[next].cr3)
+    }
+    context_switch_to(&mut tasks[prev].rsp as *mut u64, tasks[next].rsp)
+}
+
+/// Timer hook (interrupts off): wakes sleepers, counts CPU time and
+/// preempts the current task at the end of its time slice.
+fn sched_tick() {
+    let now = get_ticks()
+    let mut woke = false
+    for i in 0..max_tasks {
+        if tasks[i].state == TaskState::Sleeping && now >= tasks[i].wake_tick {
+            tasks[i].state = TaskState::Ready
+            woke = true
+        }
+    }
+    tasks[current].run_ticks += 1
+    if slice_left > 0 {
+        slice_left -= 1
+    }
+    // The idle task gives way as soon as someone is ready.
+    if slice_left == 0 || (current == idle_task && woke) {
+        slice_left = time_slice
+        if pick_next() != current {
+            preemptions += 1
+        }
+        schedule()
+    }
+}
+
+/// Puts the current task to sleep for at least `ms` milliseconds.
+fn task_sleep(ms: u64) {
+    let was_on = irq_save()
+    tasks[current].wake_tick = get_ticks() + (ms * timer_hz + 999) / 1000
+    tasks[current].state = TaskState::Sleeping
+    schedule()
+    irq_restore(was_on)
+}
+
+/// Stops the task in `slot` (not the kernel or idle task). False if there
+/// is no such task. Killing yourself is task_exit().
+fn task_kill(slot: usize) -> bool {
+    if slot >= max_tasks || slot == boot_task || slot == idle_task {
+        return false
+    }
+    let was_on = irq_save()
+    let state = tasks[slot].state
+    if state == TaskState::Free || state == TaskState::Dead {
+        irq_restore(was_on)
+        return false
+    }
+    if slot == current {
+        task_exit()
+    }
+    tasks[slot].state = TaskState::Dead
+    irq_restore(was_on)
+    return true
+}
+
+/// Gives the CPU to the next task.
+fn yield_now() {
+    let was_on = irq_save()
+    schedule()
+    irq_restore(was_on)
+}
+
+/// Ends the current task; its stack is freed later by reap().
+fn task_exit() {
+    cli()
+    tasks[current].state = TaskState::Dead
+    schedule()
+    panic("task_exit: a dead task was scheduled")
+}
+
+/// Number of live tasks (neither free nor dead).
+fn task_count() -> usize {
+    let mut n: usize = 0
+    for i in 0..max_tasks {
+        if tasks[i].state != TaskState::Free && tasks[i].state != TaskState::Dead {
+            n += 1
+        }
+    }
+    return n
+}
+
+/// State of the task in `slot`.
+fn task_state(slot: usize) -> TaskState {
+    return tasks[slot].state
+}
+
+/// Id of the task in `slot`.
+fn task_id(slot: usize) -> u64 {
+    return tasks[slot].id
+}
+
+/// Name of the task in `slot`, copied into `buf`; returns its length.
+fn task_name(slot: usize, buf: &mut [u8]) -> usize {
+    let mut n = tasks[slot].name_len
+    if n > buf.len() {
+        n = buf.len()
+    }
+    for i in 0..n {
+        buf[i] = tasks[slot].name[i]
+    }
+    return n
+}
+
+/// Short text for a task state.
+fn state_name(state: TaskState) -> Str {
+    match state {
+        TaskState::Free => return "free",
+        TaskState::Ready => return "ready",
+        TaskState::Running => return "running",
+        TaskState::Sleeping => return "sleeping",
+        TaskState::Dead => return "dead",
+    }
+}
+
+/// Times the task in `slot` was switched to.
+fn task_switches(slot: usize) -> u64 {
+    return tasks[slot].switches
+}

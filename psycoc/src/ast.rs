@@ -287,6 +287,7 @@ pub enum ExprKind {
     Bool(bool),
     Str(Vec<u8>),
     CStr(Vec<u8>),
+    Bytes(Vec<u8>),
     WStr(Vec<u16>),
     Var(String),
     Path(String, String),

@@ -24,6 +24,8 @@ pub struct Runtime {
     pub msg_bounds: DataLabel,
     pub efi_image_handle: RwLabel,
     pub efi_system_table: RwLabel,
+    pub syscall_user_rsp: RwLabel,
+    pub syscall_kernel_rsp: RwLabel,
 }
 
 impl Runtime {
@@ -51,6 +53,8 @@ impl Runtime {
             msg_bounds: a.data_str(b"panic: index out of bounds\n"),
             efi_image_handle: a.bss(8, 8),
             efi_system_table: a.bss(8, 8),
+            syscall_user_rsp: a.bss(8, 8),
+            syscall_kernel_rsp: a.bss(8, 8),
         }
     }
 }

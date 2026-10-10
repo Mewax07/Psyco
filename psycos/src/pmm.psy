@@ -7,9 +7,11 @@
 /// One bit per 4 KiB page, 1 = used. Built from the UEFI memory map:
 /// only EfiConventionalMemory (type 7) is free at first, and the first
 /// MiB stays reserved (null page, legacy areas, future SMP trampoline).
-/// Allocation always returns the lowest free page.
+/// Allocation always returns the lowest free page. Every public function
+/// runs with interrupts off, so tasks and handlers can share it.
 
 import "efi.psy"
+import "sync.psy"
 
 const page_size: u64 = 4096
 const page_shift: u64 = 12
@@ -20,12 +22,10 @@ const pmm_words: usize = 65536
 const bits_per_word: u64 = 64
 const full_word: u64 = 0xFFFFFFFFFFFFFFFF
 
-// Below this address, nothing is ever handed out.
 const pmm_reserved_low: u64 = 0x100000
 
 static mut pmm_bitmap: [u64; 65536]
 
-// Lowest page index that may be free (everything below is used).
 static mut pmm_hint: u64 = 0
 
 #[getter]
@@ -105,9 +105,17 @@ fn pmm_add_region(start: u64, pages: u64) {
     }
 }
 
+/// Some as pmm_release_region_locked, with interrupts off.
+fn pmm_release_region(start: u64, pages: u64) -> u64 {
+    let was_on = irq_save()
+    let result = pmm_release_region_locked(start, pages)
+    irq_restore(was_on)
+    return result
+}
+
 /// Adds more free memory later (e.g. boot services memory once the kernel
 /// has its own page tables). Returns the number of pages added.
-fn pmm_release_region(start: u64, pages: u64) -> u64 {
+fn pmm_release_region_locked(start: u64, pages: u64) -> u64 {
     let before = pmm_free_pages
     pmm_add_region(start, pages)
     let index = start >> page_shift
@@ -120,8 +128,16 @@ fn pmm_release_region(start: u64, pages: u64) -> u64 {
     return pmm_free_pages - before
 }
 
-/// Allocates one page; returns its physical address, or 0 if memory is full.
+/// Same as pmm_alloc_page_locked, with interrupts off.
 fn pmm_alloc_page() -> u64 {
+    let was_on = irq_save()
+    let result = pmm_alloc_page_locked()
+    irq_restore(was_on)
+    return result
+}
+
+/// Allocates one page; returns its physical address, or 0 if memory is full.
+fn pmm_alloc_page_locked() -> u64 {
     let mut w = (pmm_hint / bits_per_word) as usize
     while w < pmm_words {
         let word = pmm_bitmap[w]
@@ -142,8 +158,16 @@ fn pmm_alloc_page() -> u64 {
     return 0
 }
 
-/// Allocates `count` contiguous pages; returns the first address, or 0.
+/// Same as pmm_alloc_pages_locked, with interrupts off.
 fn pmm_alloc_pages(count: u64) -> u64 {
+    let was_on = irq_save()
+    let result = pmm_alloc_pages_locked(count)
+    irq_restore(was_on)
+    return result
+}
+
+/// Allocates `count` contiguous pages; returns the first address, or 0.
+fn pmm_alloc_pages_locked(count: u64) -> u64 {
     if count == 0 {
         return 0
     }
@@ -183,8 +207,15 @@ fn pmm_alloc_pages(count: u64) -> u64 {
     return 0
 }
 
-/// Gives back one page (panics on a double free).
+/// Same as pmm_free_page_locked, with interrupts off.
 fn pmm_free_page(addr: u64) {
+    let was_on = irq_save()
+    pmm_free_page_locked(addr)
+    irq_restore(was_on)
+}
+
+/// Gives back one page (panics on a double free).
+fn pmm_free_page_locked(addr: u64) {
     let index = page_index(addr)
     if !page_used(index) {
         panic("pmm_free_page: page already free")

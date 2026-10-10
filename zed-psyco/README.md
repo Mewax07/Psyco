@@ -10,7 +10,8 @@ lexer, parser and type errors, imported files included. It also provides:
 - hover: signatures, `//` doc comments, the type of variables (`let`, `for` and parameters),
   every base for numbers and characters (`0xFFu8` -> dec, hex, bin, oct, signed, char),
   builtins, built-in methods (`len`, `as_ptr`, `add`...) and attributes
-- go to definition (including into imported files and `import "..."` paths)
+- go to definition (including into imported files, `import "..."` paths and
+  `include_program("...")` / `include_bytes("...")` files)
 - find references and document highlights
 - document outline (functions, methods, structs and fields, enums and variants, consts, statics)
 - completion: locals, items, `Enum::`/`Type::` members, fields and built-in methods after `.`,
