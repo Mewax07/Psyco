@@ -186,37 +186,45 @@ def add_dir(fs, path, cluster, parent):
     else:
         entries.append(entry(b".          ", 0x10, cluster, 0))
         entries.append(entry(b"..         ", 0x10, parent, 0))
-        taken = set()
-        for name in sorted(os.listdir(path)):
-            full = os.path.join(path, name)
-            short, ntres, long = short_name(name, taken)
-            taken.add(short)
-            if long:
-                entries.extend(lfn_entries(name, short))
-            if os.path.isdir(full):
-                sub = fs.alloc(1)
-                entries.append(entry(short, 0x10, sub, 0, ntres))
-                add_dir(fs, full, sub, cluster if parent is not None else 0)
-            else:
-                data = open(full, "rb").read()
-                first = (
-                    fs.alloc((len(data) + fs.cluster_bytes - 1) // fs.cluster_bytes)
-                    if data
-                    else 0
-                )
-                if data:
-                    fs.write_chain(first, data)
-                entries.append(entry(short, 0x20, first, len(data), ntres))
-        payload = b"".join(entries)
-        need = max(1, (len(payload) + 32 + fs.cluster_bytes - 1) // fs.cluster_bytes)
-        chain = [cluster]
-        if need > 1:
-            extra = fs.alloc(need - 1)
-            fs.fat[cluster] = extra
-            chain += list(range(extra, extra + need - 1))
-        for i, c in enumerate(chain):
-            chunk = payload[i * fs.cluster_bytes : (i + 1) * fs.cluster_bytes]
-            fs.data[c] = chunk.ljust(fs.cluster_bytes, b"\0")
+    taken = set()
+    for name in sorted(os.listdir(path)):
+        full = os.path.join(path, name)
+        short, ntres, long = short_name(name, taken)
+        taken.add(short)
+        if long:
+            entries.extend(lfn_entries(name, short))
+
+        if os.path.isdir(full):
+            sub = fs.alloc(1)
+            entries.append(entry(short, 0x10, sub, 0, ntres))
+            add_dir(fs, full, sub, cluster if parent is not None else 0)
+        else:
+            with open(full, "rb") as f:
+                data = f.read()
+
+            first = (
+                fs.alloc((len(data) + fs.cluster_bytes - 1) // fs.cluster_bytes)
+                if data
+                else 0
+            )
+
+            if data:
+                fs.write_chain(first, data)
+
+            entries.append(entry(short, 0x20, first, len(data), ntres))
+
+    payload = b"".join(entries)
+    need = max(1, (len(payload) + 32 + fs.cluster_bytes - 1) // fs.cluster_bytes)
+
+    chain = [cluster]
+    if need > 1:
+        extra = fs.alloc(need - 1)
+        fs.fat[cluster] = extra
+        chain += list(range(extra, extra + need - 1))
+
+    for i, c in enumerate(chain):
+        chunk = payload[i * fs.cluster_bytes : (i + 1) * fs.cluster_bytes]
+        fs.data[c] = chunk.ljust(fs.cluster_bytes, b"\0")
 
 
 def main():

@@ -10,16 +10,18 @@
 import "sched.psy"
 import "usermode.psy"
 import "console.psy"
+import "fat32.psy"
+import "heap.psy"
 
 const sys_write: u64 = 1
 const sys_nanosleep: u64 = 35
 const sys_sched_yield: u64 = 24
 const sys_getpid: u64 = 39
 const sys_exit: u64 = 60
-const sys_exit_group = 231
+const sys_exit_group: u64 = 231
 
 const fd_stdout: u64 = 1
-const fd_stderr: u64 = 1
+const fd_stderr: u64 = 2
 
 // Linux error numbers (returned negated).
 const ebadf: i64 = 9
@@ -28,8 +30,12 @@ const einval: i64 = 22
 const enosys: i64 = 38
 
 const write_chunk: usize = 128
+const max_program_size: u64 = 0x400000
+const read_chunk: u64 = 32768
 const nanos_per_ms: u64 = 1000000
 const max_sleep_ms: u64 = 3600000
+
+static mut chunk: [u8; 32768]
 
 #[getter]
 static mut syscall_count: u64 = 0
@@ -124,6 +130,11 @@ fn process_init() {
 fn process_spawn(name: Str, elf: Str) -> i64 {
     let root = as_create()
     let program = load_program(root, elf)
+    return process_start(name, root, program)
+}
+
+/// Starts a loaded program (frees the address space if it cannot).
+fn process_start(name: Str, root: u64, program: LoadedProgram) -> i64 {
     if !program.ok {
         as_destroy(root)
         return -1
@@ -131,6 +142,53 @@ fn process_spawn(name: Str, elf: Str) -> i64 {
     let slot = spawn_user(name, root, program.entry, program.stack_top)
     if slot < 0 {
         as_destroy(root)
+    }
+    return slot
+}
+
+/// Reads a whole file into a heap buffer of its size; returns the bytes read.
+fn fat_read_buf(e: &DirEntry, buf: &mut ByteBuf) -> u64 {
+    let mut done: u64 = 0
+    while done < e.size {
+        let mut n = e.size - done
+        if n > read_chunk {
+            n = read_chunk
+        }
+        let got = fat_read(e, done, &mut chunk[..n as usize])
+        if got == 0 {
+            return done
+        }
+        buf.copy_from(done as usize, &chunk[..got as usize])
+        done += got
+    }
+    return done
+}
+
+/// Loads the executable at `path` on the disk and starts it in ring 3.
+/// The task is named after the file. Returns the slot, or -1 (no such
+/// file, too big, not an executable, no memory).
+fn process_spawn_file(path: &[u8]) -> i64 {
+    let e = fat_lookup(path)
+    if !e.found || is_dir(&e) || e.size == 0 || e.size > max_program_size {
+        return -1
+    }
+    let mut file = byte_buf(e.size as usize)
+    let got = fat_read_buf(&e, &mut file)
+    if got != e.size {
+        file.free()
+        return -1
+    }
+    let image = ElfImage {
+        data: file.ptr,
+        size: e.size,
+    }
+    let root = as_create()
+    let program = load_image(root, &image)
+    file.free()
+    let slot = process_start("", root, program)
+    if slot >= 0 {
+        let start = last_slash(path) + 1
+        task_set_name_bytes(slot as usize, &path[start..])
     }
     return slot
 }

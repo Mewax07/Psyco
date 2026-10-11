@@ -63,6 +63,11 @@ struct SyscallRegs {
     user_rsp: u64,
 }
 
+struct ElfImage {
+    data: *const u8,
+    size: u64,
+}
+
 struct LoadedProgram {
     entry: u64,
     stack_top: u64,
@@ -122,12 +127,12 @@ fn copy_from_user(buf: &mut [u8], src: u64) -> bool {
     return true
 }
 
-/// Little-endian value of `size` bytes at `offset` in `data` (bounds checked).
-fn read_le(data: Str, offset: u64, size: u64) -> u64 {
-    if offset + size > data.len() as u64 {
+/// Little-endian value of `size` bytes at `offset` of the image (bounds checked).
+fn read_le(elf: &ElfImage, offset: u64, size: u64) -> u64 {
+    if offset > elf.size || size > elf.size - offset {
         panic("read_le: out of bounds")
     }
-    let p = data.as_ptr()
+    let p = elf.data
     let mut v: u64 = 0
     for i in 0..size {
         v |= (p.add((offset + i) as usize).read() as u64) << (8 * i)
@@ -157,7 +162,7 @@ fn user_page(root: u64, va: u64, writable: bool) -> u64 {
 }
 
 /// Copies one PT_LOAD segment into `root` (page by page, zero-filled).
-fn load_segment(root: u64, elf: Str, offset: u64, vaddr: u64, filesz: u64, memsz: u64, writable: bool) -> bool {
+fn load_segment(root: u64, elf: &ElfImage, offset: u64, vaddr: u64, filesz: u64, memsz: u64, writable: bool) -> bool {
     let mut va = vaddr & ~(size_4k - 1)
     while va < vaddr + memsz {
         let phys = user_page(root, va, writable)
@@ -175,7 +180,7 @@ fn load_segment(root: u64, elf: Str, offset: u64, vaddr: u64, filesz: u64, memsz
             end = vaddr + filesz
         }
         if end > start {
-            let src = elf.as_ptr().add((offset + start - vaddr) as usize)
+            let src = elf.data.add((offset + start - vaddr) as usize)
             memcpy(dst.add((start - va) as usize), src, (end - start) as usize)
         }
         va += size_4k
@@ -183,14 +188,23 @@ fn load_segment(root: u64, elf: Str, offset: u64, vaddr: u64, filesz: u64, memsz
     return true
 }
 
-/// Loads an ELF64 x86-64 executable and a user stack into `root`.
+/// Loads an executable embedded as a Str (see load_image).
 fn load_program(root: u64, elf: Str) -> LoadedProgram {
+    let image = ElfImage {
+        data: elf.as_ptr(),
+        size: elf.len() as u64
+    }
+    return load_image(root, &image)
+}
+
+/// Loads an ELF64 x86-64 executable and a user stack into `root`.
+fn load_image(root: u64, elf: &ElfImage) -> LoadedProgram {
     let failed = LoadedProgram {
         entry: 0,
         stack_top: 0,
         ok: false,
     }
-    let size = elf.len() as u64
+    let size = elf.size
     if size < elf_header_size || read_le(elf, 0, 4) as u32 != elf_magic {
         return failed
     }

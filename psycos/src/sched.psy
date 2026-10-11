@@ -76,7 +76,19 @@ static mut next_task_id: u64 = 0
 static mut last_exit: [i64; 16]
 static mut last_exit_id: [u64; 16]
 
-/// Copies a name into a task slot (truncated)
+/// Renames a task from raw bytes (truncated).
+fn task_set_name_bytes(slot: usize, name: &[u8]) {
+    let mut n = name.len()
+    if n > task_name_max {
+        n = task_name_max
+    }
+    for i in 0..n {
+        tasks[slot].name[i] = name[i]
+    }
+    tasks[slot].name_len = n
+}
+
+/// Copies a name into a task slot (truncated).
 fn set_name(slot: usize, name: Str) {
     let mut n = name.len()
     if n > task_name_max {

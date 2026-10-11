@@ -9,7 +9,7 @@
 /// enter_higher_half(kmain).
 /// kmain (our tables, higher half, kernel stack): cpu_init again ->
 /// reclaim boot services memory -> heap_init -> irq_init -> sched_init ->
-/// process_init -> blk_init -> kbd_init -> sti -> shell.
+/// process_init -> blk_init -> fat_mount -> kbd_init -> sti -> shell.
 
 import "efi.psy"
 import "fb.psy"
@@ -25,7 +25,8 @@ import "paging.psy"
 import "heap.psy"
 import "sched.psy"
 import "programs.psy"
-import "virtio_bk.psy"
+import "virtio_blk.psy"
+import "fat32.psy"
 
 const line_max: usize = 76
 const bytes_per_kib: u64 = 1024
@@ -40,6 +41,10 @@ const crash_unmapped: u64 = 0xFFFFC00000000000
 const crash_non_canonical: u64 = 0x8000000000000000
 const page_fault_vector: usize = 14
 
+const path_max: usize = 64
+const cat_chunk: usize = 512
+
+static mut cat_buf: [u8; 512]
 static mut line: [u8; 76]
 static mut line_len: usize = 0
 static mut has_fb: bool = false
@@ -115,8 +120,14 @@ fn cmd_help() {
     puts("  kill N     stop the task in slot N\n")
     puts("  progs      list the user programs\n")
     puts("  lspci      list PCI devices\n")
-    puts("  run NAME   run a user program (ring 3) and wait for it\n")
-    puts("  start NAME run a user program in the background\n")
+    puts("  ls [DIR]   list a directory of the disk (default /)\n")
+    puts("  cat FILE   print a file\n")
+    puts("  write F T  write the text T into file F (created or replaced)\n")
+    puts("  mkdir DIR  create a directory\n")
+    puts("  rm PATH    delete a file or an empty directory\n")
+    puts("  df         disk usage\n")
+    puts("  run P      run a user program (ring 3): /path, /bin/P or built-in\n")
+    puts("  start P    same, in the background\n")
     puts("  fb         framebuffer info and test pattern\n")
     puts("  echo TXT   print TXT\n")
     puts("  int3       trigger a breakpoint (execution resumes)\n")
@@ -196,6 +207,23 @@ fn cmd_ver() {
         puts(" MiB\n")
     } else {
         puts("none (QEMU: -drive file=disk.img,if=virtio,format=raw)\n")
+    }
+    puts("File system: ")
+    if get_fat_mounted() {
+        puts("FAT32 '")
+        let label = get_fat_label()
+        for i in 0..11usize {
+            putc(label[i])
+        }
+        puts("', ")
+        put_u64(get_fat_free_clusters() * get_fat_cluster_bytes() / bytes_per_mib)
+        puts(" MiB free")
+        if get_fat_partition_start() != 0 {
+            puts(" (MBR partition)")
+        }
+        putc('\n')
+    } else {
+        puts("none\n")
     }
     puts("Keyboard: ")
     if get_kbd_ps2() {
@@ -491,19 +519,44 @@ fn find_program(name: &[u8], len: usize) -> i64 {
     return -1
 }
 
-/// `run NAME` / `start NAME`: starts a user program, waits if `wait`.
-fn cmd_run(start: usize, wait: bool) {
-    let mut name = [0u8; 16]
-    let len = line_word(start, &mut name)
-    let index = find_program(&name, len)
+/// Starts a program "/path" on the disk, else /bin/NAME on the disk,
+/// else the embedded program NAME. Returns the task slot or -1.
+fn start_program(name: &[u8], len: usize) -> i64 {
+    if len == 0 {
+        return -1
+    }
+    if name[0] == '/' {
+        return process_spawn_file(&name[..len])
+    }
+    if get_fat_mounted() && len + 5 <= 64 {
+        let mut path = [0u8; 64]
+        let prefix = "/bin/"
+        for i in 0..5usize {
+            path[i] = str_byte(prefix, i)
+        }
+        for i in 0..len {
+            path[5 + i] = name[i]
+        }
+        let slot = process_spawn_file(&path[..len + 5])
+        if slot >= 0 {
+            return slot
+        }
+    }
+    let index = find_program(name, len)
     if index < 0 {
-        puts("unknown program (see progs)\n")
-        return
+        return -1
     }
     let i = index as usize
-    let slot = process_spawn(program_name(i), program_elf(i))
+    return process_spawn(program_name(i), program_elf(i))
+}
+
+/// `run NAME` / `start NAME`: starts a user program, waits if `wait`.
+fn cmd_run(start: usize, wait: bool) {
+    let mut name = [0u8; 64]
+    let len = line_word(start, &mut name)
+    let slot = start_program(&name, len)
     if slot < 0 {
-        puts("cannot start the program\n")
+        puts("no such program (see progs and ls /bin)\n")
         return
     }
     let s = slot as usize
@@ -519,6 +572,196 @@ fn cmd_run(start: usize, wait: bool) {
     put_i64(code)
     putc('\n')
     set_color(white)
+}
+
+/// Index of the first non-space character at or after `start`.
+fn skip_spaces(start: usize) -> usize {
+    let mut i = start
+    while i < line_len && line[i] == ' ' {
+        i += 1
+    }
+    return i
+}
+
+/// True if the disk is mounted; otherwise says so.
+fn need_disk() -> bool {
+    if get_fat_mounted() {
+        return true
+    }
+    puts("no FAT32 disk (QEMU: -drive file=disk.img,if=virtio,format=raw)\n")
+    return false
+}
+
+/// Print `n` right-aligned on `width` columns.
+fn put_u64_right(n: u64, width: usize) {
+    let mut digits: usize = 1
+    let mut v = n
+    while v >= 10 {
+        v /= 10
+        digits += 1
+    }
+    for i in digits..width {
+        putc(' ')
+    }
+    put_u64(n)
+}
+
+/// `ls [DIR]`: entries of a directory.
+fn cmd_ls(start: usize) {
+    if !need_disk() {
+        return
+    }
+    let mut path = [0u8; 64]
+    let mut len = line_word(skip_spaces(start), &mut path)
+    if len == 0 {
+        path[0] = '/'
+        len = 1
+    }
+    let d = fat_lookup(&path[..len])
+    if !d.found {
+        puts("not found\n")
+        return
+    }
+    if !is_dir(&d) {
+        put_u64_right(d.size, 10)
+        puts("  ")
+        for i in 0..d.name_len {
+            putc(d.name[i])
+        }
+        putc('\n')
+        return
+    }
+    let mut it = dir_open(d.cluster)
+    let mut e = no_entry()
+    let mut files: u64 = 0
+    let mut bytes: u64 = 0
+    while dir_next(&mut it, &mut e) {
+        if e.name[0] == '.' && (e.name_len == 1 || (e.name_len == 2 && e.name[1] == '.')) {
+            continue
+        }
+        if is_dir(&e) {
+            puts("     <DIR>  ")
+            set_color(blue)
+        } else {
+            put_u64_right(e.size, 10)
+            puts("  ")
+            files += 1
+            bytes += e.size
+        }
+        for i in 0..e.name_len {
+            putc(e.name[i])
+        }
+        set_color(white)
+        putc('\n')
+    }
+    set_color(dark_gray)
+    put_u64(files)
+    puts(" files, ")
+    put_u64(bytes)
+    puts(" bytes\n")
+    set_color(white)
+}
+
+/// `cat FILE`: prints a file (control characters shown as '.').
+fn cmd_cat(start: usize) {
+    if !need_disk() {
+        return
+    }
+    let mut path = [0u8; 64]
+    let len = line_word(skip_spaces(start), &mut path)
+    let e = fat_lookup(&path[..len])
+    if !e.found || is_dir(&e) {
+        puts("no such file\n")
+        return
+    }
+    let mut offset: u64 = 0
+    let mut last: u8 = '\n'
+    while offset < e.size {
+        let got = fat_read(&e, offset, &mut cat_buf)
+        if got == 0 {
+            puts("\nread error\n")
+            return
+        }
+        for i in 0..got as usize {
+            let c = cat_buf[i]
+            if c == '\n' || c == '\t' || (c >= 32 && c < 127) {
+                putc(c)
+            } else if c != '\r' {
+                putc('.')
+            }
+            last = c
+        }
+        offset += got
+    }
+    if last != '\n' {
+        putc('\n')
+    }
+}
+
+/// `write FILE TEXT`: creates or replaces a file with one line of text.
+fn cmd_write(start: usize) {
+    if !need_disk() {
+        return
+    }
+    let mut path = [0u8; 64]
+    let first = skip_spaces(start)
+    let len = line_word(first, &mut path)
+    let text_start = skip_spaces(first + len)
+    if len == 0 || text_start >= line_len {
+        puts("usage: write /FILE text\n")
+        return
+    }
+    let mut data = [0u8; 77]
+    let mut n: usize = 0
+    for i in text_start..line_len {
+        data[n] = line[i]
+        n += 1
+    }
+    data[n] = '\n'
+    if fat_write_file(&path[..len], &data[..n + 1]) {
+        puts("written\n")
+    } else {
+        puts("cannot write (8.3 names only, parent directory must exist)\n")
+    }
+}
+
+/// `mkdir DIR` / `rm PATH`: changes the directory tree.
+fn cmd_tree(start: usize, make: bool) {
+    if !need_disk() {
+        return
+    }
+    let mut path = [0u8; 64]
+    let len = line_word(skip_spaces(start), &mut path)
+    let mut ok = false
+    if make {
+        ok = fat_mkdir(&path[..len])
+    } else {
+        ok = fat_delete(&path[..len])
+    }
+    if ok {
+        puts("done\n")
+    } else if make {
+        puts("cannot create it (8.3 name, parent must exist, not already there)\n")
+    } else {
+        puts("cannot delete it (missing, or a directory that is not empty)\n")
+    }
+}
+
+/// `df`: space on the disk.
+fn cmd_df() {
+    if !need_disk() {
+        return
+    }
+    let cluster = get_fat_cluster_bytes()
+    let total = get_fat_total_clusters() * cluster
+    let free = get_fat_free_clusters() * cluster
+    puts("FAT32: ")
+    put_u64((total - free) / bytes_per_kib)
+    puts(" KiB used, ")
+    put_u64(free / bytes_per_kib)
+    puts(" KiB free, ")
+    put_u64(cluster)
+    puts("-byte clusters\n")
 }
 
 /// `kill N`: stops a task.
@@ -598,6 +841,18 @@ fn run_command() {
         cmd_progs()
     } else if line_is("lspci") {
         cmd_lspci()
+    } else if line_is("ls") || line_starts_with("ls ") {
+            cmd_ls(2)
+    } else if line_starts_with("cat ") {
+        cmd_cat(4)
+    } else if line_starts_with("write ") {
+        cmd_write(6)
+    } else if line_starts_with("mkdir ") {
+        cmd_tree(6, true)
+    } else if line_starts_with("rm ") {
+        cmd_tree(3, false)
+    } else if line_is("df") {
+        cmd_df()
     } else if line_starts_with("run ") {
         cmd_run(4, true)
     } else if line_starts_with("start ") {
@@ -684,7 +939,9 @@ fn kmain() {
     irq_init()
     sched_init()
     process_init()
-    blk_init()
+    if blk_init() {
+        fat_mount()
+    }
     kbd_init()
     sti()
     print("PsycOS: boot ok")

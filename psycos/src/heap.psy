@@ -346,6 +346,24 @@ impl ByteBuf {
         self.ptr.add(i).write(v)
     }
 
+    /// Copies `src` into the buffer at index `at` (checked).
+    fn copy_from(&mut self, at: usize, src: &[u8]) {
+        check_access(self.ptr, self.generation, 0, 1)
+        if at > self.count || src.len() > self.count - at {
+            panic("buffer: copy out of bounds")
+        }
+        memcpy(self.ptr.add(at), src.as_ptr(), src.len())
+    }
+
+    /// Copies bytes from index `at` of the buffer into `dst` (checked).
+    fn copy_to(&self, at: usize, dst: &mut [u8]) {
+        check_access(self.ptr, self.generation, 0, 1)
+        if at > self.count || dst.len() > self.count - at {
+            panic("buffer: copy out of bounds")
+        }
+        memcpy(dst.as_mut_ptr(), self.ptr.add(at), dst.len())
+    }
+
     /// Sets every element to `v`.
     fn fill(&mut self, v: u8) {
         check_access(self.ptr, self.generation, 0, self.count + 1)
