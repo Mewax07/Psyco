@@ -6,4 +6,5 @@
 *.ld
 *.out
 *.o
+*.img
 esp
