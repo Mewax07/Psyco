@@ -1,0 +1,16 @@
+/// Wiki Doc sources:
+///   - https://wiki.osdev.org/Paging#Page_Faults
+///
+/// User program: tries to read kernel memory. The kernel pages are not
+/// marked "user", so the CPU raises #PF and the kernel kills the process.
+
+#![trusted]
+
+const kernel_image: u64 = 0xFFFFFFFF80000000
+
+/// Reads one word of the kernel image (never prints the value).
+fn main() {
+    print("reading kernel memory...")
+    let v = (kernel_image as *const u64).read()
+    print("read", v)
+}

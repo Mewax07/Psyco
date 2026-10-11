@@ -1,0 +1,12 @@
+/// Wiki Doc sources:
+///   - https://wiki.osdev.org/Security#Rings
+///
+/// User program: runs `cli`, a privileged instruction. In ring 3 the CPU
+/// raises #GP and the kernel kills the process.
+
+/// Tries to disable interrupts.
+fn main() {
+    print("trying cli in ring 3...")
+    cli()
+    print("interrupts are off?!")
+}

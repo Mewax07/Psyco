@@ -1,0 +1,14 @@
+/// Wiki Doc sources:
+///   - https://wiki.osdev.org/Scheduling_Algorithms
+///
+/// User program: loops forever without any system call. Only the timer can
+/// take the CPU back; `kill` stops it.
+
+/// Burns CPU time.
+fn main() {
+    print("spinning in ring 3 (use ps and kill)")
+    let mut n: u64 = 0
+    loop {
+        n = n +% 1
+    }
+}

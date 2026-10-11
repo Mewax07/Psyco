@@ -16,7 +16,7 @@ use lsp_types::*;
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
 
-use analysis::{Analysis, Def, DefKind, Target, Unit, World};
+use analysis::{Analysis, Def, DefKind, PathUse, Target, Unit, World};
 use check::{check, Loader};
 
 fn main() -> Result<(), Box<dyn Error + Sync + Send>> {
@@ -141,6 +141,12 @@ fn normalize(path: &Path) -> PathBuf {
         }
     }
     out
+}
+
+/// File named by `include_bytes` / `include_program` in the file `from`.
+fn resolve_include(from: Option<&Path>, include: &str) -> PathBuf {
+    let dir = from.and_then(Path::parent).unwrap_or(Path::new(""));
+    normalize(&dir.join(include))
 }
 
 fn path_key(path: &Path) -> String {
@@ -313,6 +319,102 @@ impl Server {
         normalize(&base.unwrap_or_default().join(import))
     }
 
+    /// File named by the path literal `path` of the file `from`.
+    fn literal_path(&self, from: Option<&Path>, kind: PathUse, path: &str) -> PathBuf {
+        match kind {
+            PathUse::Import => self.resolve_import(from, path),
+            PathUse::IncludeBytes | PathUse::IncludeProgram => resolve_include(from, path),
+        }
+    }
+
+    /// Hover text for the file behind an import or include path.
+    fn describe_path(&self, kind: PathUse, path: &Path) -> String {
+        let shown = self
+            .root
+            .as_deref()
+            .and_then(|root| path.strip_prefix(root).ok())
+            .unwrap_or(path);
+        let what = match kind {
+            PathUse::Import => "imported file",
+            PathUse::IncludeBytes => "file embedded as bytes at compile time",
+            PathUse::IncludeProgram => {
+                "Psyco program, compiled for Linux x86-64 and embedded as an ELF executable"
+            }
+        };
+        let mut text = format!("`{}`\n\n*{what}*", shown.to_string_lossy().replace('\\', "/"));
+        if kind == PathUse::IncludeBytes {
+            match fs::metadata(path) {
+                Ok(m) if m.is_file() => text.push_str(&format!("\n\n{} bytes", m.len())),
+                _ => text.push_str("\n\nFile not found."),
+            }
+        } else {
+            match self.read(path) {
+                Some(src) => {
+                    if let Some(doc) = analysis::header_comment(&src) {
+                        text.push_str(&format!("\n\n{doc}"));
+                    }
+                }
+                None => text.push_str("\n\nFile not found."),
+            }
+        }
+        text
+    }
+
+    /// Files and folders for the path being typed in `import "..."`,
+    /// `include_bytes("...")` or `include_program("...")`. `typed` is the
+    /// line up to the cursor; `None` outside of such a string.
+    fn path_completion(
+        &self,
+        typed: &str,
+        from: Option<&Path>,
+        cursor: Position,
+    ) -> Option<Vec<CompletionItem>> {
+        let quote = typed.rfind('"')?;
+        let (head, partial) = (typed[..quote].trim_end(), &typed[quote + 1..]);
+        // An odd number of quotes before it: that quote closes a string.
+        if head.matches('"').count() % 2 != 0 {
+            return None;
+        }
+        let kind = PathUse::before_quote(head)?;
+        let prefix = partial.rsplit('/').next().unwrap_or(partial);
+        let dir = self.literal_path(from, kind, &partial[..partial.len() - prefix.len()]);
+        let own = from.map(path_key);
+        let start = Position::new(
+            cursor.line,
+            cursor.character.saturating_sub(prefix.encode_utf16().count() as u32),
+        );
+
+        let mut items = Vec::new();
+        for entry in fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let path = entry.path();
+            let is_dir = path.is_dir();
+            // Only sources can be imported or compiled; never the file itself.
+            let usable = is_dir
+                || kind == PathUse::IncludeBytes
+                || path.extension().is_some_and(|e| e == "psy");
+            if name.starts_with('.') || !usable || own == Some(path_key(&path)) {
+                continue;
+            }
+            let text = if is_dir { format!("{name}/") } else { name };
+            items.push(CompletionItem {
+                label: text.clone(),
+                kind: Some(if is_dir {
+                    CompletionItemKind::FOLDER
+                } else {
+                    CompletionItemKind::FILE
+                }),
+                sort_text: Some(format!("{}{text}", if is_dir { 0 } else { 1 })),
+                text_edit: Some(CompletionTextEdit::Edit(TextEdit::new(
+                    Range::new(start, cursor),
+                    text,
+                ))),
+                ..Default::default()
+            });
+        }
+        Some(items)
+    }
+
     fn world(&self, uri: &Uri) -> Result<World, String> {
         let uri = uri.as_str();
         let doc = self
@@ -373,10 +475,29 @@ impl Server {
             };
             let s = an.tokens[i].span;
             let is_char = an.line(s.line).chars().nth(s.col - 1) == Some('\'');
+            let mut value = literal::describe(value, suffix, is_char);
+            if let Some(note) = syscall_note(&world, i) {
+                value.push_str(&format!("\n\n{note}"));
+            }
             return Ok(Some(Hover {
                 contents: HoverContents::Markup(MarkupContent {
                     kind: MarkupKind::Markdown,
-                    value: literal::describe(value, suffix, is_char),
+                    value,
+                }),
+                range: Some(an.tok_range(i)),
+            }));
+        }
+
+        // The file behind `import "..."`, `include_bytes("...")` or `include_program("...")`.
+        let literal = an
+            .string_at(pos.position)
+            .and_then(|i| Some((i, an.path_literal(i)?)));
+        if let Some((i, (kind, path))) = literal {
+            let path = self.literal_path(world.units[0].path.as_deref(), kind, &path);
+            return Ok(Some(Hover {
+                contents: HoverContents::Markup(MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value: self.describe_path(kind, &path),
                 }),
                 range: Some(an.tok_range(i)),
             }));
@@ -416,7 +537,11 @@ impl Server {
             }));
         }
         if let Some(target) = world.resolve(0, tok).first() {
-            return Ok(markdown(describe(&world, *target)));
+            let mut text = describe(&world, *target);
+            if let Some(note) = syscall_note(&world, tok) {
+                text.push_str(&format!("\n\n{note}"));
+            }
+            return Ok(markdown(text));
         }
         let word = an.ident(tok).map(str::to_string).unwrap_or_else(|| {
             let s = an.tokens[tok].span;
@@ -446,47 +571,29 @@ impl Server {
         let world = self.world(&pos.text_document.uri)?;
         let an = &world.units[0].an;
 
+        // `import "f.psy"`, `include_bytes("f")` and `include_program("f.psy")`
+        // open the file: from the path under the cursor, or from anywhere on
+        // the line (the first path there).
         let line = pos.position.line as usize + 1;
-        if let Some((import, _)) = an
-            .imports
-            .iter()
-            .find(|(_, tok)| an.tokens[*tok].span.line == line)
-        {
-            let path = self.resolve_import(world.units[0].path.as_deref(), import);
-            if let Some(uri) = self.open_doc_for(&path).map(|(u, _)| u.clone()).or_else(|| {
-                path.exists().then(|| path_to_uri(&path))
-            }) {
-                if let Some(uri) = parse_uri(&uri) {
-                    return Ok(Some(GotoDefinitionResponse::Scalar(Location {
-                        uri,
-                        range: Range::default(),
-                    })));
-                }
-            }
-        }
-
-        // `include_bytes("f")` / `include_program("f.psy")` open the file.
-        let include = (0..an.tokens.len()).find_map(|i| {
-            let named = matches!(an.ident(i), Some("include_bytes" | "include_program"));
-            match (named, an.kind(i + 1), an.kind(i + 2)) {
-                (true, psycoc::TokenKind::LParen, psycoc::TokenKind::Str(path))
-                    if an.tokens[i].span.line == line =>
-                {
-                    Some(String::from_utf8_lossy(path).into_owned())
-                }
-                _ => None,
-            }
-        });
-        if let Some(include) = include {
-            let dir = world.units[0].path.as_deref().and_then(Path::parent);
-            let path = normalize(&dir.unwrap_or(Path::new("")).join(include));
-            if path.exists() {
-                if let Some(uri) = parse_uri(&path_to_uri(&path)) {
-                    return Ok(Some(GotoDefinitionResponse::Scalar(Location {
-                        uri,
-                        range: Range::default(),
-                    })));
-                }
+        let literal = an
+            .string_at(pos.position)
+            .and_then(|i| an.path_literal(i))
+            .or_else(|| {
+                (0..an.tokens.len())
+                    .filter(|&i| an.tokens[i].span.line == line)
+                    .find_map(|i| an.path_literal(i))
+            });
+        if let Some((kind, path)) = literal {
+            let path = self.literal_path(world.units[0].path.as_deref(), kind, &path);
+            let uri = self
+                .open_doc_for(&path)
+                .map(|(u, _)| u.clone())
+                .or_else(|| path.exists().then(|| path_to_uri(&path)));
+            if let Some(uri) = uri.as_deref().and_then(parse_uri) {
+                return Ok(Some(GotoDefinitionResponse::Scalar(Location {
+                    uri,
+                    range: Range::default(),
+                })));
             }
         }
 
@@ -602,6 +709,12 @@ impl Server {
         }
         let before: String = chars[..start].iter().collect();
         let before = before.trim_end();
+
+        let typed: String = chars[..cursor].iter().collect();
+        let from = world.units[0].path.as_deref();
+        if let Some(items) = self.path_completion(&typed, from, pos.position) {
+            return Ok(Some(CompletionResponse::Array(items)));
+        }
 
         let mut items = Vec::new();
         let mut seen = HashSet::new();
@@ -776,11 +889,16 @@ impl Server {
             } else {
                 builtins::builtin(an.ident(callee).unwrap_or_default())
             } {
-                Some(b) => (
-                    b.signature(),
-                    b.params.iter().map(|s| s.to_string()).collect(),
-                    Some(b.doc.to_string()),
-                ),
+                Some(b) => {
+                    // `syscall(60, ...)`: which call it is, to know its arguments.
+                    let note = syscall_note(&world, open + 1).filter(|_| b.name == "syscall");
+                    let doc = note.map_or_else(|| b.doc.to_string(), |n| format!("{}\n\n{n}", b.doc));
+                    (
+                        b.signature(),
+                        b.params.iter().map(|s| s.to_string()).collect(),
+                        Some(doc),
+                    )
+                }
                 None => return Ok(None),
             },
         };
@@ -890,6 +1008,24 @@ fn location(world: &World, unit: usize, tok: usize) -> Option<Location> {
     })
 }
 
+/// Names the Linux system call when token `tok` of the main unit is the
+/// number given to `syscall(...)`: a literal, or a constant with a literal value.
+fn syscall_note(world: &World, tok: usize) -> Option<String> {
+    let an = &world.units[0].an;
+    if !an.is_syscall_number(tok) {
+        return None;
+    }
+    let number = match an.kind(tok) {
+        psycoc::TokenKind::Int(v) | psycoc::TokenKind::IntSuffix(v, _) => *v,
+        _ => {
+            let target = *world.resolve(0, tok).first()?;
+            world.units[target.unit].an.const_int(world.def(target))?
+        }
+    };
+    let call = builtins::linux_syscall(number)?;
+    Some(format!("Linux x86-64 system call {number}: `{call}`"))
+}
+
 fn describe(world: &World, target: Target) -> String {
     let unit = &world.units[target.unit];
     let d = world.def(target);
@@ -911,6 +1047,17 @@ fn describe(world: &World, target: Target) -> String {
         DefKind::Function if d.container.is_some() => {
             let attr = if d.name.starts_with("set_") { "setter" } else { "getter" };
             format!("generated by `#[{attr}]` on `static {owner}`")
+        }
+        DefKind::Function => {
+            let attrs = unit.an.attributes_before(d.start_tok);
+            let entry = |attr: &str| attrs.iter().any(|a| a == attr);
+            if entry("syscall") {
+                "system call entry point (`#[syscall]`), cannot be called directly".into()
+            } else if entry("interrupt") {
+                "interrupt handler (`#[interrupt]`), cannot be called directly".into()
+            } else {
+                String::new()
+            }
         }
         DefKind::Local if loop_var => format!("loop variable of `{} {{ }}`", d.detail),
         _ => String::new(),

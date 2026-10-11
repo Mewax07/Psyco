@@ -74,6 +74,52 @@ pub fn is_word(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
+/// What the path in a string literal names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PathUse {
+    Import,
+    IncludeBytes,
+    IncludeProgram,
+}
+
+impl PathUse {
+    fn of_call(name: &str) -> Option<Self> {
+        match name {
+            "include_bytes" => Some(PathUse::IncludeBytes),
+            "include_program" => Some(PathUse::IncludeProgram),
+            _ => None,
+        }
+    }
+
+    /// Use of a string whose opening quote comes right after `head`.
+    pub fn before_quote(head: &str) -> Option<Self> {
+        let ends_with_word =
+            |s: &str, word: &str| s.strip_suffix(word).is_some_and(|rest| !rest.ends_with(is_word));
+        if ends_with_word(head, "import") {
+            return Some(PathUse::Import);
+        }
+        let call = head.strip_suffix('(')?.trim_end();
+        ["include_bytes", "include_program"]
+            .into_iter()
+            .find(|name| ends_with_word(call, name))
+            .and_then(PathUse::of_call)
+    }
+}
+
+/// Comment block at the very top of a file, without the `//` markers.
+pub fn header_comment(text: &str) -> Option<String> {
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .take_while(|l| l.starts_with("//"))
+        .map(|l| {
+            let l = l.trim_start_matches('/');
+            l.strip_prefix(' ').unwrap_or(l)
+        })
+        .collect();
+    (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
 fn squash(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -175,7 +221,30 @@ impl Analysis {
         start + within
     }
 
+    /// Column after the closing quote of the string literal that starts at
+    /// `col` (`"..."`, `c"..."` or `u"..."`).
+    fn string_end(&self, line: usize, col: usize) -> Option<usize> {
+        let chars: Vec<char> = self.line(line).chars().collect();
+        let mut k = col.checked_sub(1)?;
+        if matches!(chars.get(k), Some('c' | 'u')) {
+            k += 1;
+        }
+        if chars.get(k) != Some(&'"') {
+            return None;
+        }
+        k += 1;
+        while k < chars.len() && chars[k] != '"' {
+            k += if chars[k] == '\\' { 2 } else { 1 };
+        }
+        Some((k + 1).min(chars.len()) + 1)
+    }
+
+    /// Range of the word at `line:col`, or of the whole string literal that
+    /// starts there.
     pub fn word_range(&self, line: usize, col: usize) -> Range {
+        if let Some(end) = self.string_end(line, col) {
+            return Range::new(self.position(line, col), self.position(line, end));
+        }
         let chars: Vec<char> = self.line(line).chars().collect();
         let start = col.saturating_sub(1);
         let mut end = start;
@@ -192,6 +261,11 @@ impl Analysis {
         let t = &self.tokens[i];
         if let TokenKind::Ident(name) = &t.kind {
             return name.chars().count();
+        }
+        if matches!(t.kind, TokenKind::Str(_) | TokenKind::CStr(_) | TokenKind::WStr(_)) {
+            if let Some(end) = self.string_end(t.span.line, t.span.col) {
+                return end - t.span.col;
+            }
         }
         let rest: Vec<char> = self
             .line(t.span.line)
@@ -276,6 +350,54 @@ impl Analysis {
                 && t.span.col <= col
                 && col <= t.span.col + self.tok_len(i)
         })
+    }
+
+    /// String literal under the cursor.
+    pub fn string_at(&self, p: Position) -> Option<usize> {
+        let (line, col) = self.line_col(p);
+        let i = self.cursor_index(line, col + 1).checked_sub(1)?;
+        let t = &self.tokens[i];
+        (matches!(t.kind, TokenKind::Str(_))
+            && t.span.line == line
+            && col <= t.span.col + self.tok_len(i))
+        .then_some(i)
+    }
+
+    /// The path in `import "path"`, `include_bytes("path")` or
+    /// `include_program("path")`, when token `i` is that string.
+    pub fn path_literal(&self, i: usize) -> Option<(PathUse, String)> {
+        let TokenKind::Str(bytes) = self.kind(i) else {
+            return None;
+        };
+        let kind = match self.kind_before(i, 1) {
+            TokenKind::Import => PathUse::Import,
+            TokenKind::LParen if i >= 2 && !self.is_member(i - 2) => {
+                PathUse::of_call(self.ident(i - 2)?)?
+            }
+            _ => return None,
+        };
+        Some((kind, String::from_utf8_lossy(bytes).into_owned()))
+    }
+
+    /// Whether token `i` is the whole first argument of a `syscall(...)` call.
+    pub fn is_syscall_number(&self, i: usize) -> bool {
+        i >= 2
+            && *self.kind(i - 1) == TokenKind::LParen
+            && self.ident(i - 2) == Some("syscall")
+            && !self.is_member(i - 2)
+            && *self.kind_before(i, 3) != TokenKind::Fn
+            && matches!(self.kind(i + 1), TokenKind::Comma | TokenKind::RParen)
+    }
+
+    /// Value of a `const` whose initializer is a single integer literal.
+    pub fn const_int(&self, def: &Def) -> Option<u64> {
+        if def.kind != DefKind::Const {
+            return None;
+        }
+        match (self.kind_before(def.end_tok, 1), self.kind(def.end_tok)) {
+            (TokenKind::Eq, TokenKind::Int(v) | TokenKind::IntSuffix(v, _)) => Some(*v),
+            _ => None,
+        }
     }
 
     pub fn cursor_index(&self, line: usize, col: usize) -> usize {
@@ -640,10 +762,13 @@ impl Analysis {
                     || matches!(self.tokens[k].kind, TokenKind::Eq | TokenKind::Eof)
             })
             .unwrap_or(self.tokens.len());
-        let ty = if *self.kind(j + 1) == TokenKind::Colon {
+        let ty = if *self.kind(j + 1) != TokenKind::Colon {
+            "?".into()
+        } else if ty_end < self.tokens.len() && self.tokens[ty_end].span.line == line {
             self.text(ty_start, ty_end)
         } else {
-            "?".into()
+            // No initializer: the type runs to the end of the line.
+            self.rest_of_line(ty_start)
         };
         let accessor = |name: String, detail: String, params: Vec<String>| Def {
             name,
@@ -676,7 +801,7 @@ impl Analysis {
     }
 
     /// Names in the `#[...]` attributes right before token `i`.
-    fn attributes_before(&self, i: usize) -> Vec<String> {
+    pub fn attributes_before(&self, i: usize) -> Vec<String> {
         let mut names = Vec::new();
         let mut end = i;
         while end >= 1 && *self.kind(end - 1) == TokenKind::RBracket {

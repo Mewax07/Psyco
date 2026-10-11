@@ -9,9 +9,9 @@
 ///   0x08  kernel code, 64 bits (DPL 0)
 ///   0x10  kernel data (DPL 0)
 ///   0x18  TSS (16-byte descriptor: also uses entry 0x20)
-///   0x28  reserved: 32-bit user code, expected by sysret (phase 4)
-///   0x30  reserved: user data (phase 4)
-///   0x38  reserved: 64-bit user code (phase 4)
+///   0x28  null: 32-bit user code slot expected by sysret (unused)
+///   0x30  user data (DPL 3)
+///   0x38  user code, 64 bits (DPL 3)
 ///
 /// With STAR[63:48] = 0x28, sysret will load SS = 0x30 and CS = 0x38.
 /// In 64-bit mode the TSS only gives the stacks used on interrupts:
@@ -22,10 +22,17 @@
 const kernel_cs: u16 = 0x08
 const kernel_ds: u16 = 0x10
 const tss_selector: u16 = 0x18
+const user_base_selector: u64 = 0x28
+
+// Ring 3 selectors (RPL 3).
+const user_ds: u64 = 0x33
+const user_cs: u64 = 0x3B
 
 // Present, DPL 0, base 0, limit 4 GiB.
 const gdt_kernel_code: u64 = 0x00AF9A000000FFFF
 const gdt_kernel_data: u64 = 0x00CF92000000FFFF
+const gdt_user_data: u64 = 0x00CFF2000000FFFF
+const gdt_user_code: u64 = 0x00AFFA000000FFFF
 const gdt_tss_available: u64 = 0x89
 
 const ist_double_fault: u8 = 1
@@ -71,6 +78,9 @@ fn gdt_init() {
     gdt[0] = 0
     gdt[1] = gdt_kernel_code
     gdt[2] = gdt_kernel_data
+    gdt[5] = 0
+    gdt[6] = gdt_user_data
+    gdt[7] = gdt_user_code
 
     tss.ist1 = df_stack_top()
     tss.iomap_base = sizeof(Tss) as u16
@@ -103,6 +113,11 @@ fn df_stack_bottom() -> u64 {
 /// Top of the double fault stack (IST1).
 fn df_stack_top() -> u64 {
     return df_stack.as_ptr() as u64 + df_stack_size as u64
+}
+
+/// Address of the GDT as loaded in the CPU.
+fn gdt_address() -> u64 {
+    return gdtr.base
 }
 
 /// Raw GDT entry, for tests and diagnostics.

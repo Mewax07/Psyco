@@ -83,6 +83,11 @@ fn idt_gate_address(vector: usize) -> u64 {
     return (lo & 0xFFFF) | (((lo >> 48) & 0xFFFF) << 16) | (idt[vector * 2 + 1] << 32)
 }
 
+/// Address of the IDT as loaded in the CPU.
+fn idt_address() -> u64 {
+    return idtr.base
+}
+
 /// Loads the IDT into the CPU.
 fn idt_load() {
     idtr.limit = (idt.len() * 8 - 1) as u16

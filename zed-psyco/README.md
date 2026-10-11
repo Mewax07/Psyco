@@ -10,12 +10,20 @@ lexer, parser and type errors, imported files included. It also provides:
 - hover: signatures, `//` doc comments, the type of variables (`let`, `for` and parameters),
   every base for numbers and characters (`0xFFu8` -> dec, hex, bin, oct, signed, char),
   builtins, built-in methods (`len`, `as_ptr`, `add`...) and attributes
+- system calls: the number given to `syscall(...)` (a literal or a constant) is named on hover
+  and in signature help (`syscall(1, ...)` -> `write(fd, buf, count)`, Linux x86-64 numbers),
+  `#[syscall]` documents the register layout its handler receives, and `#[syscall]` /
+  `#[interrupt]` functions are marked as such on hover
+- `include_program("...")` / `include_bytes("...")`: every included program is type checked
+  (from the editor when it is open, saved or not) and its errors are reported on its path;
+  hovering a path, or the one of an `import`, shows the file and its header comment
 - go to definition (including into imported files, `import "..."` paths and
   `include_program("...")` / `include_bytes("...")` files)
 - find references and document highlights
 - document outline (functions, methods, structs and fields, enums and variants, consts, statics)
 - completion: locals, items, `Enum::`/`Type::` members, fields and built-in methods after `.`,
-  builtins, keywords, attributes after `#[` / `#![` (also inside lists like `#[getter, setter]`)
+  builtins, keywords, attributes after `#[` / `#![` (also inside lists like `#[getter, setter]`),
+  files and folders inside `import "..."`, `include_program("...")` and `include_bytes("...")`
 - `#[getter]` / `#[setter]` statics: the generated `get_NAME()` / `set_NAME(value)` have hover,
   completion, signature help and go to definition (to the static)
 - snippets: `if`, `if else`, `else if`, `while`, `for`, `loop`, `match`, `let`, `let mut`

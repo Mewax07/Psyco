@@ -1,0 +1,146 @@
+/// Wiki Doc sources:
+///   - https://wiki.osdev.org/System_Calls
+///   - https://wiki.osdev.org/Getting_to_Ring_3
+///
+/// Processes: a program in its own address space, running in ring 3, and
+/// the system calls it can make (normal code).
+/// Numbers and conventions are Linux x86-64, so programs compiled by
+/// psycoc for Linux run unchanged: print -> write(1, ...), exit -> exit.
+
+import "sched.psy"
+import "usermode.psy"
+import "console.psy"
+
+const sys_write: u64 = 1
+const sys_nanosleep: u64 = 35
+const sys_sched_yield: u64 = 24
+const sys_getpid: u64 = 39
+const sys_exit: u64 = 60
+const sys_exit_group = 231
+
+const fd_stdout: u64 = 1
+const fd_stderr: u64 = 1
+
+// Linux error numbers (returned negated).
+const ebadf: i64 = 9
+const efault: i64 = 14
+const einval: i64 = 22
+const enosys: i64 = 38
+
+const write_chunk: usize = 128
+const nanos_per_ms: u64 = 1000000
+const max_sleep_ms: u64 = 3600000
+
+#[getter]
+static mut syscall_count: u64 = 0
+
+/// Entry point of every `syscall` instruction (interrupts are off).
+#[syscall]
+fn syscall_entry(regs: &mut SyscallRegs) {
+    syscall_count += 1
+    let result = dispatch(regs.rax, regs.rdi, regs.rsi, regs.rdx)
+    regs.rax = result as u64
+}
+
+
+/// Runs system call `n`; returns the result (negative errno on error).
+fn dispatch(n: u64, a1: u64, a2: u64, a3: u64) -> i64 {
+    if n == sys_write {
+        return sys_write_impl(a1, a2, a3)
+    }
+    if n == sys_getpid {
+        return current_task_id() as i64
+    }
+    if n == sys_sched_yield {
+        yield_now()
+        return 0
+    }
+    if n == sys_nanosleep {
+        return sys_nanosleep_impl(a1)
+    }
+    if n == sys_exit || n == sys_exit_group {
+        task_exit_code(a1 as i64)
+    }
+    return -enosys
+}
+
+/// write(fd, buf, len): stdout and stderr go to the console.
+fn sys_write_impl(fd: u64, buf: u64, len: u64) -> i64 {
+    if fd != fd_stdout && fd != fd_stderr {
+        return -ebadf
+    }
+    if !user_range_ok(read_cr3(), buf, len, false) {
+        return -efault
+    }
+    let mut chunk = [0u8; 128]
+    let mut done: u64 = 0
+    while done < len {
+        let mut n = len - done
+        if n > write_chunk as u64 {
+            n = write_chunk as u64
+        }
+        if !copy_from_user(&mut chunk[..n as usize], buf + done) {
+            return -efault
+        }
+        for i in 0..n as usize {
+            putc(chunk[i])
+        }
+        done += n
+    }
+    return len as i64
+}
+
+/// nanosleep(req, rem): sleeps for req->tv_sec seconds + req->tv_nsec ns.
+fn sys_nanosleep_impl(req: u64) -> i64 {
+    let mut raw = [0u8; 16]
+    if !copy_from_user(&mut raw, req) {
+        return -efault
+    }
+    let mut sec: u64 = 0
+    let mut nsec: u64 = 0
+    for i in 0..8usize {
+        sec |= (raw[i] as u64) << (8 * i as u64)
+        nsec |= (raw[8 + i] as u64) << (8 * i as u64)
+    }
+    if nsec >= 1000000000 || sec > max_sleep_ms / 1000 {
+        return -einval
+    }
+    task_sleep(sec * 1000 + nsec / nanos_per_ms)
+    return 0
+}
+
+/// Points the syscall instruction at syscall_entry. Must run in the higher
+/// half, after gdt_init and exceptions_init ran there too: process address
+/// spaces have no identity map, so the CPU tables need high addresses.
+fn process_init() {
+    if gdt_address() < kernel_virt_base || idt_address() < kernel_virt_base {
+        panic("process_init: GDT/IDT must be reloaded in the higher half first")
+    }
+    syscall_init(syscall_entry as u64)
+}
+
+/// Loads an executable in a new address space and starts it in ring 3.
+/// Returns the task slot, or -1 (bad file or no memory / slot).
+fn process_spawn(name: Str, elf: Str) -> i64 {
+    let root = as_create()
+    let program = load_program(root, elf)
+    if !program.ok {
+        as_destroy(root)
+        return -1
+    }
+    let slot = spawn_user(name, root, program.entry, program.stack_top)
+    if slot < 0 {
+        as_destroy(root)
+    }
+    return slot
+}
+
+/// Starts a program and waits for it; returns its exit code (-1 if it
+/// could not start).
+fn process_run(name: Str, elf: Str) -> i64 {
+    let slot = process_spawn(name, elf)
+    if slot < 0 {
+        return -1
+    }
+    return task_wait(slot as usize, task_id(slot as usize))
+}

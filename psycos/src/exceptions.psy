@@ -35,6 +35,9 @@ static mut panic_exit: bool = false
 #[setter]
 static mut stack_guard_check: fn(u64) -> bool
 
+#[setter]
+static mut user_fault_hook: fn(u64, u64, u64)
+
 /// Short name of an exception vector.
 fn exception_name(v: u64) -> Str {
     match v {
@@ -280,8 +283,13 @@ fn put_error_code(vector: u64, code: u64) {
 }
 
 /// Panic screen: exception, error code, registers, then halt.
+/// A fault in user mode only kills the process.
 fn fatal(vector: u64, frame: &Frame, code: u64, has_code: bool) {
     cli()
+    if frame.cs & 3 == 3 && user_fault_hook as u64 != 0 {
+        let kill = user_fault_hook
+        kill(vector, frame.rip, read_cr2())
+    }
     let regs = saved_regs(frame, has_code)
     let sp = stack_pointer()
 

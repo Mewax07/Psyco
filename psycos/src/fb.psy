@@ -86,6 +86,11 @@ fn fb_init() -> bool {
     return !fb_base.is_null() && fb_width > 0 && fb_height > 0
 }
 
+/// Uses another virtual address for the same framebuffer.
+fn fb_move(new_base: u64) {
+    fb_base = new_base as *mut u32
+}
+
 /// Converts 0x00RRGGBB to the framebuffer byte order (its own inverse).
 fn to_native(color: u32) -> u32 {
     if fb_rgb {
@@ -133,6 +138,8 @@ fn fill_rect(x: usize, y: usize, w: usize, h: usize, color: u32) {
     }
 }
 
+/// Moves the whole screen up by `dy` pixel rows and clears the bottom.
+/// The copy goes to lower addresses, so a forward copy is safe.
 fn fb_scroll_up(dy: usize, color: u32) {
     if dy >= fb_height {
         fill_rect(0, 0, fb_width, fb_height, color)

@@ -10,6 +10,7 @@
 /// kmain (our tables, higher half, kernel stack): cpu_init again ->
 /// reclaim boot services memory -> heap_init -> irq_init -> sched_init ->
 /// kbd_init -> sti -> shell.
+/// process_init -> kbd_init -> sti -> shell.
 
 import "efi.psy"
 import "fb.psy"
@@ -24,6 +25,7 @@ import "pmm.psy"
 import "paging.psy"
 import "heap.psy"
 import "sched.psy"
+import "programs.psy"
 
 const line_max: usize = 76
 const bytes_per_kib: u64 = 1024
@@ -111,6 +113,9 @@ fn cmd_help() {
     puts("  ps         list tasks\n")
     puts("  spin       start a demo task (animated square, top right)\n")
     puts("  kill N     stop the task in slot N\n")
+    puts("  progs      list the user programs\n")
+    puts("  run NAME   run a user program (ring 3) and wait for it\n")
+    puts("  start NAME run a user program in the background\n")
     puts("  fb         framebuffer info and test pattern\n")
     puts("  echo TXT   print TXT\n")
     puts("  int3       trigger a breakpoint (execution resumes)\n")
@@ -304,7 +309,7 @@ fn put_u64_padded(n: u64, width: usize) {
 /// `ps`: list of tasks.
 fn cmd_ps() {
     set_color(yellow)
-    puts("SLOT  ID    STATE     SWITCHES  TICKS       NAME\n")
+    puts("SLOT  ID    RING  STATE     SWITCHES  TICKS     NAME\n")
     set_color(gray)
     let mut name = [0u8; 16]
     for slot in 0..max_tasks {
@@ -314,6 +319,11 @@ fn cmd_ps() {
         }
         put_u64_padded(slot as u64, 6)
         put_u64_padded(task_id(slot), 6)
+        if task_is_user(slot) {
+            put_padded("3", 6)
+        } else {
+            put_padded("0", 6)
+        }
         put_padded(state_name(state), 10)
         put_u64_padded(task_switches(slot), 10)
         put_u64_padded(task_run_ticks(slot), 10)
@@ -344,7 +354,7 @@ fn spinner_main() {
     }
 }
 
-/// `spin`: starts one more spinner task
+/// `spin`: starts one more spinner task.
 fn cmd_spin() {
     if !has_fb {
         puts("no framebuffer\n")
@@ -353,6 +363,7 @@ fn cmd_spin() {
     let slot = spawn("spinner", spinner_main)
     if slot < 0 {
         puts("no free task slot\n")
+        return
     }
     puts("spinner started in slot ")
     put_u64(slot as u64)
@@ -368,7 +379,7 @@ fn line_number(start: usize) -> i64 {
         if c < '0' || c > '9' {
             return -1
         }
-        n = n *10 + (c - '0') as i64
+        n = n * 10 + (c - '0') as i64
         digits += 1
     }
     if digits == 0 {
@@ -377,11 +388,85 @@ fn line_number(start: usize) -> i64 {
     return n
 }
 
+/// `progs`: the embedded user programs.
+fn cmd_progs() {
+    set_color(yellow)
+    puts("User programs (ring 3, psycoc Linux executables):\n")
+    set_color(gray)
+    for i in 0..program_count {
+        puts("  ")
+        put_padded(program_name(i), 12)
+        put_u64(program_elf(i).len() as u64)
+        puts(" bytes\n")
+    }
+}
+
+/// Copies the word typed after `start` into `buf`; returns its length.
+fn line_word(start: usize, buf: &mut [u8]) -> usize {
+    let mut n: usize = 0
+    let mut i = start
+    while i < line_len && line[i] != ' ' && n < buf.len() {
+        buf[n] = line[i]
+        n += 1
+        i += 1
+    }
+    return n
+}
+
+/// Index of the program whose name is in `name[..len]`, or -1.
+fn find_program(name: &[u8], len: usize) -> i64 {
+    for i in 0..program_count {
+        let candidate = program_name(i)
+        if candidate.len() == len {
+            let mut same = true
+            for j in 0..len {
+                if str_byte(candidate, j) != name[j] {
+                    same = false
+                }
+            }
+            if same {
+                return i as i64
+            }
+        }
+    }
+    return -1
+}
+
+/// `run NAME` / `start NAME`: starts a user program, waits if `wait`.
+fn cmd_run(start: usize, wait: bool) {
+    let mut name = [0u8; 16]
+    let len = line_word(start, &mut name)
+    let index = find_program(&name, len)
+    if index < 0 {
+        puts("unknown program (see progs)\n")
+        return
+    }
+    let i = index as usize
+    let slot = process_spawn(program_name(i), program_elf(i))
+    if slot < 0 {
+        puts("cannot start the program\n")
+        return
+    }
+    let s = slot as usize
+    if !wait {
+        puts("started in slot ")
+        put_u64(s as u64)
+        putc('\n')
+        return
+    }
+    let code = task_wait(s, task_id(s))
+    set_color(dark_gray)
+    puts("exit code ")
+    put_i64(code)
+    putc('\n')
+    set_color(white)
+}
+
 /// `kill N`: stops a task.
 fn cmd_kill() {
     let n = line_number(5)
     if n < 0 || n >= max_tasks as i64 {
-        puts("usage: kill N (see ps)")
+        puts("usage: kill N (see ps)\n")
         return
     }
     let slot = n as usize
@@ -450,6 +535,12 @@ fn run_command() {
         cmd_spin()
     } else if line_starts_with("kill ") {
         cmd_kill()
+    } else if line_is("progs") {
+           cmd_progs()
+    } else if line_starts_with("run ") {
+        cmd_run(4, true)
+    } else if line_starts_with("start ") {
+        cmd_run(6, false)
     } else if line_is("int3") {
         int3()
         puts("resumed after int3 (")
@@ -531,6 +622,7 @@ fn kmain() {
     heap_init()
     irq_init()
     sched_init()
+    process_init()
     kbd_init()
     sti()
     print("PsycOS: boot ok")

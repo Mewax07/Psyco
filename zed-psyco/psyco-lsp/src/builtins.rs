@@ -66,15 +66,76 @@ pub const BUILTINS: &[Builtin] = &[
     builtin!("lgdt"("descriptor: &T"), "", true, "Loads the global descriptor table register."),
     builtin!("lidt"("descriptor: &T"), "", true, "Loads the interrupt descriptor table register."),
     builtin!("set_syscall_stack"("stack: u64"), "", true, "Sets the kernel stack that `#[syscall]` handlers switch to on entry."),
-    builtin!("syscall"("number: u64", "a1: u64", "a2: u64", "a3: u64"), "i64", false, "Makes a system call: `number` in rax, the arguments in rdi, rsi and rdx. Returns rax."),
+    builtin!("syscall"("number: u64", "a1: u64", "a2: u64", "a3: u64"), "i64", false, "Makes a system call with the `syscall` instruction (Linux x86-64 convention): `number` in rax, the arguments in rdi, rsi and rdx. Returns rax, a negative error number on failure."),
     builtin!("iret_to"("rip: u64", "cs: u64", "rflags: u64", "rsp: u64", "ss: u64"), "", true, "Pushes an interrupt frame and runs `iretq` (e.g. to enter user mode). Never returns."),
     builtin!("include_bytes"("path: Str"), "Str", false, "Embeds the bytes of a file, read at compile time. `path` is a string literal relative to the source file."),
-    builtin!("include_program"("path: Str"), "Str", false, "Compiles another Psyco program and embeds the resulting executable. `path` is a string literal relative to the source file."),
+    builtin!("include_program"("path: Str"), "Str", false, "Compiles another Psyco program for Linux x86-64 and embeds the resulting ELF executable. `path` is a string literal relative to the source file; the program needs its own `main`."),
     builtin!("context_switch"("save: *mut u64", "next_rsp: u64"), "", true, "Saves the callee-saved registers and the resume address on the current stack, stores its `rsp` in `*save`, then switches to the stack `next_rsp` and resumes the context saved there."),
 ];
 
 pub fn builtin(name: &str) -> Option<&'static Builtin> {
     BUILTINS.iter().find(|b| b.name == name)
+}
+
+/// Common Linux x86-64 system calls, for the number given to `syscall`.
+/// The builtin passes the first three arguments.
+pub const LINUX_SYSCALLS: &[(u64, &str)] = &[
+    (0, "read(fd, buf, count)"),
+    (1, "write(fd, buf, count)"),
+    (2, "open(path, flags, mode)"),
+    (3, "close(fd)"),
+    (4, "stat(path, statbuf)"),
+    (5, "fstat(fd, statbuf)"),
+    (8, "lseek(fd, offset, whence)"),
+    (9, "mmap(addr, len, prot, flags, fd, offset)"),
+    (10, "mprotect(addr, len, prot)"),
+    (11, "munmap(addr, len)"),
+    (12, "brk(addr)"),
+    (13, "rt_sigaction(sig, act, oldact, sigsetsize)"),
+    (14, "rt_sigprocmask(how, set, oldset, sigsetsize)"),
+    (16, "ioctl(fd, request, arg)"),
+    (20, "writev(fd, iov, iovcnt)"),
+    (22, "pipe(fds)"),
+    (24, "sched_yield()"),
+    (32, "dup(fd)"),
+    (33, "dup2(oldfd, newfd)"),
+    (34, "pause()"),
+    (35, "nanosleep(req, rem)"),
+    (39, "getpid()"),
+    (57, "fork()"),
+    (59, "execve(path, argv, envp)"),
+    (60, "exit(code)"),
+    (61, "wait4(pid, status, options, rusage)"),
+    (62, "kill(pid, sig)"),
+    (63, "uname(buf)"),
+    (72, "fcntl(fd, cmd, arg)"),
+    (79, "getcwd(buf, size)"),
+    (80, "chdir(path)"),
+    (82, "rename(oldpath, newpath)"),
+    (83, "mkdir(path, mode)"),
+    (84, "rmdir(path)"),
+    (87, "unlink(path)"),
+    (96, "gettimeofday(tv, tz)"),
+    (102, "getuid()"),
+    (104, "getgid()"),
+    (110, "getppid()"),
+    (158, "arch_prctl(code, addr)"),
+    (186, "gettid()"),
+    (201, "time(tloc)"),
+    (202, "futex(uaddr, op, val, timeout, uaddr2, val3)"),
+    (217, "getdents64(fd, dirp, count)"),
+    (228, "clock_gettime(clockid, tp)"),
+    (230, "clock_nanosleep(clockid, flags, req, rem)"),
+    (231, "exit_group(code)"),
+    (257, "openat(dirfd, path, flags, mode)"),
+    (318, "getrandom(buf, len, flags)"),
+];
+
+pub fn linux_syscall(number: u64) -> Option<&'static str> {
+    LINUX_SYSCALLS
+        .iter()
+        .find(|(n, _)| *n == number)
+        .map(|(_, call)| *call)
 }
 
 /// Methods the compiler provides on arrays, slices, strings and raw pointers.
@@ -165,7 +226,7 @@ pub const ATTRIBUTES: &[Attribute] = &[
         name: "syscall",
         target: "fn",
         snippet: "syscall",
-        doc: "System call entry point (`syscall` instruction): takes `(regs: &mut Regs)` with the saved user registers, returns nothing. The stub switches to the stack given to `set_syscall_stack` and ends with `sysretq`. Cannot be combined with `#[interrupt]` or called directly.",
+        doc: "System call entry point (`syscall` instruction): takes `(regs: &mut Regs)` with the saved user registers, returns nothing. The stub switches to the stack given to `set_syscall_stack` and ends with `sysretq`. Cannot be combined with `#[interrupt]` or called directly.\n\n`Regs` is a struct of 16 `u64`, in this order: `r15, r14, r13, r12, rbp, rbx, r9, r8, r10, rdx, rsi, rdi, rax, r11, rcx`, then the user `rsp`. `rax` is the call number and receives the result, `rcx` is the user `rip` and `r11` the user `rflags`.",
     },
     Attribute {
         name: "packed",

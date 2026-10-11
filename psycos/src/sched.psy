@@ -17,6 +17,7 @@ import "timer.psy"
 import "sync.psy"
 import "exceptions.psy"
 import "keyboard.psy"
+import "usermode.psy"
 
 const max_tasks: usize = 16
 const task_stack_pages: u64 = 4
@@ -28,6 +29,9 @@ const stack_window: u64 = 0x10000
 
 const boot_task: usize = 0
 const idle_task: usize = 1
+
+const exit_fault_base: i64 = 128
+const exit_killed: i64 = 137
 
 const time_slice: u64 = 2
 
@@ -51,6 +55,10 @@ struct Task {
 	run_ticks: u64,
 	switches: u64,
 	cr3: u64,
+	is_user: bool,
+	user_entry: u64,
+	user_stack: u64,
+	exit_code: i64,
 }
 
 static mut tasks: [Task; 16]
@@ -65,6 +73,9 @@ static mut preemptions: u64 = 0
 static mut slice_left: u64 = 2
 static mut next_task_id: u64 = 0
 
+static mut last_exit: [i64; 16]
+static mut last_exit_id: [u64; 16]
+
 /// Copies a name into a task slot (truncated)
 fn set_name(slot: usize, name: Str) {
     let mut n = name.len()
@@ -77,7 +88,7 @@ fn set_name(slot: usize, name: Str) {
     tasks[slot].name_len = n
 }
 
-/// Fills a slot with a fresh task in `state`
+/// Fills a slot with a fresh task in `state`.
 fn init_slot(slot: usize, name: Str, state: TaskState) {
     tasks[slot].id = next_task_id
     next_task_id += 1
@@ -85,7 +96,9 @@ fn init_slot(slot: usize, name: Str, state: TaskState) {
     tasks[slot].wake_tick = 0
     tasks[slot].run_ticks = 0
     tasks[slot].switches = 0
-    tasks[slot].cr3 = read_cr3()
+    tasks[slot].cr3 = kernel_root()
+    tasks[slot].is_user = false
+    tasks[slot].exit_code = 0
     set_name(slot, name)
 }
 
@@ -118,6 +131,7 @@ fn sched_init() {
     slice_left = time_slice
     sched_ready = true
     set_tick_hook(sched_tick)
+    set_user_fault_hook(user_fault)
     set_key_wait_hook(wait_one_tick)
     set_stack_guard_check(is_stack_guard)
     if spawn("idle", idle_main) != idle_task as i64 {
@@ -169,6 +183,10 @@ fn is_stack_guard(addr: u64) -> bool {
 fn reap() {
     for i in 0..max_tasks {
         if i != current && tasks[i].state == TaskState::Dead {
+            if tasks[i].is_user {
+                as_destroy(tasks[i].cr3)
+                tasks[i].is_user = false
+            }
             if tasks[i].has_stack {
                 stack_unmap(i)
                 tasks[i].has_stack = false
@@ -184,6 +202,27 @@ fn task_start() {
     let entry = tasks[current].entry
     entry()
     task_exit()
+}
+
+/// First instructions of a user task: straight to ring 3.
+fn user_task_start() {
+    enter_user(tasks[current].user_entry, tasks[current].user_stack)
+}
+
+/// Creates a ring 3 task in address space `root`, starting at `entry` with
+/// the user stack at `stack`. Returns its slot, or -1.
+fn spawn_user(name: Str, root: u64, entry: u64, stack: u64) -> i64 {
+    let was_on = irq_save()
+    let slot = spawn(name, user_task_start)
+    if slot >= 0 {
+        let s = slot as usize
+        tasks[s].cr3 = root
+        tasks[s].is_user = true
+        tasks[s].user_entry = entry
+        tasks[s].user_stack = stack
+    }
+    irq_restore(was_on)
+    return slot
 }
 
 /// Creates a task running `entry`; returns its slot, or -1 if full.
@@ -250,8 +289,12 @@ fn schedule() {
     }
     tasks[next].state = TaskState::Running
     tasks[next].switches += 1
+    slice_left = time_slice
     context_switches += 1
     current = next
+    if tasks[next].has_stack {
+        set_kernel_entry_stack(stack_top(next))
+    }
     if tasks[next].cr3 != tasks[prev].cr3 {
         switch_address_space(tasks[next].cr3)
     }
@@ -304,9 +347,12 @@ fn task_kill(slot: usize) -> bool {
         irq_restore(was_on)
         return false
     }
+    tasks[slot].exit_code = exit_killed
     if slot == current {
         task_exit()
     }
+    last_exit[slot] = exit_killed
+    last_exit_id[slot] = tasks[slot].id
     tasks[slot].state = TaskState::Dead
     irq_restore(was_on)
     return true
@@ -319,9 +365,54 @@ fn yield_now() {
     irq_restore(was_on)
 }
 
+/// Ends the current task with an exit code.
+fn task_exit_code(code: i64) {
+    cli()
+    tasks[current].exit_code = code
+    task_exit()
+}
+
+/// Ring 3 fault (from the exception handlers): kills the process.
+fn user_fault(vector: u64, rip: u64, addr: u64) {
+    puts("[")
+    put_u64(tasks[current].id)
+    puts("] killed: ")
+    puts(exception_name(vector))
+    puts(" at rip 0x")
+    put_hex(rip)
+    if vector == vector_page_fault {
+        puts(", address 0x")
+        put_hex(addr)
+    }
+    putc('\n')
+    task_exit_code(exit_fault_base + vector as i64)
+}
+
+/// Waits until the task `id` in `slot` ends; returns its exit code.
+fn task_wait(slot: usize, id: u64) -> i64 {
+    loop {
+        let was_on = irq_save()
+        let alive = tasks[slot].id == id && tasks[slot].state != TaskState::Free && tasks[slot].state != TaskState::Dead
+        irq_restore(was_on)
+        if !alive {
+            break
+        }
+        task_sleep(10)
+    }
+    if tasks[slot].id == id && tasks[slot].state == TaskState::Dead {
+        return tasks[slot].exit_code
+    }
+    if last_exit_id[slot] == id {
+        return last_exit[slot]
+    }
+    return -1
+}
+
 /// Ends the current task; its stack is freed later by reap().
 fn task_exit() {
     cli()
+    last_exit[current] = tasks[current].exit_code
+    last_exit_id[current] = tasks[current].id
     tasks[current].state = TaskState::Dead
     schedule()
     panic("task_exit: a dead task was scheduled")
@@ -369,6 +460,16 @@ fn state_name(state: TaskState) -> Str {
         TaskState::Sleeping => return "sleeping",
         TaskState::Dead => return "dead",
     }
+}
+
+/// Id of the current task.
+fn current_task_id() -> u64 {
+    return tasks[current].id
+}
+
+/// True if the task in `slot` runs in ring 3.
+fn task_is_user(slot: usize) -> bool {
+    return tasks[slot].is_user
 }
 
 /// Times the task in `slot` was switched to.

@@ -1,0 +1,55 @@
+/// Wiki Doc sources:
+///   - https://wiki.osdev.org/ELF
+///
+/// User programs embedded in the kernel. include_program compiles each one
+/// (psycoc, Linux target) while the kernel is compiled, and stores the
+/// executable in the kernel image.
+
+import "process.psy"
+
+const program_count: usize = 6
+
+/// Name of program `i`
+fn program_name(i: usize) -> Str {
+    match i {
+        0 => return "hello",
+        1 => return "counter",
+        2 => return "badmem",
+        3 => return "privileged",
+        4 => return "badptr",
+        5 => return "spin",
+        _ => return "",
+    }
+}
+
+/// Executable of program `i`.
+fn program_elf(i: usize) -> Str {
+    match i {
+        0 => return include_program("../user/hello.psy"),
+        1 => return include_program("../user/counter.psy"),
+        2 => return include_program("../user/badmem.psy"),
+        3 => return include_program("../user/privileged.psy"),
+        4 => return include_program("../user/badptr.psy"),
+        5 => return include_program("../user/spin.psy"),
+        _ => return "",
+    }
+}
+
+/// Index of the program called `name`, or -1.
+fn program_find(name: Str) -> i64 {
+    for i in 0..program_count {
+        let candidate = program_name(i)
+        if candidate.len() == name.len() {
+            let mut same = true
+            for j in 0..name.len() {
+                if str_byte(candidate, j) != str_byte(name, j) {
+                    same = false
+                }
+            }
+            if same {
+                return i as i64
+            }
+        }
+    }
+    return -1
+}

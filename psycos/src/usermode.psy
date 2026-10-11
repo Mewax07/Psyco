@@ -1,0 +1,244 @@
+/// Wiki Doc sources:
+///   - https://wiki.osdev.org/Getting_to_Ring_3
+///   - https://wiki.osdev.org/SYSENTER#AMD:_SYSCALL/SYSRET
+///   - https://wiki.osdev.org/ELF
+///   - https://wiki.osdev.org/ELF_Tutorial
+///
+/// The hardware side of user mode (ring 3):
+///   - syscall/sysret setup (EFER.SCE, STAR, LSTAR, SFMASK),
+///   - the first jump to ring 3 (iretq),
+///   - checked copies from user memory,
+///   - loading an ELF64 executable into a fresh address space.
+/// User programs are ordinary psycoc Linux executables (static, non-PIE,
+/// loaded at 0x400000): PsycOS implements the Linux system calls they use.
+
+#![trusted]
+
+import "paging.psy"
+import "gdt.psy"
+
+const msr_efer: u32 = 0xC0000080
+const msr_star: u32 = 0xC0000081
+const msr_lstar: u32 = 0xC0000082
+const msr_sfmask: u32 = 0xC0000084
+const efer_sce: u64 = 0x1
+
+const syscall_rflags_mask: u64 = 0x700
+const user_rflags: u64 = 0x202
+
+const user_space_start: u64 = 0x1000
+const user_space_end: u64 = 0x0000800000000000
+
+// User stack: 16 KiB under user_stack_top, with unmapped pages below.
+const user_stack_top: u64 = 0x00007FFFFFFFF000
+const user_stack_pages: u64 = 4
+
+// ELF64 header fields and values.
+const elf_magic: u32 = 0x464C457F
+const elf_class64: u8 = 2
+const elf_little_endian: u8 = 1
+const elf_type_exec: u16 = 2
+const elf_machine_x86_64: u16 = 0x3E
+const elf_header_size: u64 = 64
+const elf_phdr_size: u64 = 56
+const elf_pt_load: u32 = 1
+const elf_pf_write: u32 = 2
+
+struct SyscallRegs {
+    r15: u64,
+    r14: u64,
+    r13: u64,
+    r12: u64,
+    rbp: u64,
+    rbx: u64,
+    r9: u64,
+    r8: u64,
+    r10: u64,
+    rdx: u64,
+    rsi: u64,
+    rdi: u64,
+    rax: u64,
+    r11: u64,
+    rcx: u64,
+    user_rsp: u64,
+}
+
+struct LoadedProgram {
+    entry: u64,
+    stack_top: u64,
+    ok: bool,
+}
+
+/// Enables syscall and points it at `entry` (a #[syscall] function).
+fn syscall_init(entry: u64) {
+    wrmsr(msr_efer, rdmsr(msr_efer) | efer_sce)
+    // syscall: cs = 0x08, ss = 0x10. sysret: ss = 0x28 + 8, cs = 0x28 + 16.
+    wrmsr(msr_star, (user_base_selector << 48) | ((kernel_cs as u64) << 32))
+    wrmsr(msr_lstar, entry)
+    wrmsr(msr_sfmask, syscall_rflags_mask)
+}
+
+/// Stack used by the CPU and the syscall stub when the current task
+/// enters the kernel from ring 3.
+fn set_kernel_entry_stack(top: u64) {
+    tss_set_rsp0(top)
+    set_syscall_stack(top)
+}
+
+/// First jump to ring 3. Never returns.
+fn enter_user(rip: u64, rsp: u64) {
+    iret_to(rip, user_cs, user_rflags, rsp, user_ds)
+}
+
+/// True if [addr, addr + len) is user memory mapped in `root`.
+fn user_range_ok(root: u64, addr: u64, len: u64, write: bool) -> bool {
+    if len == 0 {
+        return true
+    }
+    if addr < user_space_start || addr >= user_space_end || len > user_space_end - addr {
+        return false
+    }
+    let mut page = addr & ~(size_4k - 1)
+    while page < addr + len {
+        if !user_page_ok(root, page, write) {
+            return false
+        }
+        page += size_4k
+    }
+    return true
+}
+
+/// Copies `buf.len()` bytes from user address `src` of the current
+/// address space; false if the range is not readable user memory (nothing
+/// is read then).
+fn copy_from_user(buf: &mut [u8], src: u64) -> bool {
+    if !user_range_ok(read_cr3(), src, buf.len() as u64, false) {
+        return false
+    }
+    let p = src as *const u8
+    for i in 0..buf.len() {
+        buf[i] = p.add(i).read()
+    }
+    return true
+}
+
+/// Little-endian value of `size` bytes at `offset` in `data` (bounds checked).
+fn read_le(data: Str, offset: u64, size: u64) -> u64 {
+    if offset + size > data.len() as u64 {
+        panic("read_le: out of bounds")
+    }
+    let p = data.as_ptr()
+    let mut v: u64 = 0
+    for i in 0..size {
+        v |= (p.add((offset + i) as usize).read() as u64) << (8 * i)
+    }
+    return v
+}
+
+/// Maps (or finds) the user page holding `va` in `root`; returns its
+/// physical address, or 0 if memory is full.
+fn user_page(root: u64, va: u64, writable: bool) -> u64 {
+    let page = va & ~(size_4k - 1)
+    let existing = translate_in(root, page)
+    if existing != not_mapped {
+        return existing
+    }
+    let phys = pmm_alloc_page()
+    if phys == 0 {
+        return 0
+    }
+    memset(phys_to_virt(phys) as *mut u8, 0, size_4k as usize)
+    let mut flags = pte_user
+    if writable {
+        flags |= pte_writable
+    }
+    map_page_in(root, page, phys, flags)
+    return phys
+}
+
+/// Copies one PT_LOAD segment into `root` (page by page, zero-filled).
+fn load_segment(root: u64, elf: Str, offset: u64, vaddr: u64, filesz: u64, memsz: u64, writable: bool) -> bool {
+    let mut va = vaddr & ~(size_4k - 1)
+    while va < vaddr + memsz {
+        let phys = user_page(root, va, writable)
+        if phys == 0 {
+            return false
+        }
+        let dst = phys_to_virt(phys) as *mut u8
+        // Bytes of the file that land in this page.
+        let mut start = va
+        if start < vaddr {
+            start = vaddr
+        }
+        let mut end = va + size_4k
+        if end > vaddr + filesz {
+            end = vaddr + filesz
+        }
+        if end > start {
+            let src = elf.as_ptr().add((offset + start - vaddr) as usize)
+            memcpy(dst.add((start - va) as usize), src, (end - start) as usize)
+        }
+        va += size_4k
+    }
+    return true
+}
+
+/// Loads an ELF64 x86-64 executable and a user stack into `root`.
+fn load_program(root: u64, elf: Str) -> LoadedProgram {
+    let failed = LoadedProgram {
+        entry: 0,
+        stack_top: 0,
+        ok: false,
+    }
+    let size = elf.len() as u64
+    if size < elf_header_size || read_le(elf, 0, 4) as u32 != elf_magic {
+        return failed
+    }
+    if read_le(elf, 4, 1) as u8 != elf_class64 || read_le(elf, 5, 1) as u8 != elf_little_endian {
+        return failed
+    }
+    if read_le(elf, 16, 2) as u16 != elf_type_exec || read_le(elf, 18, 2) as u16 != elf_machine_x86_64 {
+        return failed
+    }
+    let entry = read_le(elf, 24, 8)
+    let phoff = read_le(elf, 32, 8)
+    let phnum = read_le(elf, 56, 2)
+    if phoff > size || phnum * elf_phdr_size > size - phoff {
+        return failed
+    }
+    for i in 0..phnum {
+        let ph = phoff + i * elf_phdr_size
+        if read_le(elf, ph, 4) as u32 != elf_pt_load {
+            continue
+        }
+        let flags = read_le(elf, ph + 4, 4) as u32
+        let offset = read_le(elf, ph + 8, 8)
+        let vaddr = read_le(elf, ph + 16, 8)
+        let filesz = read_le(elf, ph + 32, 8)
+        let memsz = read_le(elf, ph + 40, 8)
+        // The segment must fit in the file and below the user stack.
+        if filesz > memsz || offset > size || filesz > size - offset {
+            return failed
+        }
+        let user_limit = user_stack_top - user_stack_pages * size_4k
+        if vaddr < user_space_start || vaddr >= user_limit || memsz > user_limit - vaddr {
+            return failed
+        }
+        if !load_segment(root, elf, offset, vaddr, filesz, memsz, flags & elf_pf_write != 0) {
+            return failed
+        }
+    }
+    if entry < user_space_start || entry >= user_space_end {
+        return failed
+    }
+    for i in 0..user_stack_pages {
+        if user_page(root, user_stack_top - (i + 1) * size_4k, true) == 0 {
+            return failed
+        }
+    }
+    return LoadedProgram {
+        entry: entry,
+        stack_top: user_stack_top,
+        ok: true,
+    }
+}
