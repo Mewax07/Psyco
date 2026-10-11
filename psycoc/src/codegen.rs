@@ -129,6 +129,9 @@ impl<'a> Codegen<'a> {
         self.gen_runtime();
 
         for f in &program.functions {
+            if self.info.skip_functions.contains(&f.name) {
+                continue;
+            }
             self.gen_function(f);
         }
 
@@ -1864,6 +1867,15 @@ impl<'a> Codegen<'a> {
             ("as_ptr", Type::Str) => {
                 self.gen_expr(recv);
                 self.asm.alu_ri(Alu::Add, Rax, 8);
+            }
+            ("as_bytes", Type::Str) => {
+                self.gen_expr(recv);
+                let off = self.alloc(16, 8);
+                self.asm.load(Rcx, Rax, 0);
+                self.asm.store(Rbp, off + 8, Rcx);
+                self.asm.alu_ri(Alu::Add, Rax, 8);
+                self.asm.store(Rbp, off, Rax);
+                self.asm.lea(Rax, Rbp, off);
             }
             ("is_null", Type::Raw(..)) => {
                 self.gen_expr(recv);

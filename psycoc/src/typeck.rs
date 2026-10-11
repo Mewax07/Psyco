@@ -1,5 +1,9 @@
 use std::{
-    cell::Cell, collections::{HashMap, HashSet}, mem::replace, path::Path,
+    cell::Cell,
+    collections::{HashMap, HashSet},
+    mem::replace,
+    path::Path,
+    ptr::eq,
 };
 
 use crate::*;
@@ -66,6 +70,7 @@ pub struct ProgramInfo {
     pub enums: Vec<EnumInfo>,
     pub statics: Vec<StaticInfo>,
     pub functions: HashMap<String, FnSig>,
+    pub skip_functions: HashSet<String>,
 }
 
 impl ProgramInfo {
@@ -158,9 +163,11 @@ pub struct TypeChecker {
     consts: HashMap<String, ConstSlot>,
     statics: Vec<StaticInfo>,
     static_ids: HashMap<String, usize>,
+    const_arrays: HashSet<String>,
     functions: HashMap<String, FnSig>,
     trusted_fns: HashSet<String>,
     accessors: HashMap<String, Accessor>,
+    used_accessors: HashSet<String>,
     files: Vec<String>,
     ctx: FnCtx,
 }
@@ -183,9 +190,11 @@ impl TypeChecker {
             consts: HashMap::new(),
             statics: Vec::new(),
             static_ids: HashMap::new(),
+            const_arrays: HashSet::new(),
             functions: HashMap::new(),
             trusted_fns: HashSet::new(),
             accessors: HashMap::new(),
+            used_accessors: HashSet::new(),
             files: Vec::new(),
             ctx: FnCtx::default(),
         }
@@ -221,7 +230,10 @@ impl TypeChecker {
             static DEPTH: Cell<u32> = const { Cell::new(0) };
         }
         if DEPTH.with(|d| d.get()) >= 8 {
-            return self.err("include_program nested too deeply (does a program include itself?)", span);
+            return self.err(
+                "include_program nested too deeply (does a program include itself?)",
+                span,
+            );
         }
         DEPTH.with(|d| d.set(d.get() + 1));
         let result = crate::compile_file(&full_str, crate::Target::Linux);
@@ -250,6 +262,34 @@ impl TypeChecker {
             self.enum_defs.push(e.clone());
             self.enums.push(State::Todo);
         }
+
+        let mut scalar_consts = Vec::new();
+        for c in std::mem::take(&mut program.consts) {
+            match (&c.r#type, &c.value.kind) {
+                (Some(te), _) if matches!(te.kind, TypeExprKind::Array(..)) => {
+                    self.const_arrays.insert(c.name.clone());
+                    program.statics.push(StaticDef {
+                        name: c.name,
+                        mutable: false,
+                        r#type: te.clone(),
+                        init: Some(c.value),
+                        attrs: Vec::new(),
+                        span: c.span,
+                    });
+                }
+                (None, ExprKind::ArrayLit(_) | ExprKind::ArrayRepeat { .. }) => {
+                    return self.err(
+                        format!(
+                            "array constant '{}' needs a type (const {}: [T; N] = ...)",
+                            c.name, c.name
+                        ),
+                        c.span,
+                    );
+                }
+                _ => scalar_consts.push(c),
+            }
+        }
+        program.consts = scalar_consts;
 
         for c in &program.consts {
             if self.consts.contains_key(&c.name) {
@@ -328,6 +368,12 @@ impl TypeChecker {
             enums,
             statics: std::mem::take(&mut self.statics),
             functions: std::mem::take(&mut self.functions),
+            skip_functions: self
+                .accessors
+                .keys()
+                .filter(|n| !self.used_accessors.contains(*n))
+                .cloned()
+                .collect(),
         })
     }
 
@@ -430,7 +476,10 @@ impl TypeChecker {
             }
         }
         if interrupt && syscall {
-            return self.err("a function cannot be both #[interrupt] and #[syscall]", f.span);
+            return self.err(
+                "a function cannot be both #[interrupt] and #[syscall]",
+                f.span,
+            );
         }
         let abi = if syscall {
             let ok = params.len() == 1
@@ -487,7 +536,10 @@ impl TypeChecker {
                 }
                 ("setter", None) => {
                     return self.err(
-                        format!("#[setter] needs a mutable static (write 'static mut {}')", s.name),
+                        format!(
+                            "#[setter] needs a mutable static (write 'static mut {}')",
+                            s.name
+                        ),
                         a.span,
                     );
                 }
@@ -980,7 +1032,8 @@ impl TypeChecker {
         }
         let span = e.span;
         let st = st.clone();
-        let Stmt::Expr(e) = std::mem::replace(stmt, Stmt::Expr(Expr::new(ExprKind::Bool(false), span)))
+        let Stmt::Expr(e) =
+            std::mem::replace(stmt, Stmt::Expr(Expr::new(ExprKind::Bool(false), span)))
         else {
             unreachable!()
         };
@@ -1066,6 +1119,9 @@ impl TypeChecker {
                 match self.place_mut(target) {
                     Some(true) => {}
                     Some(false) => {
+                        if let Some(msg) = self.immutable_root_msg(target, "assign to", "") {
+                            return self.err(msg, *span);
+                        }
                         let msg = match &target.kind {
                                 ExprKind::Var(n) => format!(
                                     "cannot assign to immutable variable '{n}' (declare it with 'let mut')"
@@ -1242,6 +1298,49 @@ impl TypeChecker {
                 Ok(exhaustive && all_diverge && !arms.is_empty())
             }
             Stmt::Block(b) => self.check_block(b),
+        }
+    }
+
+    fn immutable_root_msg(&self, e: &Expr, verb: &str, suffix: &str) -> Option<String> {
+        self.immutable_root_msg_in(e, e, verb, suffix)
+    }
+
+    fn immutable_root_msg_in(
+        &self,
+        top: &Expr,
+        e: &Expr,
+        verb: &str,
+        suffix: &str,
+    ) -> Option<String> {
+        match &e.kind {
+            ExprKind::Var(n) => {
+                if let Some(l) = self.lookup_local(n) {
+                    if l.mutable || eq(e, top) {
+                        return None;
+                    }
+                    return Some(format!(
+                        "cannot {verb} immutable variable '{n}'{suffix} (declare it with 'let mut')"
+                    ));
+                }
+                let i = *self.static_ids.get(n)?;
+                if self.statics[i].mutable {
+                    return None;
+                }
+                if self.const_arrays.contains(n) {
+                    Some(format!("cannot {verb} constant '{n}'{suffix}"))
+                } else {
+                    Some(format!(
+                        "cannot {verb} immutable static '{n}'{suffix} (declare is 'static mut')"
+                    ))
+                }
+            }
+            ExprKind::Field { base, .. } if matches!(base.r#type(), Type::Struct(_)) => {
+                self.immutable_root_msg_in(top, base, verb, suffix)
+            }
+            ExprKind::Index { base, .. } if matches!(base.r#type(), Type::Array(..)) => {
+                self.immutable_root_msg_in(top, base, verb, suffix)
+            }
+            _ => None,
         }
     }
 
@@ -1440,7 +1539,6 @@ impl TypeChecker {
             ExprKind::Bytes(b) => Ok((ExprKind::Bytes(b), Type::Str)),
             ExprKind::CStr(s) => Ok((ExprKind::CStr(s), Type::raw(Type::U8, false))),
             ExprKind::WStr(s) => Ok((ExprKind::WStr(s), Type::raw(Type::Int(IntType::U16), false))),
-
             ExprKind::Var(name) => {
                 if let Some(l) = self.lookup_local(&name) {
                     let t = l.r#type.clone();
@@ -1462,6 +1560,9 @@ impl TypeChecker {
                 }
                 if let Some(sig) = self.functions.get(&name) {
                     let t = sig.fn_type();
+                    if self.accessors.contains_key(&name) {
+                        self.used_accessors.insert(name.clone());
+                    }
                     return Ok((ExprKind::Var(name), t));
                 }
                 if is_builtin(&name) {
@@ -1469,7 +1570,6 @@ impl TypeChecker {
                 }
                 self.err(format!("unknown variable '{name}'"), span)
             }
-
             ExprKind::Path(owner, member) => {
                 if let Some(&eid) = self.enum_ids.get(&owner) {
                     self.ensure_enum(eid)?;
@@ -1489,11 +1589,9 @@ impl TypeChecker {
                 }
                 self.err(format!("'{full}' is not a variant or a function"), span)
             }
-
             ExprKind::Unary { op, mut operand } => {
                 self.check_unary(op, &mut operand, span, expected)
             }
-
             ExprKind::Binary {
                 op,
                 mut lhs,
@@ -1521,7 +1619,6 @@ impl TypeChecker {
                 };
                 Ok((ExprKind::Binary { op, lhs, rhs }, r#type))
             }
-
             ExprKind::Cast { mut expr, r#type } => {
                 let to = self.resolve_type(&r#type)?;
                 let from = self.check_expr(&mut expr, None)?;
@@ -1540,13 +1637,11 @@ impl TypeChecker {
                 }
                 Ok((ExprKind::Cast { expr, r#type }, to))
             }
-
             ExprKind::Call {
                 callee,
                 args,
                 target: _,
             } => self.check_call(*callee, args, span),
-
             ExprKind::Field { base, name } => {
                 let mut base = *base;
                 self.check_expr(&mut base, None)?;
@@ -1559,7 +1654,6 @@ impl TypeChecker {
                     r#type,
                 ))
             }
-
             ExprKind::Index { base, mut index } => {
                 let mut base = *base;
                 self.check_expr(&mut base, None)?;
@@ -1596,12 +1690,10 @@ impl TypeChecker {
                     elem,
                 ))
             }
-
             ExprKind::Range { .. } => self.err(
                 "slicing needs a reference: write '&a[i..j]' or '&mut a[i..j]'",
                 span,
             ),
-
             ExprKind::StructLit { name, mut fields } => {
                 let Some(&sid) = self.struct_ids.get(&name) else {
                     return self.err(format!("unknown struct '{name}'"), span);
@@ -1632,7 +1724,6 @@ impl TypeChecker {
                 }
                 Ok((ExprKind::StructLit { name, fields }, Type::Struct(sid)))
             }
-
             ExprKind::ArrayLit(mut items) => {
                 let elem_hint = match expected {
                     Some(Type::Array(t, _)) => Some((**t).clone()),
@@ -1658,7 +1749,6 @@ impl TypeChecker {
                 let n = items.len() as u64;
                 Ok((ExprKind::ArrayLit(items), Type::Array(Box::new(elem), n)))
             }
-
             ExprKind::ArrayRepeat {
                 mut value,
                 mut count,
@@ -1678,13 +1768,11 @@ impl TypeChecker {
                     Type::Array(Box::new(elem), n),
                 ))
             }
-
             ExprKind::Sizeof(te) => {
                 let t = self.resolve_type(&te)?;
                 let size = self.size_of(&t)?;
                 Ok((ExprKind::Int(size as i128), Type::USIZE))
             }
-
             ExprKind::Unsize(_) => unreachable!("handled in check_expr"),
         }
     }
@@ -1807,6 +1895,14 @@ impl TypeChecker {
                 }
                 let inner_hint = match expected {
                     Some(Type::Ref(t, _)) => Some((**t).clone()),
+                    Some(Type::Slice(t, _))
+                        if matches!(
+                            operand.kind,
+                            ExprKind::ArrayLit(_) | ExprKind::ArrayRepeat { .. }
+                        ) =>
+                    {
+                        Some(Type::Array(t.clone(), 0))
+                    }
                     _ => None,
                 };
                 let t = self.check_expr(operand, inner_hint.as_ref())?;
@@ -1828,6 +1924,11 @@ impl TypeChecker {
                 if mutable {
                     match self.place_mut(operand) {
                         Some(false) => {
+                            if let Some(msg) =
+                                self.immutable_root_msg(operand, "borrow", " as mutable")
+                            {
+                                return self.err(msg, span);
+                            }
                             let msg = match &operand.kind {
                                 ExprKind::Var(n) => format!(
                                     "cannot borrow '{n}' as mutable (declare it with 'let mut')"
@@ -2069,6 +2170,18 @@ impl TypeChecker {
             }
         }
 
+        if let ExprKind::Var(name) = &callee.kind {
+            if self.lookup_local(name).is_none() {
+                if let Some(Accessor::Get(st)) = self.accessors.get(name) {
+                    if args.is_empty() && self.lookup_local(st).is_none() {
+                        let mut e = Expr::new(ExprKind::Var(st.clone()), span);
+                        let t = self.check_expr(&mut e, None)?;
+                        return Ok((e.kind, t));
+                    }
+                }
+            }
+        }
+
         let ct = self.check_expr(&mut callee, None)?;
         let direct = match &callee.kind {
             ExprKind::Var(n)
@@ -2078,15 +2191,6 @@ impl TypeChecker {
             }
             _ => None,
         };
-        if let Some(name) = &direct {
-            if let Some(Accessor::Get(st)) = self.accessors.get(name) {
-                if args.is_empty() && self.lookup_local(st).is_none() {
-                    let mut e = Expr::new(ExprKind::Var(st.clone()), span);
-                    let t = self.check_expr(&mut e, None)?;
-                    return Ok((e.kind, t));
-                }
-            }
-        }
         let Type::Fn(ft) = ct else {
             return self.err(
                 format!("cannot call a value of type {}", self.type_name(&ct)),
@@ -2095,7 +2199,10 @@ impl TypeChecker {
         };
         match ft.abi {
             Abi::Interrupt => {
-                return self.err("interrupt and syscall handlers cannot be called directly", span);
+                return self.err(
+                    "interrupt and syscall handlers cannot be called directly",
+                    span,
+                );
             }
             Abi::Efi => self.need_trusted("calling an 'extern fn' (firmware code)", span)?,
             _ => {}
@@ -2233,7 +2340,10 @@ impl TypeChecker {
         };
         match ft.abi {
             Abi::Interrupt => {
-                return self.err("interrupt and syscall handlers cannot be called directly", span);
+                return self.err(
+                    "interrupt and syscall handlers cannot be called directly",
+                    span,
+                );
             }
             Abi::Efi => self.need_trusted("calling an 'extern fn' (firmware code)", span)?,
             _ => {}
@@ -2335,6 +2445,10 @@ impl TypeChecker {
             (Type::Str, "as_ptr") => {
                 need_args(0, &args)?;
                 Type::raw(Type::U8, false)
+            }
+            (Type::Str, "as_bytes") => {
+                need_args(0, &args)?;
+                Type::Slice(Box::new(Type::U8), false)
             }
             (Type::Array(t, _), "as_mut_ptr") => {
                 need_args(0, &args)?;
@@ -2647,7 +2761,11 @@ fn builtin_sig(name: &str) -> Option<(Vec<Type>, Type, bool)> {
         "context_switch" => (vec![Type::raw(Type::U64, true), u(U64)], Type::Unit, true),
         "set_syscall_stack" => (vec![u(U64)], Type::Unit, true),
         "syscall" => (vec![u(U64), u(U64), u(U64), u(U64)], u(I64), false),
-        "iret_to" => (vec![u(U64), u(U64), u(U64), u(U64), u(U64)], Type::Unit, true),
+        "iret_to" => (
+            vec![u(U64), u(U64), u(U64), u(U64), u(U64)],
+            Type::Unit,
+            true,
+        ),
         _ => return None,
     })
 }
