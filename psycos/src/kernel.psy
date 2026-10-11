@@ -9,8 +9,7 @@
 /// enter_higher_half(kmain).
 /// kmain (our tables, higher half, kernel stack): cpu_init again ->
 /// reclaim boot services memory -> heap_init -> irq_init -> sched_init ->
-/// kbd_init -> sti -> shell.
-/// process_init -> kbd_init -> sti -> shell.
+/// process_init -> blk_init -> kbd_init -> sti -> shell.
 
 import "efi.psy"
 import "fb.psy"
@@ -26,6 +25,7 @@ import "paging.psy"
 import "heap.psy"
 import "sched.psy"
 import "programs.psy"
+import "virtio_bk.psy"
 
 const line_max: usize = 76
 const bytes_per_kib: u64 = 1024
@@ -114,6 +114,7 @@ fn cmd_help() {
     puts("  spin       start a demo task (animated square, top right)\n")
     puts("  kill N     stop the task in slot N\n")
     puts("  progs      list the user programs\n")
+    puts("  lspci      list PCI devices\n")
     puts("  run NAME   run a user program (ring 3) and wait for it\n")
     puts("  start NAME run a user program in the background\n")
     puts("  fb         framebuffer info and test pattern\n")
@@ -188,6 +189,14 @@ fn cmd_ver() {
     puts(" GiB, ")
     put_u64(get_table_pages())
     puts(" table pages\n")
+    puts("Disk: ")
+    if get_blk_ready() {
+        puts("virtio, ")
+        put_u64(get_blk_sectors() * 512 / bytes_per_mib)
+        puts(" MiB\n")
+    } else {
+        puts("none (QEMU: -drive file=disk.img,if=virtio,format=raw)\n")
+    }
     puts("Keyboard: ")
     if get_kbd_ps2() {
         puts("PS/2 + serial\n")
@@ -388,6 +397,56 @@ fn line_number(start: usize) -> i64 {
     return n
 }
 
+/// Short name of a PCI class (0xCCSS).
+fn pci_class_name(class: u32) -> Str {
+    match class >> 8 {
+        0x0100 => return "SCSI / virtio storage",
+        0x0101 => return "IDE controller",
+        0x0106 => return "SATA controller",
+        0x0108 => return "NVMe controller",
+        0x0200 => return "Ethernet",
+        0x0300 => return "VGA display",
+        0x0600 => return "host bridge",
+        0x0601 => return "ISA bridge",
+        0x0604 => return "PCI bridge",
+        0x0C03 => return "USB controller",
+        0x0C05 => return "SMBus",
+        _ => return "other",
+    }
+}
+
+/// `lspci`: every PCI function on every bus.
+fn cmd_lspci() {
+    set_color(yellow)
+    puts("BUS:DEV.FN  VENDOR:DEVICE  CLASS\n")
+    set_color(gray)
+    for bus in 0..pci_max_bus {
+        for device in 0..pci_max_device {
+            if pci_vendor(bus, device, 0) == pci_no_vendor {
+                continue
+            }
+            for function in 0..pci_function_count(bus, device) {
+                let vendor = pci_vendor(bus, device, function)
+                if vendor == pci_no_vendor {
+                    continue
+                }
+                put_hex_width(bus as u64, 2)
+                putc(':')
+                put_hex_width(device as u64, 2)
+                putc('.')
+                put_u64(function as u64)
+                puts("     ")
+                put_hex_width(vendor as u64, 4)
+                putc(':')
+                put_hex_width(pci_device_id(bus, device, function) as u64, 4)
+                puts("      ")
+                puts(pci_class_name(pci_class(bus, device, function)))
+                putc('\n')
+            }
+        }
+    }
+}
+
 /// `progs`: the embedded user programs.
 fn cmd_progs() {
     set_color(yellow)
@@ -536,7 +595,9 @@ fn run_command() {
     } else if line_starts_with("kill ") {
         cmd_kill()
     } else if line_is("progs") {
-           cmd_progs()
+        cmd_progs()
+    } else if line_is("lspci") {
+        cmd_lspci()
     } else if line_starts_with("run ") {
         cmd_run(4, true)
     } else if line_starts_with("start ") {
@@ -623,6 +684,7 @@ fn kmain() {
     irq_init()
     sched_init()
     process_init()
+    blk_init()
     kbd_init()
     sti()
     print("PsycOS: boot ok")

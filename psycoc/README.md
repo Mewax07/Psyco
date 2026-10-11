@@ -36,7 +36,10 @@ L'objectif n'est pas de cacher la machine derrière des abstractions toujours pl
 
 L'objectif est de rendre ces abstractions compréhensibles.
 
+---
+
 # Psyco
+```
 ├── Philosophy
 ├── Why "Psyco"?
 ├── Language overview
@@ -57,3 +60,4 @@ L'objectif est de rendre ces abstractions compréhensibles.
 ├── Examples
 ├── Design goals
 └── Roadmap
+```

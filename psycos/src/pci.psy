@@ -1,0 +1,135 @@
+/// Wiki Doc sources:
+///   - https://wiki.osdev.org/PCI
+///   - https://wiki.osdev.org/PCI#Configuration_Space_Access_Mechanism_.231
+///
+/// PCI configuration space through the legacy I/O ports 0xCF8 / 0xCFC
+/// (mechanism #1), device search, BARs and the command register.
+
+#![trusted]
+
+const pci_config_address: u16 = 0xCF8
+const pci_config_data: u16 = 0xCFC
+const pci_enable_bit: u32 = 0x80000000
+
+const pci_max_bus: u32 = 256
+const pci_max_device: u32 = 32
+const pci_max_function: u32 = 8
+const pci_no_vendor: u32 = 0xFFFF
+
+const pci_vendor_offset: u32 = 0x00
+const pci_command_offset: u32 = 0x04
+const pci_class_offset: u32 = 0x08
+const pci_header_offset: u32 = 0x0C
+const pci_bar0_offset: u32 = 0x10
+const pci_interrupt_offset: u32 = 0x3C
+
+const pci_command_io: u32 = 0x1
+const pci_command_memory: u32 = 0x2
+const pci_command_bus_master: u32 = 0x4
+
+const pci_multifunction: u32 = 0x80
+const pci_bar_io: u32 = 0x1
+
+struct PciAddr {
+    bus: u32,
+    device: u32,
+    function: u32,
+    found: bool,
+}
+
+/// Reads the 32-bit register at `offset` (multiple of 4) of a function.
+fn pci_read32(bus: u32, device: u32, function: u32, offset: u32) -> u32 {
+    outl(pci_config_address, pci_enable_bit | (bus << 16) | (device << 11) | (function << 8) | (offset & 0xFC))
+    return inl(pci_config_data)
+}
+
+/// Writes the 32-bit register at `offset` of a function.
+fn pci_write32(bus: u32, device: u32, function: u32, offset: u32, value: u32) {
+    outl(pci_config_address, pci_enable_bit | (bus << 16) | (device << 11) | (function << 8) | (offset & 0xFC))
+    outl(pci_config_data, value)
+}
+
+/// Vendor id of a function (0xFFFF if there is none).
+fn pci_vendor(bus: u32, device: u32, function: u32) -> u32 {
+    return pci_read32(bus, device, function, pci_vendor_offset) & 0xFFFF
+}
+
+/// Device id of a function.
+fn pci_device_id(bus: u32, device: u32, function: u32) -> u32 {
+    return pci_read32(bus, device, function, pci_vendor_offset) >> 16
+}
+
+/// Class, subclass and prog-if (0xCCSSPP).
+fn pci_class(bus: u32, device: u32, function: u32) -> u32 {
+    return pci_read32(bus, device, function, pci_class_offset) >> 8
+}
+
+/// True if the device has more than one function.
+fn pci_is_multifunction(bus: u32, device: u32) -> bool {
+    return (pci_read32(bus, device, 0, pci_header_offset) >> 16) & pci_multifunction != 0
+}
+
+/// Number of functions to look at for a device.
+fn pci_function_count(bus: u32, device: u32) -> u32 {
+    if pci_is_multifunction(bus, device) {
+        return pci_max_function
+    }
+    return 1
+}
+
+/// First function with this vendor and one of the two device ids.
+fn pci_find(vendor: u32, device_a: u32, device_b: u32) -> PciAddr {
+    for bus in 0..pci_max_bus {
+        for device in 0..pci_max_device {
+            if pci_vendor(bus, device, 0) == pci_no_vendor {
+                continue
+            }
+            for function in 0..pci_function_count(bus, device) {
+                if pci_vendor(bus, device, function) != vendor {
+                    continue
+                }
+                let id = pci_device_id(bus, device, function)
+                if id == device_a || id == device_b {
+                    return PciAddr {
+                        bus: bus,
+                        device: device,
+                        function: function,
+                        found: true,
+                    }
+                }
+            }
+        }
+    }
+    return PciAddr {
+        bus: 0,
+        device: 0,
+        function: 0,
+        found: false,
+    }
+}
+
+/// Raw value of BAR `index` (0 to 5).
+fn pci_bar(a: &PciAddr, index: u32) -> u32 {
+    return pci_read32(a.bus, a.device, a.function, pci_bar0_offset + index * 4)
+}
+
+/// I/O port base of BAR `index` (0 if it is not an I/O BAR).
+fn pci_io_bar(a: &PciAddr, index: u32) -> u16 {
+    let bar = pci_bar(a, index)
+    if bar & pci_bar_io == 0 {
+        return 0
+    }
+    return (bar & 0xFFFC) as u16
+}
+
+/// Enables I/O and memory decoding and bus mastering (DMA).
+fn pci_enable(a: &PciAddr) {
+    let command = pci_read32(a.bus, a.device, a.function, pci_command_offset)
+    let wanted = (command & 0xFFFF) | pci_command_io | pci_command_memory | pci_command_bus_master
+    pci_write32(a.bus, a.device, a.function, pci_command_offset, wanted)
+}
+
+/// Legacy interrupt line (IRQ number) of a function.
+fn pci_irq_line(a: &PciAddr) -> u32 {
+    return pci_read32(a.bus, a.device, a.function, pci_interrupt_offset) & 0xFF
+}

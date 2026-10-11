@@ -1,0 +1,235 @@
+/// Wiki Doc sources:
+///   - https://wiki.osdev.org/Virtio
+///   - https://docs.oasis-open.org/virtio/virtio/v1.2/virtio-v1.2.html
+///
+/// virtio block device, legacy (I/O port) interface, as QEMU provides it
+/// with `-drive file=disk.img,if=virtio,format=raw`.
+/// One virtqueue, one request at a time, completion by polling. Data goes
+/// through a contiguous bounce buffer, so callers can use any buffer.
+
+#![trusted]
+
+import "pci.psy"
+import "paging.psy"
+import "sync.psy"
+
+const virtio_vendor: u32 = 0x1AF4
+const virtio_blk_legacy: u32 = 0x1001
+const virtio_blk_modern: u32 = 0x1042
+
+const reg_device_features: u16 = 0x00
+const reg_guest_features: u16 = 0x04
+const reg_queue_address: u16 = 0x08
+const reg_queue_size: u16 = 0x0C
+const reg_queue_select: u16 = 0x0E
+const reg_queue_notify: u16 = 0x10
+const reg_device_status: u16 = 0x12
+const reg_isr_status: u16 = 0x13
+const reg_capacity: u16 = 0x14
+
+const status_acknowledge: u8 = 1
+const status_driver: u8 = 2
+const status_driver_ok: u8 = 4
+const status_failed: u8 = 128
+
+const desc_next: u16 = 1
+const desc_device_writes: u16 = 2
+
+const request_read: u32 = 0
+const request_write: u32 = 1
+const request_ok: u8 = 0
+
+const sector_size: u64 = 512
+const queue_align: u64 = 4096
+const bounce_pages: u64 = 16
+const max_sectors_per_request: u64 = 128
+const request_timeout: u64 = 100000000
+
+static mut io_base: u16 = 0
+static mut queue_size: u64 = 0
+static mut queue_phys: u64 = 0
+static mut used_offset: u64 = 0
+static mut last_used: u16 = 0
+static mut request_phys: u64 = 0
+static mut bounce_phys: u64 = 0
+
+#[getter]
+static mut blk_ready: bool = false
+#[getter]
+static mut blk_sectors: u64 = 0
+#[getter]
+static mut blk_requests: u64 = 0
+#[getter]
+static mut blk_errors: u64 = 0
+
+/// Kernel pointer to physical address `phys`.
+fn dma_ptr(phys: u64) -> *mut u8 {
+    return phys_to_virt(phys) as *mut u8
+}
+
+/// Writes descriptor `i` of the queue.
+fn set_descriptor(i: u64, addr: u64, len: u32, flags: u16, next: u16) {
+    let d = dma_ptr(queue_phys + i * 16)
+    (d as *mut u64).write(addr)
+    (d.add(8) as *mut u32).write(len)
+    (d.add(12) as *mut u16).write(flags)
+    (d.add(14) as *mut u16).write(next)
+}
+
+/// Pointer to the avail ring index.
+fn avail_idx() -> *mut u16 {
+    return dma_ptr(queue_phys + queue_size * 16 + 2) as *mut u16
+}
+
+/// Pointer to slot `i` of the avail ring.
+fn avail_slot(i: u64) -> *mut u16 {
+    return dma_ptr(queue_phys + queue_size * 16 + 4 + 2 * i) as *mut u16
+}
+
+/// Pointer to the used ring index.
+fn used_idx() -> *mut u16 {
+    return dma_ptr(queue_phys + used_offset + 2) as *mut u16
+}
+
+/// Finds the device, sets up queue 0 and the buffers (false if absent).
+fn blk_init() -> bool {
+    let a = pci_find(virtio_vendor, virtio_blk_legacy, virtio_blk_modern)
+    if !a.found {
+        return false
+    }
+    io_base = pci_io_bar(&a, 0)
+    if io_base == 0 {
+        return false
+    }
+    pci_enable(&a)
+
+    outb(io_base + reg_device_status, 0)
+    outb(io_base + reg_device_status, status_acknowledge)
+    outb(io_base + reg_device_status, status_acknowledge | status_driver)
+    inl(io_base + reg_device_features)
+    outl(io_base + reg_guest_features, 0)
+
+    outw(io_base + reg_queue_select, 0)
+    queue_size = inw(io_base + reg_queue_size) as u64
+    if queue_size < 3 {
+        outb(io_base + reg_device_status, status_failed)
+        return false
+    }
+    let avail_end = queue_size * 16 + 6 + 2 * queue_size
+    used_offset = (avail_end + queue_align - 1) / queue_align * queue_align
+    let total = used_offset + 6 + 8 * queue_size
+    let pages = (total + size_4k - 1) / size_4k
+    queue_phys = pmm_alloc_pages(pages)
+    request_phys = pmm_alloc_page()
+    bounce_phys = pmm_alloc_pages(bounce_pages)
+    if queue_phys == 0 || request_phys == 0 || bounce_phys == 0 {
+        outb(io_base + reg_device_status, status_failed)
+        return false
+    }
+    memset(dma_ptr(queue_phys), 0, (pages * size_4k) as usize)
+    memset(dma_ptr(request_phys), 0, size_4k as usize)
+    last_used = 0
+    outl(io_base + reg_queue_address, (queue_phys / queue_align) as u32)
+
+    outb(io_base + reg_device_status, status_acknowledge | status_driver | status_driver_ok)
+    let lo = inl(io_base + reg_capacity) as u64
+    let hi = inl(io_base + reg_capacity + 4) as u64
+    blk_sectors = (hi << 32) | lo
+    blk_ready = true
+    return true
+}
+
+/// Sends one request and waits for it. The data is in the bounce buffer.
+fn blk_request(kind: u32, sector: u64, count: u64) -> bool {
+    let header = dma_ptr(request_phys)
+    (header as *mut u32).write(kind)
+    (header.add(4) as *mut u32).write(0)
+    (header.add(8) as *mut u64).write(sector)
+    header.add(16).write(0xFF)
+
+    let mut data_flags = desc_next
+    if kind == request_read {
+        data_flags |= desc_device_writes
+    }
+    set_descriptor(0, request_phys, 16, desc_next, 1)
+    set_descriptor(1, bounce_phys, (count * sector_size) as u32, data_flags, 2)
+    set_descriptor(2, request_phys + 16, 1, desc_device_writes, 0)
+
+    let idx = avail_idx().read()
+    avail_slot(idx as u64 % queue_size).write(0)
+    avail_idx().write(idx +% 1)
+    outw(io_base + reg_queue_notify, 0)
+
+    let mut spins: u64 = 0
+    while used_idx().read() == last_used {
+        spins += 1
+        if spins > request_timeout {
+            blk_errors += 1
+            return false
+        }
+        pause()
+    }
+    last_used = last_used +% 1
+    inb(io_base + reg_isr_status)
+    blk_requests += 1
+    if header.add(16).read() != request_ok {
+        blk_errors += 1
+        return false
+    }
+    return true
+}
+
+/// Checks a transfer: device ready, buffer big enough, inside the disk.
+fn blk_check(sector: u64, count: u64, buf_len: usize) -> bool {
+    if !blk_ready || count == 0 {
+        return false
+    }
+    if buf_len as u64 < count * sector_size {
+        return false
+    }
+    return sector < blk_sectors && count <= blk_sectors - sector
+}
+
+/// Reads `count` sectors starting at `sector` into `buf`.
+fn blk_read(sector: u64, count: u64, buf: &mut [u8]) -> bool {
+    if !blk_check(sector, count, buf.len()) {
+        return false
+    }
+    let was_on = irq_save()
+    let mut done: u64 = 0
+    let mut ok = true
+    while done < count && ok {
+        let mut n = count - done
+        if n > max_sectors_per_request {
+            n = max_sectors_per_request
+        }
+        ok = blk_request(request_read, sector + done, n)
+        if ok {
+            memcpy(buf.as_mut_ptr().add((done * sector_size) as usize), dma_ptr(bounce_phys), (n * sector_size) as usize)
+        }
+        done += n
+    }
+    irq_restore(was_on)
+    return ok
+}
+
+/// Writes `count` sectors from `buf` starting at `sector`.
+fn blk_write(sector: u64, count: u64, buf: &[u8]) -> bool {
+    if !blk_check(sector, count, buf.len()) {
+        return false
+    }
+    let was_on = irq_save()
+    let mut done: u64 = 0
+    let mut ok = true
+    while done < count && ok {
+        let mut n = count - done
+        if n > max_sectors_per_request {
+            n = max_sectors_per_request
+        }
+        memcpy(dma_ptr(bounce_phys), buf.as_ptr().add((done * sector_size) as usize), (n * sector_size) as usize)
+        ok = blk_request(request_write, sector + done, n)
+        done += n
+    }
+    irq_restore(was_on)
+    return ok
+}
