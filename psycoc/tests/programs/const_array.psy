@@ -1,0 +1,30 @@
+const k: u16 = 7
+const table: [u16; 4] = [k, k * 2, k * 3, 0xFFFF]
+const zeros: [u64; 3] = [0; 3]
+const grid: [[u8; 2]; 2] = [[1, 2], [3, 4]]
+
+struct P { x: i32, y: i32 }
+const points: [P; 2] = [P { x: -1, y: 2 }, P { x: 3, y: -4 }]
+
+fn total(t: &[u16]) -> u64 {
+    let mut s: u64 = 0
+    for i in 0..t.len() {
+        s += t[i] as u64
+    }
+    return s
+}
+
+fn get(i: usize) -> u16 { return table[i] }
+
+fn main() {
+    print(table[1], table.len(), total(&table), get(3))
+    print(zeros[2], grid[1][0], points[1].y)
+    let copy = table
+    print(copy[2])
+    print(get(4))
+}
+
+//> 14 4 65577 65535
+//> 0 3 -4
+//> 21
+// exit: 101

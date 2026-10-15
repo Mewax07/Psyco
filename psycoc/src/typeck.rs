@@ -1,12 +1,15 @@
 use std::{
-    cell::Cell,
-    collections::{HashMap, HashSet},
-    mem::replace,
-    path::Path,
-    ptr::eq,
+    cell::Cell, collections::{HashMap, HashSet}, fs::read, mem::replace, path::Path,
 };
 
 use crate::*;
+
+mod borrowck;
+mod generics;
+mod lazy;
+mod moves;
+mod patterns;
+mod traits;
 
 #[derive(Debug)]
 pub struct TypeError {
@@ -39,12 +42,39 @@ pub struct EnumInfo {
 }
 
 #[derive(Debug, Clone)]
+pub struct SumLayout {
+    pub name: String,
+    pub tag: IntType,
+    pub niche: Option<usize>,
+    pub variants: Vec<VariantLayout>,
+    pub size: u64,
+    pub align: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct VariantLayout {
+    pub name: String,
+    pub tag: i128,
+    pub fields: Vec<(Type, u64)>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Reloc {
+    Func(String),
+    Str(Vec<u8>),
+    CStr(Vec<u8>),
+    WStr(Vec<u16>),
+    Static(String),
+}
+
+#[derive(Debug, Clone)]
 pub struct StaticInfo {
     pub name: String,
     pub r#type: Type,
     pub mutable: bool,
     pub init: Option<Vec<u8>>,
     pub align: u64,
+    pub relocs: Vec<(usize, Reloc)>,
 }
 
 #[derive(Debug, Clone)]
@@ -68,6 +98,7 @@ impl FnSig {
 pub struct ProgramInfo {
     pub structs: Vec<StructLayout>,
     pub enums: Vec<EnumInfo>,
+    pub sums: Vec<SumLayout>,
     pub statics: Vec<StaticInfo>,
     pub functions: HashMap<String, FnSig>,
     pub skip_functions: HashSet<String>,
@@ -84,6 +115,7 @@ impl ProgramInfo {
             Type::Array(e, n) => self.size_of(e) * n,
             Type::Struct(id) => self.structs[*id].size,
             Type::Enum(id) => self.enums[*id].repr.size(),
+            Type::Sum(id) => self.sums[*id].size,
         }
     }
 
@@ -94,6 +126,7 @@ impl ProgramInfo {
             Type::Array(e, _) => self.align_of(e),
             Type::Struct(id) => self.structs[*id].align,
             Type::Enum(id) => self.enums[*id].repr.size(),
+            Type::Sum(id) => self.sums[*id].align,
             _ => 8,
         }
     }
@@ -139,7 +172,7 @@ struct ConstSlot {
 }
 
 #[derive(Clone)]
-struct Local {
+pub(crate) struct Local {
     r#type: Type,
     mutable: bool,
     origin: u8,
@@ -151,6 +184,7 @@ struct FnCtx {
     ret: Option<Type>,
     trusted: bool,
     loops: Vec<bool>,
+    self_type: Option<Type>,
 }
 
 pub struct TypeChecker {
@@ -160,6 +194,9 @@ pub struct TypeChecker {
     enum_ids: HashMap<String, usize>,
     enum_defs: Vec<EnumDef>,
     enums: Vec<State<EnumInfo>>,
+    sum_ids: HashMap<String, usize>,
+    sum_defs: Vec<EnumDef>,
+    sums: Vec<State<SumLayout>>,
     consts: HashMap<String, ConstSlot>,
     statics: Vec<StaticInfo>,
     static_ids: HashMap<String, usize>,
@@ -170,6 +207,19 @@ pub struct TypeChecker {
     used_accessors: HashSet<String>,
     files: Vec<String>,
     ctx: FnCtx,
+    traits: HashMap<String, TraitDef>,
+    modules: HashSet<String>,
+    struct_tpls: HashMap<String, StructDef>,
+    sum_tpls: HashMap<String, EnumDef>,
+    fn_tpls: HashMap<String, Function>,
+    impl_tpls: Vec<ImplDef>,
+    struct_inst: HashMap<(String, Vec<Type>), usize>,
+    sum_inst: HashMap<(String, Vec<Type>), usize>,
+    instance_of: HashMap<Type, (String, Vec<Type>)>,
+    fn_self: HashMap<String, Type>,
+    pending: Vec<Function>,
+    instances: usize,
+    unmet_bound: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -187,6 +237,9 @@ impl TypeChecker {
             enum_ids: HashMap::new(),
             enum_defs: Vec::new(),
             enums: Vec::new(),
+            sum_ids: HashMap::new(),
+            sum_defs: Vec::new(),
+            sums: Vec::new(),
             consts: HashMap::new(),
             statics: Vec::new(),
             static_ids: HashMap::new(),
@@ -197,6 +250,19 @@ impl TypeChecker {
             used_accessors: HashSet::new(),
             files: Vec::new(),
             ctx: FnCtx::default(),
+            traits: HashMap::new(),
+            modules: HashSet::new(),
+            struct_tpls: HashMap::new(),
+            sum_tpls: HashMap::new(),
+            fn_tpls: HashMap::new(),
+            impl_tpls: Vec::new(),
+            struct_inst: HashMap::new(),
+            sum_inst: HashMap::new(),
+            instance_of: HashMap::new(),
+            fn_self: HashMap::new(),
+            pending: Vec::new(),
+            instances: 0,
+            unmet_bound: None,
         }
     }
 
@@ -221,7 +287,7 @@ impl TypeChecker {
         let full = base.join(&rel);
         let full_str = full.to_string_lossy().to_string();
         if name == "include_bytes" {
-            return match std::fs::read(&full) {
+            return match read(&full) {
                 Ok(bytes) => Ok(ExprKind::Bytes(bytes)),
                 Err(e) => self.err(format!("cannot read {full_str}: {e}"), arg.span),
             };
@@ -245,9 +311,16 @@ impl TypeChecker {
     }
 
     pub fn check_program(&mut self, program: &mut Program) -> TypeResult<ProgramInfo> {
+        resolver::resolve(program)?;
+        self.modules = program.modules.iter().cloned().collect();
+        self.register_traits(std::mem::take(&mut program.traits))?;
         for s in &program.structs {
             if self.type_name_taken(&s.name) {
                 return self.err(format!("type '{}' is already defined", s.name), s.span);
+            }
+            if !s.generics.is_empty() {
+                self.struct_tpls.insert(s.name.clone(), s.clone());
+                continue;
             }
             self.struct_ids
                 .insert(s.name.clone(), self.struct_defs.len());
@@ -257,6 +330,16 @@ impl TypeChecker {
         for e in &program.enums {
             if self.type_name_taken(&e.name) {
                 return self.err(format!("type '{}' is already defined", e.name), e.span);
+            }
+            if !e.generics.is_empty() {
+                self.sum_tpls.insert(e.name.clone(), e.clone());
+                continue;
+            }
+            if e.variants.iter().any(|v| v.fields.is_some()) {
+                self.sum_ids.insert(e.name.clone(), self.sum_defs.len());
+                self.sum_defs.push(e.clone());
+                self.sums.push(State::Todo);
+                continue;
             }
             self.enum_ids.insert(e.name.clone(), self.enum_defs.len());
             self.enum_defs.push(e.clone());
@@ -269,6 +352,7 @@ impl TypeChecker {
                 (Some(te), _) if matches!(te.kind, TypeExprKind::Array(..)) => {
                     self.const_arrays.insert(c.name.clone());
                     program.statics.push(StaticDef {
+                        module: c.module.clone(),
                         name: c.name,
                         mutable: false,
                         r#type: te.clone(),
@@ -310,15 +394,51 @@ impl TypeChecker {
         for eid in 0..self.enum_defs.len() {
             self.ensure_enum(eid)?;
         }
+        for id in 0..self.sum_defs.len() {
+            self.ensure_sum(id)?;
+        }
         let names: Vec<String> = self.consts.keys().cloned().collect();
         for name in names {
             let span = self.consts[&name].def.span;
             self.ensure_const(&name, span)?;
         }
 
+        let (tpls, plain): (Vec<Function>, Vec<Function>) = std::mem::take(&mut program.functions)
+            .into_iter()
+            .partition(|f| !f.generics.is_empty());
+        program.functions = plain;
+        for f in tpls {
+            if self.fn_tpls.contains_key(&f.name) {
+                return self.err(format!("'{}' is already defined", f.name), f.span);
+            }
+            self.fn_tpls.insert(f.name.clone(), f);
+        }
+        self.impl_tpls = std::mem::take(&mut program.impls);
+        for imp in &self.impl_tpls {
+            if let Some(t) = &imp.trait_name {
+                if !self.traits.contains_key(t) {
+                    return self.err(format!("unknown trait '{t}'"), imp.span);
+                }
+            }
+        }
+
         for f in &program.functions {
+            if self.fn_tpls.contains_key(&f.name) {
+                return self.err(format!("'{}' is already defined", f.name), f.span);
+            }
             self.declare_function(f)?;
         }
+        let (lazy, eager): (Vec<Function>, Vec<Function>) = std::mem::take(&mut program.functions)
+            .into_iter()
+            .partition(|f| {
+                self.files
+                    .get(f.span.file)
+                    .is_some_and(|p| p.starts_with("std/"))
+            });
+        program.functions = eager;
+        let mut lazy: HashMap<String, Function> =
+            lazy.into_iter().map(|f| (f.name.clone(), f)).collect();
+        self.check_trait_impls()?;
         match program.functions.iter().find(|f| f.name == "main") {
             None => {
                 return self.err(
@@ -348,6 +468,67 @@ impl TypeChecker {
         for f in &mut program.functions {
             self.check_function(f)?;
         }
+        let mut refs = HashSet::new();
+        for s in &self.statics {
+            for (_, r) in &s.relocs {
+                if let Reloc::Func(n) = r {
+                    refs.insert(n.clone());
+                }
+            }
+        }
+        let mut scanned = 0;
+        loop {
+            while let Some(mut f) = self.pending.pop() {
+                self.check_function(&mut f)?;
+                program.functions.push(f);
+            }
+            for f in &program.functions[scanned..] {
+                lazy::fn_refs(f, &mut refs);
+            }
+            scanned = program.functions.len();
+            let used: Vec<String> = refs
+                .iter()
+                .filter(|n| lazy.contains_key(*n))
+                .cloned()
+                .collect();
+            if used.is_empty() {
+                break;
+            }
+            for n in used {
+                let mut f = lazy.remove(&n).unwrap();
+                self.check_function(&mut f)?;
+                program.functions.push(f);
+            }
+        }
+        let std_statics: HashSet<String> = program
+            .statics
+            .iter()
+            .filter(|s| {
+                self.files
+                    .get(s.span.file)
+                    .is_some_and(|p| p.starts_with("std/"))
+            })
+            .map(|s| s.name.clone())
+            .collect();
+        for s in &self.statics {
+            for (_, r) in &s.relocs {
+                if let Reloc::Static(n) = r {
+                    refs.insert(n.clone());
+                }
+            }
+        }
+        self.statics
+            .retain(|s| !std_statics.contains(&s.name) || refs.contains(&s.name));
+        for sid in 0..self.struct_defs.len() {
+            self.ensure_layout(sid)?;
+        }
+        for id in 0..self.sum_defs.len() {
+            self.ensure_sum(id)?;
+        }
+        for f in &program.functions {
+            self.borrow_check(f)?;
+            self.move_check(f)?;
+        }
 
         let structs = std::mem::take(&mut self.layouts)
             .into_iter()
@@ -363,9 +544,17 @@ impl TypeChecker {
                 _ => unreachable!(),
             })
             .collect();
+        let sums = std::mem::take(&mut self.sums)
+            .into_iter()
+            .map(|s| match s {
+                State::Done(e) => e,
+                _ => unreachable!(),
+            })
+            .collect();
         Ok(ProgramInfo {
             structs,
             enums,
+            sums,
             statics: std::mem::take(&mut self.statics),
             functions: std::mem::take(&mut self.functions),
             skip_functions: self
@@ -420,20 +609,35 @@ impl TypeChecker {
         match t {
             Type::Ref(..) | Type::Slice(..) => true,
             Type::Raw(inner, _) | Type::Array(inner, _) => self.contains_ref(inner),
+            Type::Sum(id) => match &self.sums[*id] {
+                State::Done(l) => l
+                    .variants
+                    .iter()
+                    .any(|v| v.fields.iter().any(|(t, _)| self.contains_ref(t))),
+                _ => false,
+            },
             _ => false,
         }
+    }
+
+    pub(crate) fn carries_ref(&self, t: &Type) -> bool {
+        t.is_ref_like() || (matches!(t, Type::Sum(_)) && self.contains_ref(t))
     }
 
     // Checker
 
     fn type_name_taken(&self, name: &str) -> bool {
         self.struct_ids.contains_key(name)
+            || self.struct_tpls.contains_key(name)
+            || self.sum_tpls.contains_key(name)
             || self.enum_ids.contains_key(name)
+            || self.sum_ids.contains_key(name)
             || self.primitive_type(name).is_some()
     }
 
     fn value_name_taken(&self, name: &str) -> bool {
         self.functions.contains_key(name)
+            || self.fn_tpls.contains_key(name)
             || self.static_ids.contains_key(name)
             || self.consts.contains_key(name)
             || is_builtin(name)
@@ -446,11 +650,43 @@ impl TypeChecker {
         if is_builtin(&f.name) {
             return self.err(format!("'{}' is a built-in function name", f.name), f.span);
         }
-        if let Some((owner, _)) = f.name.split_once("::") {
-            if !self.struct_ids.contains_key(owner) && !self.enum_ids.contains_key(owner) {
-                return self.err(format!("impl for unknown type '{owner}'"), f.span);
-            }
+        let self_type = self.fn_self_type(&f.name, f.span)?;
+        let saved_self = std::mem::replace(&mut self.ctx.self_type, self_type);
+        let r = self.declare_function_sig(f);
+        self.ctx.self_type = saved_self;
+        r
+    }
+
+    fn fn_self_type(&mut self, name: &str, span: Span) -> TypeResult<Option<Type>> {
+        if let Some(t) = self.fn_self.get(name) {
+            return Ok(Some(t.clone()));
         }
+        let Some((owner, last)) = name.rsplit_once("::") else {
+            return Ok(None);
+        };
+        if last.contains(['<', '>', ',', ' ']) || self.modules.contains(owner) {
+            return Ok(None);
+        }
+        if !self.struct_ids.contains_key(owner)
+            && !self.enum_ids.contains_key(owner)
+            && !self.sum_ids.contains_key(owner)
+        {
+            if self.is_template(owner) {
+                return self.err(
+                    format!("'{owner}' is generic: write 'impl<T> {owner}<T> {{ .. }}'"),
+                    span,
+                );
+            }
+            return self.err(format!("impl for unknown type '{owner}'"), span);
+        }
+        let te = TypeExpr {
+            kind: TypeExprKind::Named(owner.to_string()),
+            span,
+        };
+        Ok(Some(self.resolve_type(&te)?))
+    }
+
+    fn declare_function_sig(&mut self, f: &Function) -> TypeResult<()> {
         let mut params = Vec::new();
         for p in &f.params {
             let t = self.resolve_type(&p.r#type)?;
@@ -528,11 +764,11 @@ impl TypeChecker {
                 }
                 ("getter", None) => {
                     self.accessors
-                        .insert(format!("get_{}", s.name), Accessor::Get(s.name.clone()));
+                        .insert(accessor_name("get", &s.name), Accessor::Get(s.name.clone()));
                 }
                 ("setter", None) if s.mutable => {
                     self.accessors
-                        .insert(format!("set_{}", s.name), Accessor::Set(s.name.clone()));
+                        .insert(accessor_name("set", &s.name), Accessor::Set(s.name.clone()));
                 }
                 ("setter", None) => {
                     return self.err(
@@ -550,6 +786,7 @@ impl TypeChecker {
             }
         }
         let size = self.size_of(&r#type)?;
+        let mut relocs = Vec::new();
         let init = match &mut s.init {
             None => None,
             Some(e) => {
@@ -558,8 +795,8 @@ impl TypeChecker {
                 self.ctx = saved;
                 r?;
                 let mut bytes = vec![0u8; size as usize];
-                self.const_bytes(e, &mut bytes, 0)?;
-                if bytes.iter().all(|&b| b == 0) {
+                self.const_bytes(e, &mut bytes, 0, &mut relocs)?;
+                if bytes.iter().all(|&b| b == 0) && relocs.is_empty() {
                     None
                 } else {
                     Some(bytes)
@@ -573,6 +810,7 @@ impl TypeChecker {
             mutable: s.mutable,
             init,
             align,
+            relocs,
         });
         Ok(())
     }
@@ -595,6 +833,7 @@ impl TypeChecker {
             Type::Array(t, n) => format!("[{}; {n}]", self.type_name(t)),
             Type::Struct(id) => self.struct_defs[*id].name.clone(),
             Type::Enum(id) => self.enum_defs[*id].name.clone(),
+            Type::Sum(id) => self.sum_defs[*id].name.clone(),
             Type::Fn(f) => {
                 let params: Vec<_> = f.params.iter().map(|p| self.type_name(p)).collect();
                 let prefix = match f.abi {
@@ -618,6 +857,24 @@ impl TypeChecker {
     fn resolve_type(&mut self, te: &TypeExpr) -> TypeResult<Type> {
         Ok(match &te.kind {
             TypeExprKind::Unit => Type::Unit,
+            TypeExprKind::Resolved(t) => t.clone(),
+            TypeExprKind::Generic(name, args) => {
+                let mut types = Vec::new();
+                for a in args {
+                    types.push(self.resolve_type(a)?);
+                }
+                self.instantiate_type(name, types, te.span)?
+            }
+            TypeExprKind::Named(name) if name == "Self" => match &self.ctx.self_type {
+                Some(t) => t.clone(),
+                None => return self.err("'Self' is only allowed inside an impl", te.span),
+            },
+            TypeExprKind::Named(name) if self.is_template(name) => {
+                return self.err(
+                    format!("'{name}' is generic: give its type arguments ('{name}<...>')"),
+                    te.span,
+                );
+            }
             TypeExprKind::Named(name) => {
                 if let Some(t) = self.primitive_type(name) {
                     t
@@ -625,6 +882,8 @@ impl TypeChecker {
                     Type::Struct(id)
                 } else if let Some(&id) = self.enum_ids.get(name) {
                     Type::Enum(id)
+                } else if let Some(&id) = self.sum_ids.get(name) {
+                    Type::Sum(id)
                 } else {
                     return self.err(format!("unknown type '{name}'"), te.span);
                 }
@@ -679,11 +938,29 @@ impl TypeChecker {
         }
     }
 
-    fn check_storable(&self, t: &Type, allow_top_ref: bool, span: Span) -> TypeResult<()> {
+    fn check_storable(&mut self, t: &Type, allow_top_ref: bool, span: Span) -> TypeResult<()> {
         if *t == Type::Unit {
             return self.err("a value of type () cannot be stored", span);
         }
+        let mut base = t;
+        while let Type::Array(e, _) | Type::Raw(e, _) = base {
+            base = e;
+        }
+        if let Type::Sum(id) = base {
+            self.ensure_sum(*id)?;
+        }
         match t {
+            Type::Sum(_) if self.contains_ref(t) => {
+                if !allow_top_ref {
+                    return self.err(
+                        format!(
+                            "'{}' holds a reference: it cannot be stored in structs, arrays or statics",
+                            self.type_name(t)
+                        ),
+                        span,
+                    );
+                }
+            }
             Type::Ref(inner, _) | Type::Slice(inner, _) => {
                 if !allow_top_ref {
                     return self.err(
@@ -725,7 +1002,7 @@ impl TypeChecker {
         let def = self.struct_defs[sid].clone();
         let packed = has_attr(&def.attrs, "packed");
         for a in &def.attrs {
-            if a.name != "packed" {
+            if a.name != "packed" && a.name != "move" {
                 return self.err(format!("unknown struct attribute '{}'", a.name), a.span);
             }
         }
@@ -823,6 +1100,176 @@ impl TypeChecker {
         Ok(())
     }
 
+    fn ensure_sum(&mut self, id: usize) -> TypeResult<()> {
+        match self.sums[id] {
+            State::Done(_) => return Ok(()),
+            State::Busy => {
+                return self.err(
+                    format!(
+                        "enum '{}' contains itself (use a pointer)",
+                        self.sum_defs[id].name
+                    ),
+                    self.sum_defs[id].span,
+                );
+            }
+            State::Todo => {}
+        }
+        self.sums[id] = State::Busy;
+        let def = self.sum_defs[id].clone();
+        let tag = match &def.repr {
+            None if def.variants.len() <= 256 => IntType::U8,
+            None => IntType::U32,
+            Some(te) => match self.resolve_type(te)? {
+                Type::Int(i) => i,
+                _ => return self.err("enum representation must be an integer type", te.span),
+            },
+        };
+        if (def.variants.len() as i128) > tag.max() + 1 {
+            return self.err(
+                format!("too many variants for a {} tag", tag.name()),
+                def.span,
+            );
+        }
+        let mut payloads: Vec<(String, Vec<Type>)> = Vec::new();
+        for v in &def.variants {
+            if payloads.iter().any(|(n, _)| *n == v.name) {
+                return self.err(format!("variant '{}' declared twice", v.name), v.span);
+            }
+            if let Some(e) = &v.value {
+                return self.err(
+                    "an enum with data cannot set discriminants ('= value')",
+                    e.span,
+                );
+            }
+            let mut types = Vec::new();
+            for te in v.fields.iter().flatten() {
+                let t = self.resolve_type(te)?;
+                self.check_storable(&t, true, te.span)?;
+                if let Type::Ref(inner, _) | Type::Slice(inner, _) = &t {
+                    if self.contains_ref(inner) {
+                        return self.err("references to references are not supported", te.span);
+                    }
+                }
+                if matches!(t, Type::Sum(_)) && self.contains_ref(&t) {
+                    return self.err(
+                        format!(
+                            "'{}' holds a reference: it cannot be the payload of another enum",
+                            self.type_name(&t)
+                        ),
+                        te.span,
+                    );
+                }
+                types.push(t);
+            }
+            payloads.push((v.name.clone(), types));
+        }
+
+        let nonnull = |t: &Type| matches!(t, Type::Ref(..) | Type::Slice(..) | Type::Str);
+        let niche = if payloads.len() == 2 {
+            match (&payloads[0].1[..], &payloads[1].1[..]) {
+                ([], [t]) if nonnull(t) => Some(0),
+                ([t], []) if nonnull(t) => Some(1),
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        let mut variants = Vec::new();
+        let (size, align) = if let Some(empty) = niche {
+            for (i, (name, types)) in payloads.into_iter().enumerate() {
+                let fields = types.into_iter().map(|t| (t, 0)).collect();
+                variants.push(VariantLayout {
+                    name,
+                    tag: (i != empty) as i128,
+                    fields,
+                });
+            }
+            let full = &variants[1 - empty].fields[0].0.clone();
+            (self.size_of(full)?, 8)
+        } else {
+            let mut size = tag.size();
+            let mut align = tag.size();
+            for (i, (name, types)) in payloads.into_iter().enumerate() {
+                let mut off = tag.size();
+                let mut fields = Vec::new();
+                for t in types {
+                    let a = self.align_of(&t)?;
+                    off = off.next_multiple_of(a);
+                    fields.push((t.clone(), off));
+                    off += self.size_of(&t)?;
+                    align = align.max(a);
+                }
+                size = size.max(off);
+                variants.push(VariantLayout {
+                    name,
+                    tag: i as i128,
+                    fields,
+                });
+            }
+            (size.next_multiple_of(align), align)
+        };
+        self.sums[id] = State::Done(SumLayout {
+            name: def.name,
+            tag,
+            niche,
+            variants,
+            size,
+            align,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn variant_index(&mut self, id: usize, name: &str) -> Option<usize> {
+        self.sum_defs[id]
+            .variants
+            .iter()
+            .position(|v| v.name == name)
+    }
+
+    fn build_variant(
+        &mut self,
+        id: usize,
+        vi: usize,
+        mut args: Vec<Expr>,
+        span: Span,
+    ) -> TypeResult<(ExprKind, Type)> {
+        self.ensure_sum(id)?;
+        let v = self.sum_layout(id).variants[vi].clone();
+        let full = format!("{}::{}", self.sum_layout(id).name, v.name);
+        if v.fields.is_empty() && !args.is_empty() {
+            return self.err(format!("'{full}' has no data (write '{full}')"), span);
+        }
+        if v.fields.len() != args.len() {
+            return self.err(
+                format!(
+                    "'{full}' expects {} value(s), got {}",
+                    v.fields.len(),
+                    args.len()
+                ),
+                span,
+            );
+        }
+        for ((t, _), a) in v.fields.iter().zip(args.iter_mut()) {
+            self.coerce(a, t)?;
+        }
+        Ok((
+            ExprKind::VariantLit {
+                sum: id,
+                variant: vi,
+                args,
+            },
+            Type::Sum(id),
+        ))
+    }
+
+    pub(crate) fn sum_layout(&self, id: usize) -> &SumLayout {
+        match &self.sums[id] {
+            State::Done(l) => l,
+            _ => panic!("ICE: enum layout not computed"),
+        }
+    }
+
     fn enum_info(&self, eid: usize) -> &EnumInfo {
         match &self.enums[eid] {
             State::Done(e) => e,
@@ -890,6 +1337,10 @@ impl TypeChecker {
                 self.ensure_enum(*id)?;
                 self.enum_info(*id).repr.size()
             }
+            Type::Sum(id) => {
+                self.ensure_sum(*id)?;
+                self.sum_layout(*id).size
+            }
         })
     }
 
@@ -905,6 +1356,10 @@ impl TypeChecker {
             Type::Enum(id) => {
                 self.ensure_enum(*id)?;
                 self.enum_info(*id).repr.size()
+            }
+            Type::Sum(id) => {
+                self.ensure_sum(*id)?;
+                self.sum_layout(*id).align
             }
             _ => 8,
         })
@@ -952,7 +1407,7 @@ impl TypeChecker {
             let local = Local {
                 r#type: r#type.clone(),
                 mutable: param.mutable,
-                origin: if r#type.is_ref_like() { 2u8 } else { 0 },
+                origin: if self.carries_ref(r#type) { 2u8 } else { 0 },
             };
             if frame.insert(param.name.clone(), local).is_some() {
                 return self.err(
@@ -961,11 +1416,13 @@ impl TypeChecker {
                 );
             }
         }
+        let self_type = self.fn_self_type(&f.name, f.span)?;
         self.ctx = FnCtx {
             scopes: vec![frame],
             ret: Some(sig.ret.clone()),
             trusted: self.fn_trusted(&f.name),
             loops: Vec::new(),
+            self_type,
         };
         let diverges = self.check_block(&mut f.body)?;
         self.ctx = FnCtx::default();
@@ -1003,7 +1460,11 @@ impl TypeChecker {
             if i + 1 == n {
                 if let Stmt::Expr(e) = stmt {
                     let t = self.check_expr(e, last_hint)?;
-                    let o = if t.is_ref_like() { self.origin(e) } else { 0 };
+                    let o = if self.carries_ref(&t) {
+                        self.origin(e)
+                    } else {
+                        0
+                    };
                     diverges |= self.expr_diverges(e);
                     last = (t, o);
                     continue;
@@ -1095,7 +1556,7 @@ impl TypeChecker {
                     (None, None) => unreachable!("parser requires a type or a value"),
                 };
                 let origin = match value {
-                    Some(v) if t.is_ref_like() => self.origin(v),
+                    Some(v) if self.carries_ref(&t) => self.origin(v),
                     _ => 0,
                 };
                 *r#type = Some(t.clone());
@@ -1139,7 +1600,7 @@ impl TypeChecker {
                         self.binary_result(*op, &tt, &vt, value, *span)?;
                     }
                 }
-                if tt.is_ref_like() {
+                if self.carries_ref(&tt) {
                     let o = self.origin(value);
                     if let ExprKind::Var(n) = &target.kind {
                         let n = n.clone();
@@ -1159,7 +1620,7 @@ impl TypeChecker {
                 match value {
                     Some(e) => {
                         self.coerce(e, &ret)?;
-                        if ret.is_ref_like() && self.origin(e) & 1u8 != 0 {
+                        if self.carries_ref(&ret) && self.origin(e) & 1u8 != 0 {
                             return self.err(
                                 "cannot return a reference to a local variable (it is freed when the function returns)",
                                 e.span,
@@ -1253,50 +1714,18 @@ impl TypeChecker {
                 Ok(true)
             }
             Stmt::Match {
-                scrutinee,
-                arms,
-                span,
-            } => {
-                let st = self.check_expr(scrutinee, None)?;
-                if !matches!(st, Type::Int(_) | Type::Enum(_) | Type::Bool) {
-                    return self.err(
-                        format!("cannot match on a value of type {}", self.type_name(&st)),
-                        scrutinee.span,
-                    );
-                }
-                let mut seen: Vec<i128> = Vec::new();
-                let mut has_wildcard = false;
-                let mut all_diverge = true;
-                for arm in arms.iter_mut() {
-                    match &mut arm.patterns {
-                        None => {
-                            if has_wildcard {
-                                return self.err("'_' appears twice", arm.span);
-                            }
-                            has_wildcard = true;
-                        }
-                        Some(pats) => {
-                            for p in pats.iter_mut() {
-                                self.coerce(p, &st)?;
-                                let Some(v) = self.const_eval(p)? else {
-                                    return self.err("match patterns must be constants", p.span);
-                                };
-                                if seen.contains(&v) {
-                                    return self.err("this pattern is already covered", p.span);
-                                }
-                                seen.push(v);
-                                p.kind = ExprKind::Int(v);
-                            }
-                        }
-                    }
-                    all_diverge &= self.check_block(&mut arm.body)?;
-                }
-                let exhaustive = has_wildcard
-                    || (st == Type::Bool && seen.len() == 2)
-                    || matches!(st, Type::Enum(id) if self.enum_info(id).variants.iter().all(|(_, v)| seen.contains(v)));
-                let _ = span;
-                Ok(exhaustive && all_diverge && !arms.is_empty())
-            }
+                scrutinee, arms, ..
+            } => self.check_match(scrutinee, arms),
+            Stmt::IfLet {
+                pat,
+                value,
+                then_block,
+                else_block,
+                ..
+            } => self.check_if_let(pat, value, then_block, else_block),
+            Stmt::WhileLet {
+                pat, value, body, ..
+            } => self.check_while_let(pat, value, body),
             Stmt::Block(b) => self.check_block(b),
         }
     }
@@ -1315,7 +1744,7 @@ impl TypeChecker {
         match &e.kind {
             ExprKind::Var(n) => {
                 if let Some(l) = self.lookup_local(n) {
-                    if l.mutable || eq(e, top) {
+                    if l.mutable || std::ptr::eq(e, top) {
                         return None;
                     }
                     return Some(format!(
@@ -1330,7 +1759,7 @@ impl TypeChecker {
                     Some(format!("cannot {verb} constant '{n}'{suffix}"))
                 } else {
                     Some(format!(
-                        "cannot {verb} immutable static '{n}'{suffix} (declare is 'static mut')"
+                        "cannot {verb} immutable static '{n}'{suffix} (declare it 'static mut')"
                     ))
                 }
             }
@@ -1388,7 +1817,15 @@ impl TypeChecker {
             ExprKind::Call { args, .. } => {
                 let o = args
                     .iter()
-                    .filter(|a| a.r#type().is_ref_like())
+                    .filter(|a| self.carries_ref(a.r#type()))
+                    .fold(0, |acc, a| acc | self.origin(a));
+                if o == 0 { 4u8 } else { o }
+            }
+            ExprKind::TryOp { inner, .. } => self.origin(inner),
+            ExprKind::VariantLit { args, .. } => {
+                let o = args
+                    .iter()
+                    .filter(|a| self.carries_ref(a.r#type()))
                     .fold(0, |acc, a| acc | self.origin(a));
                 if o == 0 { 4u8 } else { o }
             }
@@ -1498,9 +1935,7 @@ impl TypeChecker {
 
     pub fn check_expr(&mut self, e: &mut Expr, expected: Option<&Type>) -> TypeResult<Type> {
         if let Some(t) = &e.r#type {
-            if matches!(e.kind, ExprKind::Unsize(_)) {
-                return Ok(t.clone());
-            }
+            return Ok(t.clone());
         }
         let span = e.span;
         let kind = std::mem::replace(&mut e.kind, ExprKind::Bool(false));
@@ -1539,6 +1974,7 @@ impl TypeChecker {
             ExprKind::Bytes(b) => Ok((ExprKind::Bytes(b), Type::Str)),
             ExprKind::CStr(s) => Ok((ExprKind::CStr(s), Type::raw(Type::U8, false))),
             ExprKind::WStr(s) => Ok((ExprKind::WStr(s), Type::raw(Type::Int(IntType::U16), false))),
+
             ExprKind::Var(name) => {
                 if let Some(l) = self.lookup_local(&name) {
                     let t = l.r#type.clone();
@@ -1565,11 +2001,63 @@ impl TypeChecker {
                     }
                     return Ok((ExprKind::Var(name), t));
                 }
+                if let Some(owner) = self.prelude_variant(&name) {
+                    return self.infer_assoc_call(owner, &name, Vec::new(), expected, span);
+                }
                 if is_builtin(&name) {
                     return self.err(format!("built-in '{name}' can only be called"), span);
                 }
+                if self.fn_tpls.contains_key(&name) {
+                    return self.err(
+                        format!(
+                            "'{name}' is generic: call it, or name an instance ('{name}::<...>')"
+                        ),
+                        span,
+                    );
+                }
+                if name.starts_with("psy_") {
+                    return self.err(
+                        format!(
+                            "unknown variable '{name}': this target has no heap for Box/Vec/String (define psy_alloc, psy_free, psy_generation and psy_capacity)"
+                        ),
+                        span,
+                    );
+                }
                 self.err(format!("unknown variable '{name}'"), span)
             }
+
+            ExprKind::Turbofish { .. } | ExprKind::TypePath { .. } => {
+                self.type_path(kind, None, expected, span)
+            }
+
+            ExprKind::Path(owner, member)
+                if owner == "Self"
+                    || self.is_template(&owner)
+                    || (self.type_name_taken(&owner)
+                        && !self.enum_ids.contains_key(&owner)
+                        && !self.sum_ids.contains_key(&owner)
+                        && !self.functions.contains_key(&format!("{owner}::{member}"))) =>
+            {
+                if self.is_template(&owner) {
+                    if let Some(tpl) = self.sum_tpls.get(&owner) {
+                        if tpl.variants.iter().any(|v| v.name == member) {
+                            return self.infer_assoc_call(
+                                &owner,
+                                &member,
+                                Vec::new(),
+                                expected,
+                                span,
+                            );
+                        }
+                    }
+                    return self.err(
+                        format!("'{owner}' is generic: write '{owner}::<...>::{member}'"),
+                        span,
+                    );
+                }
+                self.path_member(owner, member, None, expected, span)
+            }
+
             ExprKind::Path(owner, member) => {
                 if let Some(&eid) = self.enum_ids.get(&owner) {
                     self.ensure_enum(eid)?;
@@ -1582,6 +2070,11 @@ impl TypeChecker {
                         return Ok((ExprKind::Int(*v), Type::Enum(eid)));
                     }
                 }
+                if let Some(&id) = self.sum_ids.get(&owner) {
+                    if let Some(vi) = self.variant_index(id, &member) {
+                        return self.build_variant(id, vi, Vec::new(), span);
+                    }
+                }
                 let full = format!("{owner}::{member}");
                 if let Some(sig) = self.functions.get(&full) {
                     let t = sig.fn_type();
@@ -1589,9 +2082,16 @@ impl TypeChecker {
                 }
                 self.err(format!("'{full}' is not a variant or a function"), span)
             }
+
+            ExprKind::VariantLit { sum, .. } => Ok((kind, Type::Sum(sum))),
+
+            ExprKind::Try(inner) => self.check_try(*inner, span),
+            ExprKind::TryOp { .. } => unreachable!("checked once"),
+
             ExprKind::Unary { op, mut operand } => {
                 self.check_unary(op, &mut operand, span, expected)
             }
+
             ExprKind::Binary {
                 op,
                 mut lhs,
@@ -1619,6 +2119,7 @@ impl TypeChecker {
                 };
                 Ok((ExprKind::Binary { op, lhs, rhs }, r#type))
             }
+
             ExprKind::Cast { mut expr, r#type } => {
                 let to = self.resolve_type(&r#type)?;
                 let from = self.check_expr(&mut expr, None)?;
@@ -1637,11 +2138,13 @@ impl TypeChecker {
                 }
                 Ok((ExprKind::Cast { expr, r#type }, to))
             }
+
             ExprKind::Call {
                 callee,
                 args,
                 target: _,
-            } => self.check_call(*callee, args, span),
+            } => self.check_call(*callee, args, span, expected),
+
             ExprKind::Field { base, name } => {
                 let mut base = *base;
                 self.check_expr(&mut base, None)?;
@@ -1654,6 +2157,7 @@ impl TypeChecker {
                     r#type,
                 ))
             }
+
             ExprKind::Index { base, mut index } => {
                 let mut base = *base;
                 self.check_expr(&mut base, None)?;
@@ -1690,14 +2194,20 @@ impl TypeChecker {
                     elem,
                 ))
             }
+
             ExprKind::Range { .. } => self.err(
                 "slicing needs a reference: write '&a[i..j]' or '&mut a[i..j]'",
                 span,
             ),
-            ExprKind::StructLit { name, mut fields } => {
-                let Some(&sid) = self.struct_ids.get(&name) else {
-                    return self.err(format!("unknown struct '{name}'"), span);
-                };
+
+            ExprKind::StructLit {
+                name,
+                args,
+                mut fields,
+            } => {
+                let sid = self.struct_lit_type(&name, &args, &mut fields, expected, span)?;
+                let name = self.struct_defs[sid].name.clone();
+                self.ensure_layout(sid)?;
                 let layout = self.layout(sid).clone();
                 let mut seen: Vec<String> = Vec::new();
                 for (fname, value, fspan) in fields.iter_mut() {
@@ -1722,8 +2232,16 @@ impl TypeChecker {
                         span,
                     );
                 }
-                Ok((ExprKind::StructLit { name, fields }, Type::Struct(sid)))
+                Ok((
+                    ExprKind::StructLit {
+                        name,
+                        args: Vec::new(),
+                        fields,
+                    },
+                    Type::Struct(sid),
+                ))
             }
+
             ExprKind::ArrayLit(mut items) => {
                 let elem_hint = match expected {
                     Some(Type::Array(t, _)) => Some((**t).clone()),
@@ -1749,6 +2267,7 @@ impl TypeChecker {
                 let n = items.len() as u64;
                 Ok((ExprKind::ArrayLit(items), Type::Array(Box::new(elem), n)))
             }
+
             ExprKind::ArrayRepeat {
                 mut value,
                 mut count,
@@ -1768,13 +2287,173 @@ impl TypeChecker {
                     Type::Array(Box::new(elem), n),
                 ))
             }
+
             ExprKind::Sizeof(te) => {
                 let t = self.resolve_type(&te)?;
                 let size = self.size_of(&t)?;
                 Ok((ExprKind::Int(size as i128), Type::USIZE))
             }
+
             ExprKind::Unsize(_) => unreachable!("handled in check_expr"),
         }
+    }
+
+    fn struct_lit_type(
+        &mut self,
+        name: &str,
+        args: &[TypeExpr],
+        fields: &mut [(String, Expr, Span)],
+        expected: Option<&Type>,
+        span: Span,
+    ) -> TypeResult<usize> {
+        if name == "Self" {
+            return match &self.ctx.self_type {
+                Some(Type::Struct(id)) => Ok(*id),
+                Some(t) => self.err(
+                    format!("'Self' is {}, not a struct", self.type_name(t)),
+                    span,
+                ),
+                None => self.err("'Self' is only allowed inside an impl", span),
+            };
+        }
+        if !self.struct_tpls.contains_key(name) {
+            if !args.is_empty() {
+                return self.err(format!("'{name}' takes no type arguments"), span);
+            }
+            return match self.struct_ids.get(name) {
+                Some(&sid) => Ok(sid),
+                None => self.err(format!("unknown struct '{name}'"), span),
+            };
+        }
+        if !args.is_empty() {
+            let mut types = Vec::new();
+            for a in args {
+                types.push(self.resolve_type(a)?);
+            }
+            return self.instantiate_struct(name, types, span);
+        }
+        if let Some(t @ Type::Struct(_)) = expected {
+            if let Some((tn, _)) = self.instance_of.get(t) {
+                if tn == name {
+                    let Type::Struct(id) = t else { unreachable!() };
+                    return Ok(*id);
+                }
+            }
+        }
+        let tpl = self.struct_tpls[name].clone();
+        let params: Vec<String> = tpl.generics.iter().map(|g| g.name.clone()).collect();
+        let mut subst = HashMap::new();
+        for flexible_pass in [false, true] {
+            for (fname, value, _) in fields.iter_mut() {
+                let Some(fd) = tpl.fields.iter().find(|f| f.name == *fname) else {
+                    continue;
+                };
+                if self.is_flexible(value) != flexible_pass {
+                    continue;
+                }
+                if flexible_pass {
+                    if let Some(t) = self.try_resolve_pub(&fd.r#type, &params, &subst)? {
+                        self.coerce(value, &t)?;
+                        continue;
+                    }
+                }
+                let t = self.check_expr(value, None)?;
+                self.unify(&fd.r#type, &t, &params, &mut subst);
+            }
+        }
+        if let Some(p) = params.iter().find(|p| !subst.contains_key(*p)) {
+            return self.err(
+                format!("cannot infer the type parameter '{p}' of '{name}' (write '{name}::<...> {{ .. }}')"),
+                span,
+            );
+        }
+        let types: Vec<Type> = params.iter().map(|p| subst[p].clone()).collect();
+        self.instantiate_struct(name, types, span)
+    }
+
+    fn prelude_variant(&self, name: &str) -> Option<&'static str> {
+        let owner = match name {
+            "Some" | "None" => "Option",
+            "Ok" | "Err" => "Result",
+            _ => return None,
+        };
+        if self.lookup_local(name).is_some()
+            || self.functions.contains_key(name)
+            || self.static_ids.contains_key(name)
+            || self.consts.contains_key(name)
+            || !self.sum_tpls.contains_key(owner)
+        {
+            return None;
+        }
+        Some(owner)
+    }
+
+    fn check_try(&mut self, mut inner: Expr, span: Span) -> TypeResult<(ExprKind, Type)> {
+        let t = self.check_expr(&mut inner, None)?;
+        let kind_of = |tc: &Self, t: &Type| -> Option<(String, Vec<Type>)> {
+            tc.instance_of
+                .get(t)
+                .filter(|(n, _)| n == "Option" || n == "Result")
+                .cloned()
+        };
+        let Some((tpl, targs)) = kind_of(self, &t) else {
+            return self.err(
+                format!(
+                    "'?' needs an Option or a Result, found {}",
+                    self.type_name(&t)
+                ),
+                span,
+            );
+        };
+        let ret = self.ctx.ret.clone().unwrap_or(Type::Unit);
+        let rkind = kind_of(self, &ret);
+        let Some((rtpl, rargs)) = rkind.filter(|(n, _)| *n == tpl) else {
+            return self.err(
+                format!(
+                    "'?' on {} returns early: the function must return {} (it returns {})",
+                    self.type_name(&t),
+                    if tpl == "Option" {
+                        "an Option"
+                    } else {
+                        "a Result"
+                    },
+                    self.type_name(&ret)
+                ),
+                span,
+            );
+        };
+        if rtpl == "Result" && rargs[1] != targs[1] {
+            return self.err(
+                format!(
+                    "'?' cannot pass a {} error to a function whose error type is {}",
+                    self.type_name(&targs[1]),
+                    self.type_name(&rargs[1])
+                ),
+                span,
+            );
+        }
+        let (Type::Sum(id), Type::Sum(rid)) = (&t, &ret) else {
+            unreachable!()
+        };
+        let (ok_name, fail_name) = if tpl == "Option" {
+            ("Some", "None")
+        } else {
+            ("Ok", "Err")
+        };
+        let ok = self.variant_index(*id, ok_name).unwrap();
+        let fail = self.variant_index(*id, fail_name).unwrap();
+        let ret_fail = self.variant_index(*rid, fail_name).unwrap();
+        let value = self.sum_layout(*id).variants[ok].fields[0].0.clone();
+        Ok((
+            ExprKind::TryOp {
+                inner: Box::new(inner),
+                ok,
+                fail,
+                ret_sum: *rid,
+                ret_fail,
+            },
+            value,
+        ))
     }
 
     fn auto_deref(&self, base: Expr) -> Expr {
@@ -2092,6 +2771,14 @@ impl TypeChecker {
                     )
                 {
                     Ok(Type::Bool)
+                } else if lt == rt && matches!(lt, Type::Sum(_)) {
+                    self.err(
+                        format!(
+                            "cannot compare two {} values; use 'match' or 'if let'",
+                            self.type_name(lt)
+                        ),
+                        span,
+                    )
                 } else if lt == rt && lt.is_ref_like() {
                     self.err(
                         "cannot compare references; compare the values with '*a == *b'",
@@ -2139,12 +2826,48 @@ impl TypeChecker {
         mut callee: Expr,
         mut args: Vec<Expr>,
         span: Span,
+        expected: Option<&Type>,
     ) -> TypeResult<(ExprKind, Type)> {
         if let ExprKind::Field { .. } = callee.kind {
             let ExprKind::Field { base, name } = callee.kind else {
                 unreachable!()
             };
-            return self.check_method_call(*base, name, args, span);
+            return self.check_method_call(*base, name, args, span, expected);
+        }
+
+        if let ExprKind::Var(ref name) = callee.kind {
+            if let Some(owner) = self.prelude_variant(name) {
+                let name = name.clone();
+                return self.infer_assoc_call(owner, &name, args, expected, span);
+            }
+        }
+
+        match callee.kind {
+            ExprKind::Var(ref name)
+                if self.lookup_local(name).is_none() && self.fn_tpls.contains_key(name) =>
+            {
+                let name = name.clone();
+                return self.generic_call(&name, Vec::new(), args, expected, span);
+            }
+            ExprKind::Turbofish { .. } | ExprKind::TypePath { .. } => {
+                return self.type_path(callee.kind, Some(args), expected, span);
+            }
+            ExprKind::Path(ref owner, ref member) if !self.sum_ids.contains_key(owner) => {
+                let full = format!("{owner}::{member}");
+                if !self.functions.contains_key(&full) && !self.fn_tpls.contains_key(&full) {
+                    return self.path_member(
+                        owner.clone(),
+                        member.clone(),
+                        Some(args),
+                        expected,
+                        span,
+                    );
+                }
+                if self.fn_tpls.contains_key(&full) {
+                    return self.generic_call(&full, Vec::new(), args, expected, span);
+                }
+            }
+            _ => {}
         }
 
         if let ExprKind::Var(name) = &callee.kind {
@@ -2170,6 +2893,14 @@ impl TypeChecker {
             }
         }
 
+        if let ExprKind::Path(owner, member) = &callee.kind {
+            if let Some(&id) = self.sum_ids.get(owner) {
+                if let Some(vi) = self.variant_index(id, member) {
+                    return self.build_variant(id, vi, args, span);
+                }
+            }
+        }
+
         if let ExprKind::Var(name) = &callee.kind {
             if self.lookup_local(name).is_none() {
                 if let Some(Accessor::Get(st)) = self.accessors.get(name) {
@@ -2181,7 +2912,6 @@ impl TypeChecker {
                 }
             }
         }
-
         let ct = self.check_expr(&mut callee, None)?;
         let direct = match &callee.kind {
             ExprKind::Var(n)
@@ -2235,13 +2965,118 @@ impl TypeChecker {
         Ok(())
     }
 
+    fn path_member(
+        &mut self,
+        owner: String,
+        member: String,
+        args: Option<Vec<Expr>>,
+        expected: Option<&Type>,
+        span: Span,
+    ) -> TypeResult<(ExprKind, Type)> {
+        if owner == "Self" {
+            let Some(t) = self.ctx.self_type.clone() else {
+                return self.err("'Self' is only allowed inside an impl", span);
+            };
+            return self.type_member(t, &member, Vec::new(), args, expected, span);
+        }
+        if self.is_template(&owner) {
+            return self.infer_assoc_call(
+                &owner,
+                &member,
+                args.unwrap_or_default(),
+                expected,
+                span,
+            );
+        }
+        if self.type_name_taken(&owner) {
+            let te = TypeExpr {
+                kind: TypeExprKind::Named(owner),
+                span,
+            };
+            let t = self.resolve_type(&te)?;
+            return self.type_member(t, &member, Vec::new(), args, expected, span);
+        }
+        self.err(
+            format!("'{owner}::{member}' is not a variant or a function"),
+            span,
+        )
+    }
+
+    fn type_path(
+        &mut self,
+        kind: ExprKind,
+        args: Option<Vec<Expr>>,
+        expected: Option<&Type>,
+        span: Span,
+    ) -> TypeResult<(ExprKind, Type)> {
+        match kind {
+            ExprKind::Turbofish {
+                owner,
+                owner_args,
+                member,
+                member_args,
+            } => {
+                let mut oargs = Vec::new();
+                for a in &owner_args {
+                    oargs.push(self.resolve_type(a)?);
+                }
+                let mut margs = Vec::new();
+                for a in &member_args {
+                    margs.push(self.resolve_type(a)?);
+                }
+                match member {
+                    None => {
+                        if !self.fn_tpls.contains_key(&owner) {
+                            return self.err(format!("'{owner}' is not a generic function"), span);
+                        }
+                        match args {
+                            Some(args) => self.generic_call(&owner, oargs, args, expected, span),
+                            None => {
+                                let f = self.instantiate_fn(&owner, oargs, span)?;
+                                let t = self.functions[&f].fn_type();
+                                Ok((ExprKind::Var(f), t))
+                            }
+                        }
+                    }
+                    Some(m) => {
+                        let ty = if oargs.is_empty() {
+                            let te = TypeExpr {
+                                kind: TypeExprKind::Named(owner),
+                                span,
+                            };
+                            self.resolve_type(&te)?
+                        } else {
+                            self.instantiate_type(&owner, oargs, span)?
+                        };
+                        self.type_member(ty, &m, margs, args, expected, span)
+                    }
+                }
+            }
+            ExprKind::TypePath {
+                ty,
+                member,
+                member_args,
+            } => {
+                let t = self.resolve_type(&ty)?;
+                let mut margs = Vec::new();
+                for a in &member_args {
+                    margs.push(self.resolve_type(a)?);
+                }
+                self.type_member(t, &member, margs, args, expected, span)
+            }
+            _ => unreachable!(),
+        }
+    }
+
     fn check_method_call(
         &mut self,
         mut base: Expr,
         name: String,
         mut args: Vec<Expr>,
         span: Span,
+        expected: Option<&Type>,
     ) -> TypeResult<(ExprKind, Type)> {
+        self.unmet_bound = None;
         if let ExprKind::Range { .. } = base.kind {
             let bspan = base.span;
             base = Expr::new(
@@ -2281,13 +3116,30 @@ impl TypeChecker {
             }
         }
 
-        let owner = match &target_ty {
-            Type::Struct(id) => Some(self.struct_defs[*id].name.clone()),
-            Type::Enum(id) => Some(self.enum_defs[*id].name.clone()),
-            _ => None,
-        };
-        if let Some(owner) = owner {
-            let full = format!("{owner}::{name}");
+        let owner = self.type_name(&target_ty);
+        {
+            let mut full = format!("{owner}::{name}");
+            if !self.functions.contains_key(&full) && !self.fn_tpls.contains_key(&full) {
+                if let Some(f) = self.instantiate_method(&target_ty, &name, span)? {
+                    full = f;
+                }
+            }
+            if self.fn_tpls.contains_key(&full) {
+                let tpl = self.fn_tpls[&full].clone();
+                let Some(first) = tpl.params.first() else {
+                    return self.err(
+                        format!("'{full}' has no 'self' parameter; call it as '{full}(...)'"),
+                        span,
+                    );
+                };
+                let saved_self = self.ctx.self_type.clone();
+                self.ctx.self_type = self.fn_self.get(&full).cloned();
+                let recv_ty = self.resolve_type(&first.r#type);
+                self.ctx.self_type = saved_self;
+                let recv = self.adjust_receiver(base, &bt, &recv_ty?, &full, span)?;
+                args.insert(0, recv);
+                return self.generic_call(&full, Vec::new(), args, expected, span);
+            }
             if let Some(sig) = self.functions.get(&full).cloned() {
                 let Some(recv_ty) = sig.params.first() else {
                     return self.err(
@@ -2502,8 +3354,14 @@ impl TypeChecker {
                 Type::Unit
             }
             _ => {
+                let unmet = self.unmet_bound.take();
                 return self.err(
-                    format!("no method '{name}' on type {}", self.type_name(&bt)),
+                    match unmet {
+                        Some(why) => {
+                            format!("no method '{name}' on type {}: {why}", self.type_name(&bt))
+                        }
+                        None => format!("no method '{name}' on type {}", self.type_name(&bt)),
+                    },
                     span,
                 );
             }
@@ -2529,7 +3387,8 @@ impl TypeChecker {
         if name == "print" {
             for a in args.iter_mut() {
                 let t = self.check_expr(a, None)?;
-                if !matches!(t, Type::Int(_) | Type::Bool | Type::Str | Type::Enum(_)) {
+                let bytes = matches!(&t, Type::Slice(e, _) if **e == Type::U8);
+                if !bytes && !matches!(t, Type::Int(_) | Type::Bool | Type::Str | Type::Enum(_)) {
                     return self.err(
                         format!("cannot print a value of type {}", self.type_name(&t)),
                         a.span,
@@ -2541,6 +3400,30 @@ impl TypeChecker {
         let (params, ret, trusted_only) = builtin_sig(name).unwrap();
         if trusted_only {
             self.need_trusted(&format!("'{name}'"), span)?;
+        }
+        if name == "slice_from_raw" || name == "slice_from_raw_mut" {
+            let mutable = name == "slice_from_raw_mut";
+            if args.len() != 2 {
+                return self.err(format!("'{name}' expects (pointer, length)"), span);
+            }
+            let t = self.check_expr(&mut args[0], None)?;
+            let Type::Raw(elem, m) = t else {
+                return self.err(
+                    format!("'{name}' expects a raw pointer first"),
+                    args[0].span,
+                );
+            };
+            if mutable && !m {
+                return self.err("'slice_from_raw_mut' needs a '*mut' pointer", args[0].span);
+            }
+            if *elem == Type::Unit || self.contains_ref(&elem) {
+                return self.err(
+                    format!("cannot make a slice of {}", self.type_name(&elem)),
+                    args[0].span,
+                );
+            }
+            self.coerce(&mut args[1], &Type::USIZE)?;
+            return Ok(Type::Slice(elem, mutable));
         }
         if name == "lgdt" || name == "lidt" {
             if args.len() != 1 {
@@ -2639,7 +3522,13 @@ impl TypeChecker {
         })
     }
 
-    fn const_bytes(&self, e: &Expr, out: &mut [u8], off: usize) -> TypeResult<()> {
+    fn const_bytes(
+        &self,
+        e: &Expr,
+        out: &mut [u8],
+        off: usize,
+        relocs: &mut Vec<(usize, Reloc)>,
+    ) -> TypeResult<()> {
         let size_of = |t: &Type| -> u64 {
             match t {
                 Type::Bool => 1,
@@ -2651,7 +3540,7 @@ impl TypeChecker {
             }
         };
         match &e.kind {
-            ExprKind::StructLit { name, fields } => {
+            ExprKind::StructLit { name, fields, .. } => {
                 let sid = self.struct_ids[name];
                 for (fname, value, _) in fields {
                     let fl = self
@@ -2660,14 +3549,27 @@ impl TypeChecker {
                         .iter()
                         .find(|f| f.name == *fname)
                         .unwrap();
-                    self.const_bytes(value, out, off + fl.offset as usize)?;
+                    self.const_bytes(value, out, off + fl.offset as usize, relocs)?;
                 }
                 Ok(())
             }
             ExprKind::ArrayLit(items) => {
                 let stride = self.elem_size(e.r#type());
                 for (i, item) in items.iter().enumerate() {
-                    self.const_bytes(item, out, off + i * stride)?;
+                    self.const_bytes(item, out, off + i * stride, relocs)?;
+                }
+                Ok(())
+            }
+            ExprKind::VariantLit { sum, variant, args } => {
+                let l = self.sum_layout(*sum);
+                let v = &l.variants[*variant];
+                if l.niche.is_none() {
+                    let size = l.tag.size() as usize;
+                    let bytes = (v.tag as u64).to_le_bytes();
+                    out[off..off + size].copy_from_slice(&bytes[..size]);
+                }
+                for ((_, foff), a) in v.fields.iter().zip(args) {
+                    self.const_bytes(a, out, off + *foff as usize, relocs)?;
                 }
                 Ok(())
             }
@@ -2676,16 +3578,52 @@ impl TypeChecker {
                     unreachable!()
                 };
                 let stride = self.elem_size(e.r#type());
-                self.const_bytes(value, out, off)?;
+                let mut one = Vec::new();
+                self.const_bytes(value, out, off, &mut one)?;
                 for i in 1..*n as usize {
                     out.copy_within(off..off + stride, off + i * stride);
                 }
+                for i in 0..*n as usize {
+                    for (o, r) in &one {
+                        relocs.push((o + i * stride, r.clone()));
+                    }
+                }
                 Ok(())
             }
-            ExprKind::Str(_) | ExprKind::CStr(_) | ExprKind::WStr(_) => self.err(
-                "string literals cannot initialize statics yet (their address needs relocation); assign it at runtime",
-                e.span,
-            ),
+            ExprKind::Str(s) | ExprKind::Bytes(s) => {
+                relocs.push((off, Reloc::Str(s.clone())));
+                Ok(())
+            }
+            ExprKind::CStr(s) => {
+                relocs.push((off, Reloc::CStr(s.clone())));
+                Ok(())
+            }
+            ExprKind::WStr(s) => {
+                relocs.push((off, Reloc::WStr(s.clone())));
+                Ok(())
+            }
+            ExprKind::Var(name)
+                if self.functions.contains_key(name) && matches!(e.r#type(), Type::Fn(_)) =>
+            {
+                relocs.push((off, Reloc::Func(name.clone())));
+                Ok(())
+            }
+            ExprKind::Cast { expr, .. } if self.const_eval(expr)?.is_none() => match &expr.kind {
+                ExprKind::Unary {
+                    op: UnaryOp::Ref(_),
+                    operand,
+                } => match &operand.kind {
+                    ExprKind::Var(n) if self.static_ids.contains_key(n) => {
+                        relocs.push((off, Reloc::Static(n.clone())));
+                        Ok(())
+                    }
+                    _ => self.err(
+                        "only the address of a static can initialize a static",
+                        e.span,
+                    ),
+                },
+                _ => self.const_bytes(expr, out, off, relocs),
+            },
             _ => match self.const_eval(e)? {
                 Some(v) => {
                     let size = size_of(e.r#type()) as usize;
@@ -2709,6 +3647,7 @@ impl TypeChecker {
                 Type::Int(i) => i.size(),
                 Type::Enum(id) => tc.enum_info(*id).repr.size(),
                 Type::Struct(id) => tc.layout(*id).size,
+                Type::Sum(id) => tc.sum_layout(*id).size,
                 Type::Array(e, n) => size(tc, e) * n,
                 Type::Slice(..) => 16,
                 _ => 8,
@@ -2758,8 +3697,10 @@ fn builtin_sig(name: &str) -> Option<(Vec<Type>, Type, bool)> {
             true,
         ),
         "lgdt" | "lidt" => (vec![], Type::Unit, true),
+        "slice_from_raw" | "slice_from_raw_mut" => (vec![], Type::Unit, true),
         "context_switch" => (vec![Type::raw(Type::U64, true), u(U64)], Type::Unit, true),
         "set_syscall_stack" => (vec![u(U64)], Type::Unit, true),
+        "rebase_statics" => (vec![u(U64)], Type::Unit, true),
         "syscall" => (vec![u(U64), u(U64), u(U64), u(U64)], u(I64), false),
         "iret_to" => (
             vec![u(U64), u(U64), u(U64), u(U64), u(U64)],
@@ -2776,6 +3717,13 @@ pub fn is_builtin(name: &str) -> bool {
 
 fn diverging_builtin(name: &str) -> bool {
     matches!(name, "panic" | "exit" | "switch_stack" | "iret_to")
+}
+
+fn accessor_name(kind: &str, static_name: &str) -> String {
+    match static_name.rsplit_once("::") {
+        Some((m, x)) => format!("{m}::{kind}_{x}"),
+        None => format!("{kind}_{static_name}"),
+    }
 }
 
 fn take(e: &mut Expr) -> Expr {

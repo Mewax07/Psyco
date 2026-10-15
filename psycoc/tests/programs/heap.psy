@@ -1,0 +1,84 @@
+struct Point {
+    x: i32,
+    y: i32,
+}
+
+fn total(v: &Vec<u64>) -> u64 {
+    let s = v.as_slice()
+    let mut sum: u64 = 0
+    for i in 0..s.len() {
+        sum += s[i]
+    }
+    return sum
+}
+
+fn squares(n: u64) -> Vec<u64> {
+    let mut v: Vec<u64> = Vec::new()
+    for i in 0..n {
+        v.push(i * i)
+    }
+    return v
+}
+
+fn main() {
+    let mut v = squares(10)
+    print(v.len(), v.get(9), v.capacity(), total(&v))
+    print(v.pop().unwrap(), v.len())
+    v.insert(0, 7)
+    print(v.get(0), v.get(1), v.remove(1), v.len())
+    v.set(2, 100)
+    let m = v.as_mut_slice()
+    m[0] += 1
+    print(v.get(0), v.get(2))
+    v.free()
+
+    let mut pts: Vec<Point> = Vec::with_capacity(2)
+    for i in 0..5i32 {
+        pts.push(Point { x: i, y: -i })
+    }
+    pts.at_mut(4).y = 40
+    print(pts.len(), pts.at(3).x, pts.get(4).y)
+    pts.free()
+
+    let mut b = Box::new(Point { x: 1, y: 2 })
+    b.as_mut().x += 10
+    print(b.get().x, b.as_ref().y)
+    let p = b.into_inner()
+    print(p.x)
+
+    let mut s = String::from("psy ")
+    s.push_str("os ")
+    s.push_u64(2026)
+    s.push('!')
+    print(s.as_bytes())
+    print(s.len(), s.eq_str("psy os 2026!"), s.eq_str("psy"))
+
+    let mut words: Vec<String> = Vec::new()
+    words.push(s)
+    words.push(String::from("two"))
+    let first = words.remove(0)
+    print(first.as_bytes(), words.at(0).len(), words.len())
+    first.free()
+    while let Some(w) = words.pop() {
+        w.free()
+    }
+    words.free()
+
+    let empty: Vec<u8> = Vec::zeroed(3)
+    print(empty.get(2), empty.len())
+    print(empty.get(3))
+}
+
+//> 10 81 16 285
+//> 81 9
+//> 7 0 0 9
+//> 8 100
+//> 5 3 40
+//> 11 2
+//> 11
+//> psy os 2026!
+//> 12 true false
+//> psy os 2026! 3 1
+//> 0 3
+//> panic: index out of bounds
+// exit: 101

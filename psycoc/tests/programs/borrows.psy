@@ -1,0 +1,65 @@
+struct Counter {
+    hits: u64,
+    misses: u64,
+}
+
+impl Counter {
+    fn total(&self) -> u64 {
+        return self.hits + self.misses
+    }
+
+    fn add(&mut self, n: u64) {
+        self.hits += n
+    }
+}
+
+fn bump(r: &mut u64) {
+    *r += 1
+}
+
+fn bump_twice(r: &mut u64) {
+    bump(r)
+    bump(r)
+}
+
+fn largest(v: &[u64]) -> &u64 {
+    let mut best = &v[0]
+    for i in 0..v.len() {
+        if v[i] > *best {
+            best = &v[i]
+        }
+    }
+    return best
+}
+
+fn main() {
+    let mut c = Counter { hits: 1, misses: 2 }
+    let h = &mut c.hits
+    let m = &mut c.misses
+    *h += 10
+    *m += 20
+    c.add(c.total())
+    print(c.hits, c.misses)
+
+    let mut x: u64 = 0
+    bump_twice(&mut x)
+    let r = &mut x
+    *r *= 10
+    print(x)
+
+    let v = [4u64, 9, 2]
+    let big = largest(&v)
+    print(*big, v[0])
+
+    let mut grid = [0u64; 4]
+    for i in 0..grid.len() {
+        let cell = &mut grid[i]
+        *cell = i as u64 * 3
+    }
+    print(grid[3])
+}
+
+//> 44 22
+//> 20
+//> 9 4
+//> 9

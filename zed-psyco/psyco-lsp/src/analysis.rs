@@ -21,18 +21,29 @@ pub enum DefKind {
     Static,
     Local,
     Param,
+    Trait,
+    Module,
+    /// `T` in `fn f<T: Bound>`, `struct S<T>`, `impl<T>`...
+    TypeParam,
 }
 
 impl DefKind {
     pub fn is_item(self) -> bool {
         matches!(
             self,
-            DefKind::Function | DefKind::Struct | DefKind::Enum | DefKind::Const | DefKind::Static
+            DefKind::Function
+                | DefKind::Struct
+                | DefKind::Enum
+                | DefKind::Const
+                | DefKind::Static
+                | DefKind::Trait
+                | DefKind::Module
         )
     }
 
+    /// Names visible in a range of tokens only.
     pub fn is_local(self) -> bool {
-        matches!(self, DefKind::Local | DefKind::Param)
+        matches!(self, DefKind::Local | DefKind::Param | DefKind::TypeParam)
     }
 }
 
@@ -48,6 +59,8 @@ pub struct Def {
     pub params: Vec<String>,
     pub scope: Option<(usize, usize)>,
     pub explicit_type: bool,
+    /// `mod` block the definition is in (`a::b` when nested).
+    pub module: Option<String>,
 }
 
 impl Def {
@@ -66,8 +79,20 @@ pub struct Analysis {
     pub tokens: Vec<Token>,
     pub defs: Vec<Def>,
     pub imports: Vec<(String, usize)>,
+    /// `impl` blocks, to know what `Self` and a method's trait are.
+    pub impls: Vec<ImplBlock>,
+    /// `mod name { ... }` blocks: full name, `{` and `}`.
+    mods: Vec<(String, usize, usize)>,
     close_of: HashMap<usize, usize>,
     encl: Vec<Option<usize>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ImplBlock {
+    pub self_ty: String,
+    pub trait_name: Option<String>,
+    pub open: usize,
+    pub close: usize,
 }
 
 pub fn is_word(c: char) -> bool {
@@ -171,6 +196,8 @@ impl Analysis {
             tokens,
             defs: Vec::new(),
             imports: Vec::new(),
+            impls: Vec::new(),
+            mods: Vec::new(),
             close_of: HashMap::new(),
             encl: Vec::new(),
         };
@@ -468,24 +495,114 @@ impl Analysis {
         }
     }
 
+    /// The `{` of the body of the item starting at `owner`, if it has one:
+    /// a trait method without a body is followed by the next `fn` or by the
+    /// `}` of the trait.
     fn body_after(&self, owner: usize, from: usize) -> Option<usize> {
-        (from..self.tokens.len().min(from + 96)).find(|&k| {
-            *self.kind(k) == TokenKind::LBrace && self.encl[k] == self.encl[owner]
-        })
+        for k in from..self.tokens.len().min(from + 96) {
+            if self.encl[k] != self.encl[owner] {
+                continue;
+            }
+            match self.kind(k) {
+                TokenKind::LBrace => return Some(k),
+                TokenKind::RBrace | TokenKind::Semicolon => return None,
+                TokenKind::Fn if self.ident(k + 1).is_some() => return None,
+                _ => {}
+            }
+        }
+        None
     }
 
+    /// End of a comma separated item: `(`/`[`/`{` and type arguments
+    /// (`Pair<A, B>`) are skipped.
     fn segment_end(&self, from: usize, stop: usize) -> usize {
         let mut depth = 0i32;
+        let mut angle = 0i32;
         for k in from..stop {
             match self.kind(k) {
                 TokenKind::LParen | TokenKind::LBracket | TokenKind::LBrace => depth += 1,
                 TokenKind::RParen | TokenKind::RBracket | TokenKind::RBrace => depth -= 1,
-                TokenKind::Comma if depth == 0 => return k,
+                TokenKind::Lt => angle += 1,
+                TokenKind::Gt if angle > 0 => angle -= 1,
+                TokenKind::Shr if angle > 0 => angle = (angle - 2).max(0),
+                TokenKind::Comma if depth == 0 && angle == 0 => return k,
                 _ => {}
             }
         }
         stop
     }
+
+    /// Token after the `<...>` starting at `lt` (`>>` closes two levels).
+    fn after_angles(&self, lt: usize) -> usize {
+        let mut depth = 0i32;
+        for k in lt..self.tokens.len() {
+            match self.kind(k) {
+                TokenKind::Lt => depth += 1,
+                TokenKind::Gt => depth -= 1,
+                TokenKind::Shr => depth -= 2,
+                TokenKind::LBrace | TokenKind::Semicolon | TokenKind::Eof => return k,
+                _ => {}
+            }
+            if depth <= 0 {
+                return k + 1;
+            }
+        }
+        self.tokens.len()
+    }
+
+    /// Type parameters declared by `<T: A + B, U>` at `at` (nothing when
+    /// there is no `<`), and the token after them.
+    fn generic_params(&self, at: usize) -> (Vec<(usize, String)>, usize) {
+        if *self.kind(at) != TokenKind::Lt {
+            return (Vec::new(), at);
+        }
+        let end = self.after_angles(at);
+        let mut params = Vec::new();
+        let mut k = at + 1;
+        while k < end.saturating_sub(1) {
+            if self.ident(k).is_some() && matches!(self.kind(k - 1), TokenKind::Lt | TokenKind::Comma) {
+                let stop = self.segment_end(k, end - 1);
+                params.push((k, self.text(k, stop)));
+                k = stop;
+            }
+            k += 1;
+        }
+        (params, end)
+    }
+
+    fn push_type_params(&mut self, params: Vec<(usize, String)>, owner: &str, scope: (usize, usize)) {
+        for (tok, text) in params {
+            self.push(Def {
+                name: self.ident(tok).unwrap_or_default().to_string(),
+                kind: DefKind::TypeParam,
+                tok,
+                start_tok: tok,
+                end_tok: tok,
+                container: Some(owner.to_string()),
+                detail: text,
+                params: Vec::new(),
+                scope: Some(scope),
+                explicit_type: true,
+                module: None,
+            });
+        }
+    }
+
+    /// The `impl` block around token `i`.
+    pub fn impl_at(&self, i: usize) -> Option<&ImplBlock> {
+        self.impls
+            .iter()
+            .filter(|b| b.open < i && i < b.close)
+            .max_by_key(|b| b.open)
+    }
+
+    /// `m` in `import "file.psy" as m`, from the index of the path string.
+    pub fn import_alias(&self, path_tok: usize) -> Option<&str> {
+        (*self.kind(path_tok + 1) == TokenKind::As)
+            .then(|| self.ident(path_tok + 2))
+            .flatten()
+    }
+
 
     fn match_brackets(&mut self) {
         let n = self.tokens.len();
@@ -519,13 +636,59 @@ impl Analysis {
     }
 
     fn index(&mut self) {
+        // Blocks whose `fn`s are methods: `impl` (of the implementing type)
+        // and `trait` (of the trait).
         let mut impls: Vec<(String, usize, usize)> = Vec::new();
+        let mut patterns: Vec<(usize, usize, usize)> = Vec::new();
+        let mut mod_stack: Vec<(String, usize)> = Vec::new();
         for i in 0..self.tokens.len() {
             impls.retain(|(_, _, end)| *end > i);
+            mod_stack.retain(|(_, end)| *end > i);
             match self.kind(i).clone() {
                 TokenKind::Impl => {
-                    if let (Some(name), TokenKind::LBrace) = (self.ident(i + 1), self.kind(i + 2)) {
-                        impls.push((name.to_string(), i + 2, self.close(i + 2)));
+                    if let Some((self_ty, open)) = self.index_impl(i) {
+                        impls.push((self_ty, open, self.close(open)));
+                    }
+                }
+                TokenKind::Trait => {
+                    if let Some(open) = self.index_trait(i) {
+                        let name = self.ident(i + 1).unwrap_or_default().to_string();
+                        impls.push((name, open, self.close(open)));
+                    }
+                }
+                TokenKind::Ident(m)
+                    if m == "mod" && self.ident(i + 1).is_some() && *self.kind(i + 2) == TokenKind::LBrace =>
+                {
+                    let name = self.ident(i + 1).unwrap_or_default().to_string();
+                    let full = match mod_stack.last() {
+                        Some((outer, _)) => format!("{outer}::{name}"),
+                        None => name.clone(),
+                    };
+                    let close = self.close(i + 2);
+                    self.mods.push((full.clone(), i + 2, close));
+                    mod_stack.push((full, close));
+                    self.push(Def {
+                        name: name.clone(),
+                        kind: DefKind::Module,
+                        tok: i + 1,
+                        start_tok: i,
+                        end_tok: close,
+                        container: None,
+                        detail: format!("mod {name}"),
+                        params: Vec::new(),
+                        scope: None,
+                        explicit_type: true,
+                        module: None,
+                    });
+                }
+                TokenKind::Match => {
+                    if let Some(open) = self.body_after(i, i + 1) {
+                        patterns.extend(self.match_arms(open));
+                    }
+                }
+                TokenKind::Let if matches!(self.kind_before(i, 1), TokenKind::If | TokenKind::While) => {
+                    if let Some(p) = self.let_pattern(i) {
+                        patterns.push(p);
                     }
                 }
                 TokenKind::Fn => {
@@ -551,11 +714,184 @@ impl Analysis {
                 _ => {}
             }
         }
+
+        // Bindings need every constant of the file to be known: `X =>`
+        // binds a name unless `X` is a constant or a variant.
+        for (from, to, scope_end) in patterns {
+            self.index_bindings(from, to, scope_end);
+        }
+
+        // Which `mod` block each definition is in.
+        let mods = self.mods.clone();
+        for d in &mut self.defs {
+            d.module = mods
+                .iter()
+                .filter(|(_, open, close)| *open < d.start_tok && d.start_tok < *close)
+                .max_by_key(|(_, open, _)| *open)
+                .map(|(name, _, _)| name.clone());
+        }
+    }
+
+    /// `impl<T> Trait for Type<T> {` / `impl Type {`: records the block, its
+    /// type parameters, and returns the implementing type and the `{`.
+    fn index_impl(&mut self, i: usize) -> Option<(String, usize)> {
+        let (generics, mut k) = self.generic_params(i + 1);
+        let mut first = self.ident(k)?.to_string();
+        k = self.after_angles_if(k + 1);
+        let mut trait_name = None;
+        if *self.kind(k) == TokenKind::For {
+            trait_name = Some(first);
+            first = match self.kind(k + 1) {
+                TokenKind::Ident(n) => n.clone(),
+                _ => return None,
+            };
+            k = self.after_angles_if(k + 2);
+        }
+        let open = self.body_after(i, k)?;
+        let close = self.close(open);
+        self.impls.push(ImplBlock {
+            self_ty: first.clone(),
+            trait_name,
+            open,
+            close,
+        });
+        self.push_type_params(generics, &first, (i, close));
+        Some((first, open))
+    }
+
+    fn after_angles_if(&self, at: usize) -> usize {
+        if *self.kind(at) == TokenKind::Lt {
+            self.after_angles(at)
+        } else {
+            at
+        }
+    }
+
+    /// `trait Name { ... }`: returns the `{`.
+    fn index_trait(&mut self, i: usize) -> Option<usize> {
+        let name = self.ident(i + 1)?.to_string();
+        let open = self.body_after(i, i + 2)?;
+        self.push(Def {
+            name: name.clone(),
+            kind: DefKind::Trait,
+            tok: i + 1,
+            start_tok: i,
+            end_tok: self.close(open),
+            container: None,
+            detail: format!("trait {name}"),
+            params: Vec::new(),
+            scope: None,
+            explicit_type: true,
+            module: None,
+        });
+        Some(open)
+    }
+
+    /// Patterns of the arms of the `match` block `open`:
+    /// (first token, end, last token where the bindings are visible).
+    fn match_arms(&self, open: usize) -> Vec<(usize, usize, usize)> {
+        let close = self.close(open);
+        let mut arms = Vec::new();
+        let mut k = open + 1;
+        while k < close {
+            let start = k;
+            // The pattern runs to `=>`, or to the `if` of a guard.
+            let Some(arrow) = (k..close).find(|&j| self.encl[j] == Some(open) && *self.kind(j) == TokenKind::FatArrow)
+            else {
+                break;
+            };
+            let pat_end = (start..arrow)
+                .find(|&j| self.encl[j] == Some(open) && *self.kind(j) == TokenKind::If)
+                .unwrap_or(arrow);
+            // The body: a block, or a statement up to the `,` of the arm.
+            let body_end = if *self.kind(arrow + 1) == TokenKind::LBrace {
+                self.close(arrow + 1)
+            } else {
+                let mut depth = 0i32;
+                let mut j = arrow + 1;
+                while j < close {
+                    match self.kind(j) {
+                        TokenKind::LParen | TokenKind::LBracket | TokenKind::LBrace => depth += 1,
+                        TokenKind::RParen | TokenKind::RBracket | TokenKind::RBrace => depth -= 1,
+                        TokenKind::Comma if depth == 0 => break,
+                        _ => {}
+                    }
+                    j += 1;
+                }
+                j.saturating_sub(1)
+            };
+            arms.push((start, pat_end, body_end));
+            k = body_end + 1;
+            if *self.kind(k) == TokenKind::Comma {
+                k += 1;
+            }
+        }
+        arms
+    }
+
+    /// `if let PAT = value { ... }` / `while let`: the pattern and the block.
+    fn let_pattern(&self, i: usize) -> Option<(usize, usize, usize)> {
+        let mut depth = 0i32;
+        let mut eq = None;
+        for j in i + 1..self.tokens.len().min(i + 64) {
+            match self.kind(j) {
+                TokenKind::LParen | TokenKind::LBracket => depth += 1,
+                TokenKind::RParen | TokenKind::RBracket => depth -= 1,
+                TokenKind::Eq if depth == 0 => {
+                    eq = Some(j);
+                    break;
+                }
+                TokenKind::LBrace | TokenKind::RBrace => return None,
+                _ => {}
+            }
+        }
+        let eq = eq?;
+        let body = self.body_after(i, eq + 1)?;
+        Some((i + 1, eq, self.close(body)))
+    }
+
+    /// Locals for the names a pattern binds: `x` in `Some(x)`,
+    /// `Event::Move(x, _)`, `mut n`, or a lone `other =>`.
+    fn index_bindings(&mut self, from: usize, to: usize, scope_end: usize) {
+        let constant = |an: &Self, name: &str| {
+            an.defs.iter().any(|d| {
+                d.name == name && matches!(d.kind, DefKind::Const | DefKind::Static | DefKind::Variant)
+            })
+        };
+        for k in from..to {
+            let Some(name) = self.ident(k) else {
+                continue;
+            };
+            let after = self.kind(k + 1);
+            let mutable = *self.kind_before(k, 1) == TokenKind::Mut;
+            let binds = name != "_"
+                && !matches!(after, TokenKind::ColonColon | TokenKind::LParen | TokenKind::LBrace | TokenKind::Dot)
+                && !self.is_path_segment(k)
+                && (mutable || name.starts_with(|c: char| c.is_lowercase() || c == '_'))
+                && !constant(self, name);
+            if !binds {
+                continue;
+            }
+            let name = name.to_string();
+            self.push(Def {
+                detail: if mutable { format!("mut {name}") } else { name.clone() },
+                name,
+                kind: DefKind::Local,
+                tok: k,
+                start_tok: if mutable { k - 1 } else { k },
+                end_tok: k,
+                container: None,
+                params: Vec::new(),
+                scope: Some((k, scope_end)),
+                explicit_type: false,
+                module: None,
+            });
+        }
     }
 
     fn index_fn(&mut self, i: usize, container: Option<String>) {
         let name = self.ident(i + 1).unwrap_or_default().to_string();
-        let lp = i + 2;
+        let (generics, lp) = self.generic_params(i + 2);
         let rp = if *self.kind(lp) == TokenKind::LParen {
             self.close(lp)
         } else {
@@ -577,6 +913,7 @@ impl Analysis {
             None => self.rest_of_line(i),
         };
         let scope = body.map(|b| (b, self.close(b))).unwrap_or((rp, rp));
+        self.push_type_params(generics, &name, (i, end_tok));
 
         let mut param_texts = Vec::new();
         for (a, b) in params {
@@ -609,6 +946,7 @@ impl Analysis {
                 params: Vec::new(),
                 scope: Some(scope),
                 explicit_type: true,
+                module: None,
             });
         }
 
@@ -627,6 +965,7 @@ impl Analysis {
             params: param_texts,
             scope: None,
             explicit_type: true,
+            module: None,
         });
     }
 
@@ -634,9 +973,11 @@ impl Analysis {
         let Some(name) = self.ident(i + 1).map(str::to_string) else {
             return;
         };
-        let lb = i + 2;
+        let (generics, lb) = self.generic_params(i + 2);
         let has_body = *self.kind(lb) == TokenKind::LBrace;
         let end_tok = if has_body { self.close(lb) } else { i + 1 };
+        let header = if generics.is_empty() { name.clone() } else { self.text(i + 1, lb) };
+        self.push_type_params(generics, &name, (i, end_tok));
         if has_body {
             for j in lb + 1..end_tok {
                 if self.encl[j] == Some(lb)
@@ -656,6 +997,7 @@ impl Analysis {
                         params: Vec::new(),
                         scope: None,
                         explicit_type: true,
+                        module: None,
                     });
                 }
             }
@@ -667,10 +1009,11 @@ impl Analysis {
             start_tok: i,
             end_tok,
             container: None,
-            detail: format!("struct {name}"),
+            detail: format!("struct {header}"),
             params: Vec::new(),
             scope: None,
             explicit_type: true,
+            module: None,
         });
     }
 
@@ -678,8 +1021,10 @@ impl Analysis {
         let Some(name) = self.ident(i + 1).map(str::to_string) else {
             return;
         };
-        let lb = (i + 2..self.tokens.len().min(i + 8)).find(|&k| *self.kind(k) == TokenKind::LBrace);
+        let (generics, after) = self.generic_params(i + 2);
+        let lb = self.body_after(i, after);
         let end_tok = lb.map_or(i + 1, |b| self.close(b));
+        self.push_type_params(generics, &name, (i, end_tok));
         let detail = match lb {
             Some(b) => self.text(i, b),
             None => self.rest_of_line(i),
@@ -702,6 +1047,7 @@ impl Analysis {
                         params: Vec::new(),
                         scope: None,
                         explicit_type: true,
+                        module: None,
                     });
                 }
             }
@@ -717,6 +1063,7 @@ impl Analysis {
             params: Vec::new(),
             scope: None,
             explicit_type: true,
+            module: None,
         });
     }
 
@@ -748,6 +1095,7 @@ impl Analysis {
             params: Vec::new(),
             scope: None,
             explicit_type: true,
+            module: None,
         });
 
         // `#[getter]` / `#[setter]` on a static generate `get_NAME()` / `set_NAME(value)`.
@@ -781,6 +1129,7 @@ impl Analysis {
             params,
             scope: None,
             explicit_type: true,
+            module: None,
         };
         let name = self.ident(j).unwrap_or_default().to_string();
         let mut generated = Vec::new();
@@ -855,6 +1204,7 @@ impl Analysis {
             params: Vec::new(),
             scope: Some((j, self.block_end(i))),
             explicit_type: *self.kind(j + 1) == TokenKind::Colon,
+            module: None,
         });
     }
 
@@ -878,6 +1228,7 @@ impl Analysis {
             params: Vec::new(),
             scope: Some((i + 1, body.map_or(i + 1, |b| self.close(b)))),
             explicit_type: false,
+            module: None,
         });
     }
 
@@ -967,6 +1318,8 @@ pub struct Unit {
     pub path: Option<PathBuf>,
     pub an: Arc<Analysis>,
     pub let_types: Arc<HashMap<(usize, usize), String>>,
+    /// `m` when the file is imported `as m`: its items are then `m::item`.
+    pub alias: Option<String>,
 }
 
 pub struct World {
@@ -1014,6 +1367,132 @@ impl World {
         Vec::new()
     }
 
+    /// The struct, enum or trait named `name`, as seen from `unit`.
+    fn find_type(&self, unit: usize, name: &str) -> Vec<Target> {
+        let mut found = self.find_item(unit, name);
+        found.retain(|t| matches!(self.def(*t).kind, DefKind::Struct | DefKind::Enum | DefKind::Trait));
+        found
+    }
+
+    /// `owner::name`, where `owner` is a type (variant, method), a `mod`, a
+    /// file imported `as owner`, `Self` or a type parameter.
+    /// With `name`, the definitions it names; without, everything that can
+    /// follow `owner::`.
+    pub fn resolve_path(&self, unit: usize, tok: usize, owner: &str, name: Option<&str>) -> Vec<Target> {
+        let named = |d: &Def| name.is_none_or(|n| d.name == n);
+        let an = &self.units[unit].an;
+        let mut owner = owner.to_string();
+        if owner == "Self" {
+            match an.impl_at(tok) {
+                Some(b) => owner = b.self_ty.clone(),
+                None => return Vec::new(),
+            }
+        }
+        // `T::name()` in a generic function: a method of one of the traits.
+        if let Some(def) = an.local_at(&owner, tok) {
+            if an.defs[def].kind == DefKind::TypeParam {
+                let traits: Vec<String> = self
+                    .find_all(|d| d.kind == DefKind::Trait)
+                    .into_iter()
+                    .map(|t| self.def(t).name.clone())
+                    .collect();
+                return self.find_all(|d| {
+                    d.kind == DefKind::Method
+                        && named(d)
+                        && d.container.as_ref().is_some_and(|c| traits.contains(c))
+                });
+            }
+        }
+        let mut found = self.find_all(|d| {
+            d.container.as_deref() == Some(owner.as_str())
+                && named(d)
+                && matches!(d.kind, DefKind::Variant | DefKind::Method)
+        });
+        // Items of `mod owner { ... }` (also `outer::owner`).
+        found.extend(self.find_all(|d| {
+            named(d)
+                && d.kind.is_item()
+                && d.module.as_ref().is_some_and(|m| m == &owner || m.ends_with(&format!("::{owner}")))
+        }));
+        // Items of a file imported `as owner`.
+        for (u, other) in self.units.iter().enumerate() {
+            if other.alias.as_deref() == Some(owner.as_str()) {
+                found.extend(
+                    other
+                        .an
+                        .defs
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, d)| d.kind.is_item() && named(d) && d.module.is_none())
+                        .map(|(def, _)| Target { unit: u, def }),
+                );
+            }
+        }
+        found
+    }
+
+    /// Type name of `x` in `x.member` when `x` is `self`, a parameter or a
+    /// local whose type is known: `Wrap` for `&mut Wrap<T>`.
+    fn receiver_type(&self, unit: usize, member: usize) -> Option<String> {
+        let u = &self.units[unit];
+        let an = &u.an;
+        let recv = member.checked_sub(2)?;
+        // Only a plain name: `a.b.c()` would need the type of `a.b`.
+        if an.is_member(recv) || an.is_path_segment(recv) {
+            return None;
+        }
+        let name = an.ident(recv)?;
+        if name == "self" {
+            return an.impl_at(recv).map(|b| b.self_ty.clone());
+        }
+        let d = &an.defs[an.local_at(name, recv)?];
+        let ty = match d.kind {
+            DefKind::Param => d.detail.split_once(':')?.1.to_string(),
+            DefKind::Local if d.explicit_type => d.detail.split_once(':')?.1.to_string(),
+            DefKind::Local => {
+                let s = an.tokens.get(d.start_tok)?.span;
+                u.let_types.get(&(s.line, s.col))?.clone()
+            }
+            _ => return None,
+        };
+        let mut ty = ty.trim();
+        for prefix in ["&", "mut ", "*const ", "*mut "] {
+            ty = ty.trim_start_matches(prefix).trim_start();
+        }
+        let base: String = ty.chars().take_while(|c| is_word(*c)).collect();
+        (!base.is_empty()).then_some(base)
+    }
+
+    /// The members among `all` that belong to type `ty`: its own fields and
+    /// methods, else the methods of the traits it implements.
+    fn members_of(&self, ty: &str, all: Vec<Target>) -> Vec<Target> {
+        let own: Vec<Target> = all
+            .iter()
+            .copied()
+            .filter(|t| self.def(*t).container.as_deref() == Some(ty))
+            .collect();
+        if !own.is_empty() {
+            return own;
+        }
+        let traits: Vec<&str> = self
+            .units
+            .iter()
+            .flat_map(|u| u.an.impls.iter())
+            .filter(|b| b.self_ty == ty)
+            .filter_map(|b| b.trait_name.as_deref())
+            .collect();
+        let inherited: Vec<Target> = all
+            .iter()
+            .copied()
+            .filter(|t| self.def(*t).container.as_deref().is_some_and(|c| traits.contains(&c)))
+            .collect();
+        if inherited.is_empty() {
+            all
+        } else {
+            inherited
+        }
+    }
+
     pub fn resolve(&self, unit: usize, tok: usize) -> Vec<Target> {
         let an = &self.units[unit].an;
         let Some(name) = an.ident(tok) else {
@@ -1024,17 +1503,23 @@ impl World {
         }
         if an.is_path_segment(tok) {
             if let Some(owner) = tok.checked_sub(2).and_then(|t| an.ident(t)) {
-                return self.find_all(|d| {
-                    d.container.as_deref() == Some(owner)
-                        && d.name == name
-                        && matches!(d.kind, DefKind::Variant | DefKind::Method)
-                });
+                return self.resolve_path(unit, tok, owner, Some(name));
             }
         }
+        if name == "Self" {
+            return match an.impl_at(tok) {
+                Some(b) => self.find_type(unit, &b.self_ty),
+                None => Vec::new(),
+            };
+        }
         if an.is_member(tok) {
-            return self.find_all(|d| {
+            let all = self.find_all(|d| {
                 d.name == name && matches!(d.kind, DefKind::Field | DefKind::Method)
             });
+            return match self.receiver_type(unit, tok) {
+                Some(ty) => self.members_of(&ty, all),
+                None => all,
+            };
         }
         if let Some(owner) = an.struct_literal_name(tok) {
             let fields = self.find_all(|d| {

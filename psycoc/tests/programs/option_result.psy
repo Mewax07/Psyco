@@ -1,0 +1,101 @@
+enum ParseError {
+    Empty,
+    BadDigit(u8),
+    TooBig,
+}
+
+fn digit(c: u8) -> Option<u64> {
+    if c >= '0' && c <= '9' {
+        return Some((c - '0') as u64)
+    }
+    return None
+}
+
+fn parse(s: Str) -> Result<u64, ParseError> {
+    let b = s.as_bytes()
+    if b.len() == 0 {
+        return Err(ParseError::Empty)
+    }
+    let mut n: u64 = 0
+    for i in 0..b.len() {
+        let d = digit(b[i]).ok_or(ParseError::BadDigit(b[i]))?
+        if n > 1000 {
+            return Err(ParseError::TooBig)
+        }
+        n = n * 10 + d
+    }
+    return Ok(n)
+}
+
+fn sum3(a: Str, b: Str, c: Str) -> Result<u64, ParseError> {
+    return Ok(parse(a)? + parse(b)? + parse(c)?)
+}
+
+fn first_digit_doubled(s: Str) -> Option<u64> {
+    let b = s.as_bytes()
+    if b.len() == 0 {
+        return None
+    }
+    let d = digit(b[0])?
+    return Some(d * 2)
+}
+
+fn find(items: &[u64], want: u64) -> Option<&u64> {
+    for i in 0..items.len() {
+        if items[i] == want {
+            return Some(&items[i])
+        }
+    }
+    return None
+}
+
+fn show(r: Result<u64, ParseError>) {
+    match r {
+        Ok(v) => print("ok", v),
+        Err(ParseError::Empty) => print("error: empty"),
+        Err(ParseError::BadDigit(c)) => print("error: bad digit", c),
+        Err(ParseError::TooBig) => print("error: too big"),
+    }
+}
+
+fn triple(x: u64) -> u64 {
+    return x * 3
+}
+
+fn main() {
+    show(parse("123"))
+    show(parse(""))
+    show(parse("12x"))
+    show(parse("99999"))
+    show(sum3("1", "20", "300"))
+    show(sum3("1", "?", "300"))
+    print(first_digit_doubled("7a").unwrap_or(0), first_digit_doubled("a7").is_none(), first_digit_doubled("").is_some())
+
+    let items = [4u64, 8, 15]
+    let found = find(&items, 8)
+    print(*found.unwrap(), find(&items, 9).is_none())
+    print(sizeof(Option<&u64>), sizeof(Option<u64>), sizeof(Result<u8, u8>))
+
+    let m = Some(5u64).map(triple)
+    print(m.unwrap(), parse("7").map(triple).unwrap_or(0), parse("-").ok().is_none())
+    let e: Result<u8, ParseError> = Err(ParseError::TooBig)
+    if let Err(ParseError::TooBig) = e {
+        print("too big again")
+    }
+    let none: Option<u8> = None
+    print(none.expect("boom"))
+}
+
+//> ok 123
+//> error: empty
+//> error: bad digit 120
+//> error: too big
+//> ok 321
+//> error: bad digit 63
+//> 14 true false
+//> 8 true
+//> 8 16 2
+//> 15 21 true
+//> too big again
+//> panic: boom
+// exit: 101

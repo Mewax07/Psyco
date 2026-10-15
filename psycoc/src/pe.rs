@@ -32,12 +32,39 @@ impl PeBuilder {
         let rw_size = asm.rw_size().max(1) as u32;
         let reloc_rva = self.align(data_rva + rw_size, 0x1000u32);
 
-        asm.link(text_rva as u64, rdata_rva as u64, data_rva as u64);
+        asm.link_with_base(
+            text_rva as u64,
+            rdata_rva as u64,
+            data_rva as u64,
+            0x40_0000,
+        );
         let entry_rva = text_rva + asm.offset_of(entry) as u32;
 
+        let mut slots: Vec<u32> = asm.abs_slots.iter().map(|&a| a as u32).collect();
+        slots.sort_unstable();
         let mut reloc = Vec::new();
-        reloc.extend_from_slice(&text_rva.to_le_bytes());
-        reloc.extend_from_slice(&8u32.to_le_bytes());
+        if slots.is_empty() {
+            reloc.extend_from_slice(&text_rva.to_le_bytes());
+            reloc.extend_from_slice(&8u32.to_le_bytes());
+        }
+        let mut i = 0;
+        while i < slots.len() {
+            let page = slots[i] & !0xFFF;
+            let mut entries: Vec<u16> = Vec::new();
+            while i < slots.len() && slots[i] & !0xFFF == page {
+                entries.push((10 << 12) | (slots[i] & 0xFFF) as u16);
+                i += 1;
+            }
+            if entries.len() % 2 == 1 {
+                entries.push(0);
+            }
+            reloc.extend_from_slice(&page.to_le_bytes());
+            reloc.extend_from_slice(&(8 + 2 * entries.len() as u32).to_le_bytes());
+            for e in entries {
+                reloc.extend_from_slice(&e.to_le_bytes());
+            }
+        }
+        let reloc_len = reloc.len() as u32;
 
         let sections = vec![
             Section {
@@ -72,7 +99,7 @@ impl PeBuilder {
 
         let headers_len = 0x40 + 4 + 20 + 240 + 40 * sections.len() as u32;
         let size_of_headers = self.align(headers_len, 0x200u32);
-        let size_of_image = self.align(reloc_rva + 8, 0x1000u32);
+        let size_of_image = self.align(reloc_rva + reloc_len, 0x1000u32);
 
         let mut file_offsets = Vec::new();
         let mut cursor = size_of_headers;
@@ -124,7 +151,7 @@ impl PeBuilder {
         for i in 0..16 {
             if i == 5 {
                 out.extend_from_slice(&reloc_rva.to_le_bytes());
-                out.extend_from_slice(&8u32.to_le_bytes());
+                out.extend_from_slice(&reloc_len.to_le_bytes());
             } else {
                 out.extend_from_slice(&[0; 8]);
             }

@@ -31,6 +31,12 @@ struct Place {
     disp: i32,
 }
 
+#[derive(Clone, Copy)]
+enum PLoc {
+    Val(i32),
+    Mem(i32, i32),
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum OverflowKind {
     Add,
@@ -92,6 +98,14 @@ impl<'a> Codegen<'a> {
             ExprKind::ArrayRepeat { value, .. } => self.is_zero(value),
             ExprKind::ArrayLit(items) => items.iter().all(|l| self.is_zero(l)),
             ExprKind::StructLit { fields, .. } => fields.iter().all(|(_, v, _)| self.is_zero(v)),
+            ExprKind::VariantLit { sum, variant, args } => {
+                let l = &self.info.sums[*sum];
+                let tag_zero = match l.niche {
+                    Some(empty) => *variant == empty,
+                    None => l.variants[*variant].tag == 0,
+                };
+                tag_zero && args.iter().all(|a| self.is_zero(a))
+            }
             _ => false,
         }
     }
@@ -142,10 +156,16 @@ impl<'a> Codegen<'a> {
     }
 
     fn layout_statics(&mut self) {
+        let mut with_addresses = Vec::new();
         for s in &self.info.statics {
             let size = self.info.size_of(&s.r#type) as usize;
             let align = s.align as usize;
             let loc = match (&s.init, s.mutable) {
+                (Some(bytes), _) if !s.relocs.is_empty() => {
+                    let l = self.asm.rw_data(bytes, align.max(8));
+                    with_addresses.push((s.name.clone(), l));
+                    StaticLoc::Rw(l)
+                }
                 (Some(bytes), false) => StaticLoc::Ro(self.asm.data_aligned(bytes, align)),
                 (None, false) => StaticLoc::Ro(self.asm.data_aligned(&vec![0; size], align)),
                 (Some(bytes), true) => StaticLoc::Rw(self.asm.rw_data(bytes, align)),
@@ -153,6 +173,49 @@ impl<'a> Codegen<'a> {
             };
             self.statics.insert(s.name.clone(), loc);
         }
+        for (name, label) in with_addresses {
+            let RwLabel::Data(base) = label else {
+                unreachable!()
+            };
+            let relocs = self.info.statics[self.info.static_index(&name).unwrap()]
+                .relocs
+                .clone();
+            for (off, r) in relocs {
+                let target = match r {
+                    Reloc::Func(f) => AddrTarget::Code(self.functions[&f]),
+                    Reloc::Str(b) => AddrTarget::Data(self.intern_str(&b)),
+                    Reloc::CStr(b) => AddrTarget::Data(self.intern_cstr(&b)),
+                    Reloc::WStr(w) => AddrTarget::Data(self.intern_wstr(&w)),
+                    Reloc::Static(n) => match self.statics[&n] {
+                        StaticLoc::Ro(d) => AddrTarget::Data(d),
+                        StaticLoc::Rw(r) => AddrTarget::Rw(r),
+                    },
+                };
+                self.asm.abs_address(base + off, target, 0);
+            }
+        }
+    }
+
+    fn intern_cstr(&mut self, s: &[u8]) -> DataLabel {
+        if let Some(&l) = self.cstrings.get(s) {
+            return l;
+        }
+        let mut bytes = s.to_vec();
+        bytes.push(0);
+        let l = self.asm.data_aligned(&bytes, 1);
+        self.cstrings.insert(s.to_vec(), l);
+        l
+    }
+
+    fn intern_wstr(&mut self, s: &[u16]) -> DataLabel {
+        if let Some(&l) = self.wstrings.get(s) {
+            return l;
+        }
+        let mut bytes: Vec<u8> = s.iter().flat_map(|c| c.to_le_bytes()).collect();
+        bytes.extend_from_slice(&[0, 0]);
+        let l = self.asm.data_aligned(&bytes, 2);
+        self.wstrings.insert(s.to_vec(), l);
+        l
     }
 
     fn gen_runtime(&mut self) {
@@ -550,37 +613,288 @@ impl<'a> Codegen<'a> {
             Stmt::Match {
                 scrutinee, arms, ..
             } => {
-                self.gen_expr(scrutinee);
-                let end = self.asm.new_label();
-                let mut labels = Vec::new();
-                let mut wildcard = None;
-                for arm in arms {
-                    let label = self.asm.new_label();
-                    match &arm.patterns {
-                        None => wildcard = Some(label),
-                        Some(pats) => {
-                            for p in pats {
-                                let ExprKind::Int(v) = p.kind else {
-                                    panic!("ICE: match pattern not folded")
-                                };
-                                self.cmp_rax_const(v as i64);
-                                self.asm.jcc(Cond::E, label);
-                            }
+                if self.simple_match(scrutinee, arms) {
+                    self.gen_simple_match(scrutinee, arms);
+                } else {
+                    self.gen_match(scrutinee, arms);
+                }
+            }
+            Stmt::IfLet {
+                pat,
+                value,
+                then_block,
+                else_block,
+                ..
+            } => {
+                let root = self.gen_scrutinee(value);
+                let else_label = self.asm.new_label();
+                self.gen_pat_test(pat, root, else_label);
+                self.scopes.push(HashMap::new());
+                self.gen_pat_bind(pat, root);
+                self.gen_block(then_block);
+                self.scopes.pop();
+                match else_block {
+                    None => self.asm.bind(else_label),
+                    Some(block) => {
+                        let end_label = self.asm.new_label();
+                        if !self.always_exits(then_block) {
+                            self.asm.jmp(end_label);
                         }
-                    }
-                    labels.push(label);
-                }
-                self.asm.jmp(wildcard.unwrap_or(end));
-                for (arm, label) in arms.iter().zip(labels) {
-                    self.asm.bind(label);
-                    self.gen_block(&arm.body);
-                    if !self.always_exits(&arm.body) {
-                        self.asm.jmp(end);
+                        self.asm.bind(else_label);
+                        self.gen_block(block);
+                        self.asm.bind(end_label);
                     }
                 }
+            }
+            Stmt::WhileLet {
+                pat, value, body, ..
+            } => {
+                let top = self.asm.new_label();
+                let end = self.asm.new_label();
+                self.asm.bind(top);
+                let root = self.gen_scrutinee(value);
+                self.gen_pat_test(pat, root, end);
+                self.scopes.push(HashMap::new());
+                self.gen_pat_bind(pat, root);
+                self.loops.push((top, end));
+                self.gen_block(body);
+                self.loops.pop();
+                self.scopes.pop();
+                self.asm.jmp(top);
                 self.asm.bind(end);
             }
             Stmt::Block(b) => self.gen_block(b),
+        }
+    }
+
+    fn simple_match(&self, scrutinee: &Expr, arms: &[MatchArm]) -> bool {
+        matches!(
+            scrutinee.r#type(),
+            Type::Int(_) | Type::Bool | Type::Enum(_)
+        ) && arms.iter().all(|a| {
+            a.guard.is_none()
+                && a.pats
+                    .iter()
+                    .all(|p| matches!(p.kind, PatKind::Const(_) | PatKind::Wild))
+        })
+    }
+
+    fn gen_simple_match(&mut self, scrutinee: &Expr, arms: &[MatchArm]) {
+        self.gen_expr(scrutinee);
+        let end = self.asm.new_label();
+        let mut labels = Vec::new();
+        let mut wildcard = None;
+        for arm in arms {
+            let label = self.asm.new_label();
+            for p in &arm.pats {
+                match p.kind {
+                    PatKind::Const(v) => {
+                        self.cmp_rax_const(v as i64);
+                        self.asm.jcc(Cond::E, label);
+                    }
+                    _ => {
+                        if wildcard.is_none() {
+                            wildcard = Some(label);
+                        }
+                    }
+                }
+            }
+            labels.push(label);
+        }
+        self.asm.jmp(wildcard.unwrap_or(end));
+        for (arm, label) in arms.iter().zip(labels) {
+            self.asm.bind(label);
+            self.gen_block(&arm.body);
+            if !self.always_exits(&arm.body) {
+                self.asm.jmp(end);
+            }
+        }
+        self.asm.bind(end);
+    }
+
+    fn gen_match(&mut self, scrutinee: &Expr, arms: &[MatchArm]) {
+        let root = self.gen_scrutinee(scrutinee);
+        let end = self.asm.new_label();
+        for arm in arms {
+            let next = self.asm.new_label();
+            let body = self.asm.new_label();
+            let n = arm.pats.len();
+            for (i, p) in arm.pats.iter().enumerate() {
+                if i + 1 < n {
+                    let alt_fail = self.asm.new_label();
+                    self.gen_pat_test(p, root, alt_fail);
+                    self.asm.jmp(body);
+                    self.asm.bind(alt_fail);
+                } else {
+                    self.gen_pat_test(p, root, next);
+                }
+            }
+            self.asm.bind(body);
+            self.scopes.push(HashMap::new());
+            self.gen_pat_bind(&arm.pats[0], root);
+            if let Some(g) = &arm.guard {
+                self.gen_branch(g, false, next);
+            }
+            self.gen_block(&arm.body);
+            self.scopes.pop();
+            if !self.always_exits(&arm.body) {
+                self.asm.jmp(end);
+            }
+            self.asm.bind(next);
+        }
+        self.asm.bind(end);
+    }
+
+    fn gen_scrutinee(&mut self, e: &Expr) -> PLoc {
+        let slot = self.alloc(8, 8);
+        self.gen_expr(e);
+        self.asm.store(Reg::Rbp, slot, Reg::Rax);
+        if e.r#type().is_aggregate() {
+            PLoc::Mem(slot, 0)
+        } else {
+            PLoc::Val(slot)
+        }
+    }
+
+    fn ploc_load(&mut self, loc: PLoc, t: &Type) {
+        use Reg::*;
+        match loc {
+            PLoc::Val(s) => self.load_val(Rax, Place { base: Rbp, disp: s }, t),
+            PLoc::Mem(s, d) => {
+                self.asm.load(Rax, Rbp, s);
+                self.load_val(Rax, Place { base: Rax, disp: d }, t);
+            }
+        }
+    }
+
+    fn ploc_addr(&mut self, loc: PLoc) {
+        use Reg::*;
+        let PLoc::Mem(s, d) = loc else {
+            panic!("ICE: address of a value slot")
+        };
+        self.asm.load(Rax, Rbp, s);
+        if d != 0 {
+            self.asm.lea(Rax, Rax, d);
+        }
+    }
+
+    fn ploc_deref(&mut self, loc: PLoc) -> PLoc {
+        match loc {
+            PLoc::Val(s) => PLoc::Mem(s, 0),
+            PLoc::Mem(..) => {
+                self.ploc_load(loc, &Type::U64);
+                let slot = self.alloc(8, 8);
+                self.asm.store(Reg::Rbp, slot, Reg::Rax);
+                PLoc::Mem(slot, 0)
+            }
+        }
+    }
+
+    fn gen_pat_test(&mut self, p: &Pattern, loc: PLoc, fail: Label) {
+        use Reg::*;
+        let loc = if p.deref { self.ploc_deref(loc) } else { loc };
+        match &p.kind {
+            PatKind::Or(alts) => {
+                let ok = self.asm.new_label();
+                for (i, a) in alts.iter().enumerate() {
+                    if i + 1 < alts.len() {
+                        let next = self.asm.new_label();
+                        self.gen_pat_test(a, loc, next);
+                        self.asm.jmp(ok);
+                        self.asm.bind(next);
+                    } else {
+                        self.gen_pat_test(a, loc, fail);
+                    }
+                }
+                self.asm.bind(ok);
+            }
+            PatKind::Const(v) => {
+                let t = p.r#type.clone().expect("ICE: pattern not typed");
+                self.ploc_load(loc, &t);
+                self.cmp_rax_const(*v as i64);
+                self.asm.jcc(Cond::NE, fail);
+            }
+            PatKind::Ctor { sum, variant, args } => {
+                let l = self.info.sums[*sum].clone();
+                match l.niche {
+                    Some(empty) => {
+                        self.ploc_load(loc, &Type::U64);
+                        self.asm.test_rr(Rax, Rax);
+                        let cc = if *variant == empty { Cond::NE } else { Cond::E };
+                        self.asm.jcc(cc, fail);
+                    }
+                    None => {
+                        self.ploc_load(loc, &Type::Int(l.tag));
+                        self.cmp_rax_const(l.variants[*variant].tag as i64);
+                        self.asm.jcc(Cond::NE, fail);
+                    }
+                }
+                let PLoc::Mem(s, d) = loc else {
+                    panic!("ICE: enum value not in memory")
+                };
+                for (a, (_, off)) in args.iter().zip(&l.variants[*variant].fields) {
+                    self.gen_pat_test(a, PLoc::Mem(s, d + *off as i32), fail);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn gen_pat_bind(&mut self, p: &Pattern, loc: PLoc) {
+        use Reg::*;
+        match &p.kind {
+            PatKind::Bind { name, by_ref, .. } => {
+                let vt = p.r#type.clone().expect("ICE: pattern not typed");
+                let slot = match by_ref {
+                    Some(_) => {
+                        self.ploc_addr(loc);
+                        let slot = self.alloc(8, 8);
+                        self.asm.store(Rbp, slot, Rax);
+                        slot
+                    }
+                    None => {
+                        let slot = self.alloc_ty(&vt);
+                        let dst = Place {
+                            base: Rbp,
+                            disp: slot,
+                        };
+                        if vt.is_aggregate() {
+                            self.ploc_addr(loc);
+                            let size = self.size(&vt);
+                            self.copy_to(dst, Rax, size);
+                        } else {
+                            self.ploc_load(loc, &vt);
+                            self.store_val(dst, Rax, &vt);
+                        }
+                        slot
+                    }
+                };
+                self.declare(
+                    name,
+                    Var {
+                        loc: VarLoc::Frame(slot),
+                    },
+                );
+            }
+            PatKind::Ctor { sum, variant, args } if args.iter().any(Self::pat_binds) => {
+                let loc = if p.deref { self.ploc_deref(loc) } else { loc };
+                let PLoc::Mem(s, d) = loc else {
+                    panic!("ICE: enum value not in memory")
+                };
+                let fields = self.info.sums[*sum].variants[*variant].fields.clone();
+                for (a, (_, off)) in args.iter().zip(&fields) {
+                    self.gen_pat_bind(a, PLoc::Mem(s, d + *off as i32));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn pat_binds(p: &Pattern) -> bool {
+        match &p.kind {
+            PatKind::Bind { .. } => true,
+            PatKind::Ctor { args, .. } => args.iter().any(Self::pat_binds),
+            _ => false,
         }
     }
 
@@ -812,6 +1126,25 @@ impl<'a> Codegen<'a> {
                     }
                 }
             }
+            ExprKind::VariantLit { sum, variant, args } => {
+                let l = self.info.sums[*sum].clone();
+                let v = &l.variants[*variant];
+                if l.niche.is_some() {
+                    if v.fields.is_empty() {
+                        self.zero_fill(dst, l.size);
+                    }
+                } else {
+                    self.asm.mov_ri(Rax, v.tag as i64);
+                    self.store_val(dst, Rax, &Type::Int(l.tag));
+                }
+                for (a, (ft, off)) in args.iter().zip(&v.fields) {
+                    let p = Place {
+                        base: Rbp,
+                        disp: dst.disp + *off as i32,
+                    };
+                    self.gen_init(p, a, ft);
+                }
+            }
             _ if r#type.is_aggregate() => {
                 self.gen_expr(e);
                 let size = self.size(r#type);
@@ -984,29 +1317,11 @@ impl<'a> Codegen<'a> {
                 self.asm.lea_data(Rax, l);
             }
             ExprKind::CStr(s) => {
-                let l = match self.cstrings.get(s) {
-                    Some(&l) => l,
-                    None => {
-                        let mut bytes = s.clone();
-                        bytes.push(0);
-                        let l = self.asm.data_aligned(&bytes, 1);
-                        self.cstrings.insert(s.clone(), l);
-                        l
-                    }
-                };
+                let l = self.intern_cstr(s);
                 self.asm.lea_data(Rax, l);
             }
             ExprKind::WStr(s) => {
-                let l = match self.wstrings.get(s) {
-                    Some(&l) => l,
-                    None => {
-                        let mut bytes: Vec<u8> = s.iter().flat_map(|c| c.to_le_bytes()).collect();
-                        bytes.extend_from_slice(&[0, 0]);
-                        let l = self.asm.data_aligned(&bytes, 2);
-                        self.wstrings.insert(s.clone(), l);
-                        l
-                    }
-                };
+                let l = self.intern_wstr(s);
                 self.asm.lea_data(Rax, l);
             }
             ExprKind::Var(name)
@@ -1034,7 +1349,10 @@ impl<'a> Codegen<'a> {
                 args,
                 target,
             } => self.gen_call(callee, args, target, e.r#type()),
-            ExprKind::StructLit { .. } | ExprKind::ArrayLit(_) | ExprKind::ArrayRepeat { .. } => {
+            ExprKind::StructLit { .. }
+            | ExprKind::ArrayLit(_)
+            | ExprKind::ArrayRepeat { .. }
+            | ExprKind::VariantLit { .. } => {
                 let r#type = e.r#type().clone();
                 let off = self.alloc_ty(&r#type);
                 self.gen_init(
@@ -1064,12 +1382,102 @@ impl<'a> Codegen<'a> {
                 self.asm.store(Rbp, off + 8, Rax);
                 self.asm.lea(Rax, Rbp, off);
             }
-            ExprKind::TypedInt(..) | ExprKind::Path(..) | ExprKind::Sizeof(_) => {
+            ExprKind::TryOp {
+                inner,
+                ok,
+                fail,
+                ret_sum,
+                ret_fail,
+            } => self.gen_try(inner, *ok, *fail, *ret_sum, *ret_fail),
+            ExprKind::TypedInt(..)
+            | ExprKind::Path(..)
+            | ExprKind::Sizeof(_)
+            | ExprKind::Turbofish { .. }
+            | ExprKind::TypePath { .. }
+            | ExprKind::Try(_) => {
                 panic!(
                     "ICE: {:?} should have been rewritten by the type checker",
                     e.kind
                 )
             }
+        }
+    }
+
+    fn gen_try(&mut self, inner: &Expr, ok: usize, fail: usize, ret_sum: usize, ret_fail: usize) {
+        use Reg::*;
+        let Type::Sum(id) = inner.r#type().clone() else {
+            unreachable!()
+        };
+        let l = self.info.sums[id].clone();
+        let rl = self.info.sums[ret_sum].clone();
+        let slot = self.alloc(8, 8);
+        self.gen_expr(inner);
+        self.asm.store(Rbp, slot, Rax);
+        let ok_label = self.asm.new_label();
+        match l.niche {
+            Some(_) => {
+                self.ploc_load(PLoc::Mem(slot, 0), &Type::U64);
+                self.asm.test_rr(Rax, Rax);
+                self.asm.jcc(Cond::NE, ok_label);
+            }
+            None => {
+                self.ploc_load(PLoc::Mem(slot, 0), &Type::Int(l.tag));
+                self.cmp_rax_const(l.variants[ok].tag as i64);
+                self.asm.jcc(Cond::E, ok_label);
+            }
+        }
+
+        let sret = self
+            .sret
+            .expect("ICE: '?' in a function without an enum result");
+        self.asm.load(Rdi, Rbp, sret);
+        match rl.niche {
+            Some(_) => self.zero_fill(Place { base: Rdi, disp: 0 }, rl.size),
+            None => {
+                self.asm.mov_ri(Rax, rl.variants[ret_fail].tag as i64);
+                self.store_val(Place { base: Rdi, disp: 0 }, Rax, &Type::Int(rl.tag));
+            }
+        }
+        if let (Some((et, src_off)), Some((_, dst_off))) = (
+            l.variants[fail].fields.first().cloned(),
+            rl.variants[ret_fail].fields.first().cloned(),
+        ) {
+            self.asm.load(Rsi, Rbp, slot);
+            if src_off != 0 {
+                self.asm.lea(Rsi, Rsi, src_off as i32);
+            }
+            let size = self.size(&et);
+            if et.is_aggregate() {
+                self.copy_to(
+                    Place {
+                        base: Rdi,
+                        disp: dst_off as i32,
+                    },
+                    Rsi,
+                    size,
+                );
+            } else {
+                self.load_val(Rax, Place { base: Rsi, disp: 0 }, &et);
+                self.store_val(
+                    Place {
+                        base: Rdi,
+                        disp: dst_off as i32,
+                    },
+                    Rax,
+                    &et,
+                );
+            }
+        }
+        self.asm.load(Rax, Rbp, sret);
+        let ret = self.ret_label.expect("ICE: '?' outside a function");
+        self.asm.jmp(ret);
+
+        self.asm.bind(ok_label);
+        let (vt, off) = l.variants[ok].fields[0].clone();
+        if vt.is_aggregate() {
+            self.ploc_addr(PLoc::Mem(slot, off as i32));
+        } else {
+            self.ploc_load(PLoc::Mem(slot, off as i32), &vt);
         }
     }
 

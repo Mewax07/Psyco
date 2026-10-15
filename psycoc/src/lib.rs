@@ -7,6 +7,7 @@ pub mod lexer;
 pub mod parser;
 pub mod pe;
 pub mod platform;
+pub mod resolver;
 pub mod runtime;
 pub mod typeck;
 
@@ -19,5 +20,6 @@ pub use lexer::*;
 pub use parser::*;
 pub use pe::*;
 pub use platform::*;
+pub use resolver::*;
 pub use runtime::*;
 pub use typeck::*;

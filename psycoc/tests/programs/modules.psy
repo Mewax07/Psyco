@@ -1,0 +1,112 @@
+const limit: u64 = 100
+
+fn helper() -> u64 {
+    return 1
+}
+
+mod elf {
+    const magic: u32 = 0x464C457F
+    const pt_load: u32 = 1
+
+    struct Header {
+        kind: u32,
+        size: u64,
+    }
+
+    impl Header {
+        fn new(kind: u32) -> Header {
+            return Header { kind: kind, size: limit }
+        }
+
+        fn is_load(&self) -> bool {
+            return self.kind == pt_load
+        }
+    }
+
+    enum Seg {
+        Load(u64),
+        Note,
+    }
+
+    trait Size {
+        fn size(&self) -> u64
+    }
+
+    impl Size for Header {
+        fn size(&self) -> u64 {
+            return self.size * 2
+        }
+    }
+
+    struct Pair<T> {
+        a: T,
+        b: T,
+    }
+
+    #[getter]
+    static mut count: u64 = 0
+
+    fn helper() -> u64 {
+        return 2
+    }
+
+    fn check() -> u64 {
+        return helper() * 10
+    }
+
+    fn bump() {
+        count += 1
+    }
+
+    fn first<T>(a: T, b: T) -> T {
+        return a
+    }
+
+    mod inner {
+        fn deep() -> u64 {
+            return helper() + 100
+        }
+    }
+}
+
+mod net {
+    const pt_load: u32 = 77
+
+    fn helper() -> u64 {
+        return 3
+    }
+}
+
+fn main() {
+    print(elf::magic, elf::pt_load, net::pt_load)
+    let h = elf::Header::new(1)
+    print(h.is_load(), h.size, h.size())
+    print(helper(), elf::helper(), net::helper(), elf::check(), elf::inner::deep())
+    let s = elf::Seg::Load(5)
+    match s {
+        elf::Seg::Load(n) => print("load", n),
+        elf::Seg::Note => print("note"),
+    }
+    elf::bump()
+    elf::bump()
+    print(elf::get_count())
+    let p = elf::Pair { a: 7u8, b: 1 }
+    let q: elf::Pair<u16> = elf::Pair { a: 2, b: 3 }
+    print(p.a, q.b, elf::first(4, 5), elf::first::<u16>(9, 1))
+    let x: elf::Header = elf::Header { kind: 2, size: 9 }
+    print(x.is_load(), x.size())
+    match 77u32 {
+        elf::pt_load => print("elf"),
+        net::pt_load => print("net"),
+        _ => print("other"),
+    }
+}
+
+//> 1179403647 1 77
+//> true 100 200
+//> 1 2 3 20 102
+//> load 5
+//> 2
+//> 7 3 4 9
+//> false 18
+//> net

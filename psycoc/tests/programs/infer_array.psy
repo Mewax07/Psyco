@@ -1,0 +1,32 @@
+struct Pair { a: u8, b: u8 }
+
+fn sum8(b: &[u8]) -> u64 {
+    let mut s: u64 = 0
+    for i in 0..b.len() {
+        s += b[i] as u64
+    }
+    return s
+}
+
+fn first16(b: &[u16]) -> u16 { return b[0] }
+fn low(b: &[i8]) -> i8 { return b[1] }
+fn corner(g: &[[u8; 2]]) -> u8 { return g[1][1] }
+fn second(p: &[Pair]) -> u8 { return p[1].b }
+
+fn bump(b: &mut [u32]) -> u32 {
+    b[0] += 1
+    return b[0] + b[1]
+}
+
+fn main() {
+    print(sum8(&[0x23, 0x10, 255]), first16(&[0xFFFF, 1]), low(&[0, -128]))
+    print(corner(&[[1, 2], [3, 4]]), second(&[Pair { a: 1, b: 2 }, Pair { a: 3, b: 4 }]))
+    print(sum8(&[7; 3]), bump(&mut [1, 0xFFFFFFFD]))
+    let s: &[u16] = &[10, 20, 30]
+    print(s.len(), s[2])
+}
+
+//> 306 65535 -128
+//> 4 4
+//> 21 4294967295
+//> 3 30

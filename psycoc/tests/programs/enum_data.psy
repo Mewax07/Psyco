@@ -1,0 +1,131 @@
+enum Event {
+    Key(u8),
+    Tick,
+    Move(i32, i32),
+}
+
+enum Shape {
+    Dot,
+    Line(Event, u64),
+}
+
+enum MaybeNum {
+    Nothing,
+    Num(&u64),
+}
+
+struct Slot {
+    id: u16,
+    ev: Event,
+}
+
+static start: Event = Event::Move(-1, 2)
+
+fn describe(e: Event) -> i64 {
+    match e {
+        Event::Key(c) if c == 'q' => return -1,
+        Event::Key(c) => return c as i64,
+        Event::Tick => return 0,
+        Event::Move(x, y) => return (x + y) as i64,
+    }
+}
+
+fn next(n: u8) -> Event {
+    if n % 3 == 0 {
+        return Event::Tick
+    }
+    if n % 3 == 1 {
+        return Event::Key('a' + n)
+    }
+    return Event::Move(n as i32, -(n as i32))
+}
+
+fn nudge(e: &mut Event) {
+    match e {
+        Event::Move(x, _) => *x += 100,
+        Event::Key(k) => *k += 1,
+        Event::Tick => {}
+    }
+}
+
+fn read(m: MaybeNum) -> u64 {
+    match m {
+        MaybeNum::Num(r) => return *r,
+        MaybeNum::Nothing => return 0,
+    }
+}
+
+fn depth(s: &Shape) -> u64 {
+    match s {
+        Shape::Line(Event::Move(_, y), n) if *y < 0 => return *n + 1000,
+        Shape::Line(Event::Key(_) | Event::Tick, n) => return *n,
+        Shape::Line(_, n) => return *n + 1,
+        Shape::Dot => return 7,
+    }
+}
+
+fn main() {
+    print(describe(Event::Key('q')), describe(Event::Key(65)), describe(Event::Tick), describe(Event::Move(3, 4)))
+    print(sizeof(Event), sizeof(Shape), sizeof(MaybeNum), sizeof(Slot))
+
+    let mut events = [Event::Tick; 4]
+    for i in 0..events.len() {
+        events[i] = next(i as u8 + 1)
+    }
+    let mut sum: i64 = 0
+    for i in 0..events.len() {
+        sum += describe(events[i])
+    }
+    print(sum)
+
+    let mut e = Event::Move(1, 2)
+    nudge(&mut e)
+    if let Event::Move(x, y) = e {
+        print(x, y)
+    }
+    let mut k = Event::Key(41)
+    nudge(&mut k)
+    if let Event::Tick = k {
+        print("no")
+    } else if let Event::Key(c) = k {
+        print("key", c)
+    }
+
+    let v: u64 = 42
+    print(read(MaybeNum::Num(&v)), read(MaybeNum::Nothing))
+
+    let s = Slot { id: 3, ev: Event::Key(9) }
+    match s.ev {
+        Event::Key(c) => print("slot", s.id, c),
+        _ => print("other"),
+    }
+    print(describe(start))
+
+    print(depth(&Shape::Line(Event::Move(1, -1), 5)), depth(&Shape::Line(Event::Tick, 5)), depth(&Shape::Line(Event::Move(1, 1), 5)), depth(&Shape::Dot))
+
+    let mut n: u8 = 0
+    let mut ev = next(n)
+    while let Event::Tick | Event::Key(_) = ev {
+        n += 1
+        ev = next(n)
+    }
+    print("stopped at", n)
+
+    let flag = true
+    match flag {
+        true => print("t"),
+        false => print("f"),
+    }
+}
+
+//> -1 65 0 7
+//> 12 24 8 16
+//> 199
+//> 101 2
+//> key 42
+//> 42 0
+//> slot 3 9
+//> 1
+//> 1005 5 6 7
+//> stopped at 2
+//> t

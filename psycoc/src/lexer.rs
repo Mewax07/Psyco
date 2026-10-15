@@ -17,6 +17,7 @@ pub enum TokenKind {
     Struct,   // struct ...
     Enum,     // enum ...
     Impl,     // impl ...
+    Trait,    // trait ...
     Match,    // match ...
     As,       // as ...
     Static,   // static ...
@@ -63,12 +64,13 @@ pub enum TokenKind {
     StarPercent,  // *%
 
     // Bitwise
-    Amp,   // &
-    Pipe,  // |
-    Caret, // ^
-    Tilde, // ~
-    Shl,   // <<
-    Shr,   // >>
+    Amp,      // &
+    Pipe,     // |
+    Caret,    // ^
+    Tilde,    // ~
+    Shl,      // <<
+    Shr,      // >>
+    Question, // ?
 
     // Arrows
     Arrow,    // ->
@@ -369,6 +371,7 @@ impl Lexer {
                     T::Pipe
                 }
             }
+            '?' => T::Question,
             ':' => {
                 if self.eat(':') {
                     T::ColonColon
@@ -553,6 +556,7 @@ impl Lexer {
             "struct" => T::Struct,
             "enum" => T::Enum,
             "impl" => T::Impl,
+            "trait" => T::Trait,
             "match" => T::Match,
             "as" => T::As,
             "static" => T::Static,

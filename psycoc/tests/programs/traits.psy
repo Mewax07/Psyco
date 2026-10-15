@@ -1,0 +1,118 @@
+trait Shape {
+    fn area(&self) -> u64
+    fn sides(&self) -> u8 {
+        return 0
+    }
+    fn describe(&self) -> u64 {
+        return self.area() * 10 + self.sides() as u64
+    }
+}
+
+trait Named {
+    fn name() -> Str
+}
+
+trait Grow {
+    fn grow(&mut self, by: u64)
+}
+
+struct Square {
+    side: u64,
+}
+
+struct Circle {
+    r: u64,
+}
+
+struct Wrap<T> {
+    inner: T,
+    count: u64,
+}
+
+impl Shape for Square {
+    fn area(&self) -> u64 {
+        return self.side * self.side
+    }
+    fn sides(&self) -> u8 {
+        return 4
+    }
+}
+
+impl Shape for Circle {
+    fn area(&self) -> u64 {
+        return 3 * self.r * self.r
+    }
+}
+
+impl Named for Square {
+    fn name() -> Str {
+        return "square"
+    }
+}
+
+impl Named for Circle {
+    fn name() -> Str {
+        return "circle"
+    }
+}
+
+impl Grow for Square {
+    fn grow(&mut self, by: u64) {
+        self.side += by
+    }
+}
+
+impl<T: Shape> Shape for Wrap<T> {
+    fn area(&self) -> u64 {
+        return self.inner.area() * self.count
+    }
+}
+
+impl Shape for u8 {
+    fn area(&self) -> u64 {
+        return *self as u64
+    }
+}
+
+fn total<T: Shape>(items: &[T]) -> u64 {
+    let mut sum: u64 = 0
+    for i in 0..items.len() {
+        sum += items[i].area()
+    }
+    return sum
+}
+
+fn label<T: Shape + Named>(x: &T) -> Str {
+    if x.area() > 50 {
+        return T::name()
+    }
+    return "small"
+}
+
+fn grow_twice<T: Grow + Shape>(x: &mut T) -> u64 {
+    x.grow(1)
+    x.grow(1)
+    return x.area()
+}
+
+fn main() {
+    let s = Square { side: 3 }
+    let c = Circle { r: 5 }
+    print(s.area(), c.area(), s.sides(), c.sides())
+    print(s.describe(), c.describe())
+    print(total(&[Square { side: 1 }, Square { side: 2 }]), total(&[7u8, 8]))
+    print(label(&s), label(&c), Square::name())
+    let w = Wrap { inner: Circle { r: 1 }, count: 4 }
+    print(w.area(), w.describe())
+    let mut g = Square { side: 2 }
+    print(grow_twice(&mut g), g.side)
+    print(9u8.area())
+}
+
+//> 9 75 4 0
+//> 94 750
+//> 5 15
+//> small circle square
+//> 12 120
+//> 16 4
+//> 9

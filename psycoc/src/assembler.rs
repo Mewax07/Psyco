@@ -159,7 +159,8 @@ pub enum RwLabel {
     Bss(usize),
 }
 
-enum Target {
+#[derive(Debug, Clone, Copy)]
+pub enum AddrTarget {
     Code(Label),
     Data(DataLabel),
     Rw(RwLabel),
@@ -167,7 +168,7 @@ enum Target {
 
 struct Fixup {
     pos: usize,
-    target: Target,
+    target: AddrTarget,
 }
 
 pub struct Assembler {
@@ -177,6 +178,8 @@ pub struct Assembler {
     pub bss_size: usize,
     labels: Vec<Option<usize>>,
     fixups: Vec<Fixup>,
+    abs_fixups: Vec<(usize, AddrTarget, i64)>,
+    pub abs_slots: Vec<u64>,
 }
 
 impl Default for Assembler {
@@ -194,6 +197,8 @@ impl Assembler {
             bss_size: 0,
             labels: Vec::new(),
             fixups: Vec::new(),
+            abs_fixups: Vec::new(),
+            abs_slots: Vec::new(),
         }
     }
 
@@ -323,7 +328,7 @@ impl Assembler {
         }
     }
 
-    fn rel32(&mut self, target: Target) {
+    fn rel32(&mut self, target: AddrTarget) {
         self.fixups.push(Fixup {
             pos: self.code.len(),
             target,
@@ -331,17 +336,51 @@ impl Assembler {
         self.bytes(&[0; 4]); // fix in link()
     }
 
-    pub fn link(&mut self, code_addr: u64, rodata_addr: u64, data_addr: u64) {
+    pub fn abs_address(&mut self, offset: usize, target: AddrTarget, addend: i64) {
+        self.abs_fixups.push((offset, target, addend));
+    }
+
+    pub fn has_abs(&self) -> bool {
+        !self.abs_fixups.is_empty()
+    }
+
+    pub fn abs_offsets(&self) -> Vec<usize> {
+        self.abs_fixups.iter().map(|(o, _, _)| *o).collect()
+    }
+
+    fn target_addr(&self, t: &AddrTarget, code_addr: u64, rodata_addr: u64, data_addr: u64) -> u64 {
         let bss_addr = data_addr + self.bss_offset() as u64;
+        match t {
+            AddrTarget::Code(l) => {
+                code_addr + self.labels[l.0].expect("ICE: label never bound") as u64
+            }
+            AddrTarget::Data(d) => rodata_addr + d.0 as u64,
+            AddrTarget::Rw(RwLabel::Data(o)) => data_addr + *o as u64,
+            AddrTarget::Rw(RwLabel::Bss(o)) => bss_addr + *o as u64,
+        }
+    }
+
+    pub fn link(&mut self, code_addr: u64, rodata_addr: u64, data_addr: u64) {
+        self.link_with_base(code_addr, rodata_addr, data_addr, 0);
+    }
+
+    pub fn link_with_base(
+        &mut self,
+        code_addr: u64,
+        rodata_addr: u64,
+        data_addr: u64,
+        abs_base: u64,
+    ) {
+        self.abs_slots.clear();
+        for i in 0..self.abs_fixups.len() {
+            let (off, t, addend) = self.abs_fixups[i];
+            let v = (abs_base + self.target_addr(&t, code_addr, rodata_addr, data_addr)) as i64
+                + addend;
+            self.data[off..off + 8].copy_from_slice(&v.to_le_bytes());
+            self.abs_slots.push(data_addr + off as u64);
+        }
         for fixup in &self.fixups {
-            let target = match &fixup.target {
-                Target::Code(l) => {
-                    code_addr + self.labels[l.0].expect("ICE: label never bound") as u64
-                }
-                Target::Data(d) => rodata_addr + d.0 as u64,
-                Target::Rw(RwLabel::Data(o)) => data_addr + *o as u64,
-                Target::Rw(RwLabel::Bss(o)) => bss_addr + *o as u64,
-            };
+            let target = self.target_addr(&fixup.target, code_addr, rodata_addr, data_addr);
             let next_ip = code_addr + fixup.pos as u64 + 4;
             let rel = i32::try_from(target as i64 - next_ip as i64).expect("ICE: jump too far");
             self.code[fixup.pos..fixup.pos + 4].copy_from_slice(&rel.to_le_bytes());
@@ -371,17 +410,17 @@ impl Assembler {
 
     pub fn jmp(&mut self, label: Label) {
         self.byte(0xE9);
-        self.rel32(Target::Code(label))
+        self.rel32(AddrTarget::Code(label))
     }
 
     pub fn jcc(&mut self, cc: Cond, label: Label) {
         self.bytes(&[0x0F, 0x80 + cc as u8]);
-        self.rel32(Target::Code(label));
+        self.rel32(AddrTarget::Code(label));
     }
 
     pub fn call(&mut self, label: Label) {
         self.byte(0xE8);
-        self.rel32(Target::Code(label));
+        self.rel32(AddrTarget::Code(label));
     }
 
     pub fn call_r(&mut self, r: Reg) {
@@ -554,21 +593,21 @@ impl Assembler {
         self.rex(true, dst.ext(), 0);
         self.byte(0x8D);
         self.byte(0b00 << 6 | dst.low() << 3 | 0b101);
-        self.rel32(Target::Data(data));
+        self.rel32(AddrTarget::Data(data));
     }
 
     pub fn lea_rw(&mut self, dst: Reg, data: RwLabel) {
         self.rex(true, dst.ext(), 0);
         self.byte(0x8D);
         self.byte(dst.low() << 3 | 0b101);
-        self.rel32(Target::Rw(data));
+        self.rel32(AddrTarget::Rw(data));
     }
 
     pub fn lea_code(&mut self, dst: Reg, label: Label) {
         self.rex(true, dst.ext(), 0);
         self.byte(0x8D);
         self.byte(dst.low() << 3 | 0b101);
-        self.rel32(Target::Code(label));
+        self.rel32(AddrTarget::Code(label));
     }
 
     pub fn alu_rr(&mut self, op: Alu, dst: Reg, src: Reg) {
@@ -811,14 +850,14 @@ impl Assembler {
         self.rex(true, src.ext(), 0);
         self.byte(0x89);
         self.byte(src.low() << 3 | 0b101);
-        self.rel32(Target::Rw(data));
+        self.rel32(AddrTarget::Rw(data));
     }
 
     pub fn load_rw(&mut self, dst: Reg, data: RwLabel) {
         self.rex(true, dst.ext(), 0);
         self.byte(0x8B);
         self.byte(dst.low() << 3 | 0b101);
-        self.rel32(Target::Rw(data));
+        self.rel32(AddrTarget::Rw(data));
     }
 
     pub fn sysretq(&mut self) {

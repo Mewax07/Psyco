@@ -1,0 +1,33 @@
+#![trusted]
+
+fn one() -> u64 {
+    return 1
+}
+
+fn two() -> u64 {
+    return 2
+}
+
+static table: [fn() -> u64; 2] = [one, two]
+static names: [Str; 2] = ["one", "two"]
+static target: u64 = 77
+static ptr: *const u64 = &target as *const u64
+
+fn main() {
+    print(names[0], table[0](), names[1], table[1]())
+    print(ptr.read())
+    let before = ptr as u64
+    print("address ok:", before == &target as *const u64 as u64)
+    rebase_statics(0x1000)
+    print("moved:", ptr as u64 - before)
+    rebase_statics(0xFFFFFFFFFFFFF000)
+    print("back:", ptr as u64 == before, table[1]())
+    exit(15)
+}
+
+//> one 1 two 2
+//> 77
+//> address ok: true
+//> moved: 4096
+//> back: true 2
+// exit: 15

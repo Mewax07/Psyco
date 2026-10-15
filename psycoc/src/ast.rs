@@ -93,6 +93,7 @@ pub enum Type {
     Array(Box<Type>, u64),
     Struct(usize),
     Enum(usize),
+    Sum(usize),
     Fn(Box<FnType>),
 }
 
@@ -133,7 +134,10 @@ impl Type {
     }
 
     pub fn is_aggregate(&self) -> bool {
-        matches!(self, Type::Struct(_) | Type::Array(..) | Type::Slice(..))
+        matches!(
+            self,
+            Type::Struct(_) | Type::Array(..) | Type::Slice(..) | Type::Sum(_)
+        )
     }
 }
 
@@ -153,8 +157,17 @@ pub fn attr_arg(attrs: &[Attr], name: &str) -> Option<u64> {
 }
 
 #[derive(Debug, Clone)]
+pub struct GenericParam {
+    pub name: String,
+    pub bounds: Vec<String>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
 pub enum TypeExprKind {
     Named(String),
+    Generic(String, Vec<TypeExpr>),
+    Resolved(Type),
     Unit,
     Ref {
         inner: Box<TypeExpr>,
@@ -319,7 +332,14 @@ pub enum ExprKind {
     },
     StructLit {
         name: String,
+        args: Vec<TypeExpr>,
         fields: Vec<(String, Expr, Span)>,
+    },
+    Turbofish {
+        owner: String,
+        owner_args: Vec<TypeExpr>,
+        member: Option<String>,
+        member_args: Vec<TypeExpr>,
     },
     ArrayLit(Vec<Expr>),
     ArrayRepeat {
@@ -333,11 +353,75 @@ pub enum ExprKind {
         end: Option<Box<Expr>>,
     },
     Unsize(Box<Expr>),
+    TypePath {
+        ty: TypeExpr,
+        member: String,
+        member_args: Vec<TypeExpr>,
+    },
+    Try(Box<Expr>),
+    TryOp {
+        inner: Box<Expr>,
+        ok: usize,
+        fail: usize,
+        ret_sum: usize,
+        ret_fail: usize,
+    },
+    VariantLit {
+        sum: usize,
+        variant: usize,
+        args: Vec<Expr>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub enum PatKind {
+    Wild,
+    Ident(String),
+    MutBind(String),
+    Path(String, String),
+    Variant {
+        owner: Option<String>,
+        name: String,
+        args: Vec<Pattern>,
+    },
+    Lit(Box<Expr>),
+    Or(Vec<Pattern>),
+    Bind {
+        name: String,
+        mutable: bool,
+        by_ref: Option<bool>,
+    },
+    Const(i128),
+    Ctor {
+        sum: usize,
+        variant: usize,
+        args: Vec<Pattern>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct Pattern {
+    pub kind: PatKind,
+    pub span: Span,
+    pub r#type: Option<Type>,
+    pub deref: bool,
+}
+
+impl Pattern {
+    pub fn new(kind: PatKind, span: Span) -> Self {
+        Pattern {
+            kind,
+            span,
+            r#type: None,
+            deref: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct MatchArm {
-    pub patterns: Option<Vec<Expr>>,
+    pub pats: Vec<Pattern>,
+    pub guard: Option<Expr>,
     pub body: Block,
     pub span: Span,
 }
@@ -392,6 +476,19 @@ pub enum Stmt {
         arms: Vec<MatchArm>,
         span: Span,
     },
+    IfLet {
+        pat: Pattern,
+        value: Expr,
+        then_block: Block,
+        else_block: Option<Block>,
+        span: Span,
+    },
+    WhileLet {
+        pat: Pattern,
+        value: Expr,
+        body: Block,
+        span: Span,
+    },
     Block(Block),
 }
 
@@ -412,6 +509,8 @@ pub struct Param {
 #[derive(Debug, Clone)]
 pub struct Function {
     pub name: String,
+    pub module: String,
+    pub generics: Vec<GenericParam>,
     pub params: Vec<Param>,
     pub return_type: Option<TypeExpr>,
     pub body: Block,
@@ -430,6 +529,8 @@ pub struct FieldDef {
 #[derive(Debug, Clone)]
 pub struct StructDef {
     pub name: String,
+    pub module: String,
+    pub generics: Vec<GenericParam>,
     pub fields: Vec<FieldDef>,
     pub attrs: Vec<Attr>,
     pub span: Span,
@@ -439,12 +540,15 @@ pub struct StructDef {
 pub struct Variant {
     pub name: String,
     pub value: Option<Expr>,
+    pub fields: Option<Vec<TypeExpr>>,
     pub span: Span,
 }
 
 #[derive(Debug, Clone)]
 pub struct EnumDef {
     pub name: String,
+    pub module: String,
+    pub generics: Vec<GenericParam>,
     pub repr: Option<TypeExpr>,
     pub variants: Vec<Variant>,
     pub span: Span,
@@ -453,6 +557,7 @@ pub struct EnumDef {
 #[derive(Debug, Clone)]
 pub struct StaticDef {
     pub name: String,
+    pub module: String,
     pub mutable: bool,
     pub r#type: TypeExpr,
     pub init: Option<Expr>,
@@ -463,15 +568,37 @@ pub struct StaticDef {
 #[derive(Debug, Clone)]
 pub struct ConstDef {
     pub name: String,
+    pub module: String,
     pub r#type: Option<TypeExpr>,
     pub value: Expr,
     pub span: Span,
 }
 
+#[derive(Debug, Clone)]
+pub struct ImplDef {
+    pub module: String,
+    pub generics: Vec<GenericParam>,
+    pub self_ty: TypeExpr,
+    pub trait_name: Option<String>,
+    pub methods: Vec<Function>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct TraitDef {
+    pub name: String,
+    pub module: String,
+    pub methods: Vec<(Function, bool)>,
+    pub span: Span,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Program {
-    pub imports: Vec<(String, Span)>,
+    pub traits: Vec<TraitDef>,
+    pub imports: Vec<(String, Option<String>, Span)>,
+    pub modules: Vec<String>,
     pub functions: Vec<Function>,
+    pub impls: Vec<ImplDef>,
     pub structs: Vec<StructDef>,
     pub enums: Vec<EnumDef>,
     pub statics: Vec<StaticDef>,
@@ -481,6 +608,13 @@ pub struct Program {
 impl Program {
     pub fn merge(&mut self, other: Program) {
         self.functions.extend(other.functions);
+        self.impls.extend(other.impls);
+        self.traits.extend(other.traits);
+        for m in other.modules {
+            if !self.modules.contains(&m) {
+                self.modules.push(m);
+            }
+        }
         self.structs.extend(other.structs);
         self.enums.extend(other.enums);
         self.statics.extend(other.statics);

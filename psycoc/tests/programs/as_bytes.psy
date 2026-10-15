@@ -1,0 +1,29 @@
+fn count(b: &[u8], c: u8) -> u64 {
+    let mut n: u64 = 0
+    for i in 0..b.len() {
+        if b[i] == c {
+            n += 1
+        }
+    }
+    return n
+}
+
+fn greeting() -> &[u8] { return "hello".as_bytes() }
+
+fn main() {
+    let b = "banana".as_bytes()
+    print(b.len(), b[0], count(b, 'a'), count("".as_bytes(), 'a'))
+    let mid = &b[1..4]
+    print(mid.len(), mid[0], mid[2])
+    let word = "banana"
+    print(greeting()[4], word.as_bytes().as_ptr() == word.as_ptr())
+    let e = "a\x00b".as_bytes()
+    print(e.len(), e[1], e[2])
+    print(b[6])
+}
+
+//> 6 98 3 0
+//> 3 97 97
+//> 111 true
+//> 3 0 98
+// exit: 101

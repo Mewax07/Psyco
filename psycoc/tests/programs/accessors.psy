@@ -1,0 +1,15 @@
+#[getter, setter]
+static mut ticks: u64 = 0
+
+fn call(f: fn() -> u64) -> u64 { return f() }
+
+fn main() {
+    set_ticks(get_ticks() + 5)
+    print(get_ticks(), call(get_ticks))
+    let set = set_ticks
+    set(9)
+    print(ticks)
+}
+
+//> 5 5
+//> 9

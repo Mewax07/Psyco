@@ -1,0 +1,14 @@
+import "../../../psycos/src/kernel.psy"
+
+//> PsycOS: boot ok
+//> psycos> cat /readme.txt
+//> hello from the disk
+//> psycos> run /bin/hello
+//> hello from ring 3, pid
+//> exit code 0
+//> counter
+//> exit code 7
+//> trying cli in ring 3...
+//> exit code 141
+//> Heap: 0 bytes in 0 blocks
+// exit: 0

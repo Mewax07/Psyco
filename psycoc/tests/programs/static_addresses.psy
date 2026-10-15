@@ -1,0 +1,65 @@
+#![trusted]
+
+struct Command {
+    name: Str,
+    run: fn(u64) -> u64,
+}
+
+fn double(x: u64) -> u64 {
+    return x * 2
+}
+
+fn square(x: u64) -> u64 {
+    return x * x
+}
+
+fn negate_ish(x: u64) -> u64 {
+    return 1000 - x
+}
+
+static table: [fn(u64) -> u64; 3] = [double, square, negate_ish]
+static names: [Str; 3] = ["double", "square", "negate"]
+static commands: [Command; 2] = [Command { name: "dbl", run: double }, Command { name: "sq", run: square }]
+static mut current: fn(u64) -> u64 = square
+static hook: Option<fn(u64) -> u64> = Some(double)
+static greeting: *const u8 = c"hi"
+static answer: u64 = 40
+static mut later: u64 = 2
+static answer_ptr: *const u64 = &answer as *const u64
+static later_ptr: *mut u64 = &mut later as *mut u64
+static same_three: [Str; 3] = ["x"; 3]
+
+fn main() {
+    for i in 0..table.len() {
+        let f = table[i]
+        print(names[i], f(7))
+    }
+    for i in 0..commands.len() {
+        print(commands[i].name, commands[i].run(5))
+    }
+    print(current(3))
+    current = negate_ish
+    print(current(3))
+    if let Some(h) = hook {
+        print("hook", h(21))
+    }
+    print(greeting.read(), greeting.add(1).read())
+    later_ptr.write(later_ptr.read() + 0)
+    print(answer_ptr.read() + later)
+    print(same_three[0], same_three[2])
+    rebase_statics(0)
+    print(table[1](9))
+}
+
+//> double 14
+//> square 49
+//> negate 993
+//> dbl 10
+//> sq 25
+//> 9
+//> 997
+//> hook 42
+//> 104 105
+//> 42
+//> x x
+//> 81

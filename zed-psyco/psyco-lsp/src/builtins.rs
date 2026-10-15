@@ -70,6 +70,9 @@ pub const BUILTINS: &[Builtin] = &[
     builtin!("iret_to"("rip: u64", "cs: u64", "rflags: u64", "rsp: u64", "ss: u64"), "", true, "Pushes an interrupt frame and runs `iretq` (e.g. to enter user mode). Never returns."),
     builtin!("include_bytes"("path: Str"), "Str", false, "Embeds the bytes of a file, read at compile time. `path` is a string literal relative to the source file."),
     builtin!("include_program"("path: Str"), "Str", false, "Compiles another Psyco program for Linux x86-64 and embeds the resulting ELF executable. `path` is a string literal relative to the source file; the program needs its own `main`."),
+    builtin!("slice_from_raw"("ptr: *const T", "len: usize"), "&[T]", true, "Makes a slice from a raw pointer and a number of elements."),
+    builtin!("slice_from_raw_mut"("ptr: *mut T", "len: usize"), "&mut [T]", true, "Makes a mutable slice from a `*mut` pointer and a number of elements."),
+    builtin!("rebase_statics"("delta: u64"), "", true, "Adds `delta` to every static holding an address (function pointers, string and static addresses), after the image moved in memory."),
     builtin!("context_switch"("save: *mut u64", "next_rsp: u64"), "", true, "Saves the callee-saved registers and the resume address on the current stack, stores its `rsp` in `*save`, then switches to the stack `next_rsp` and resumes the context saved there."),
 ];
 
@@ -141,6 +144,7 @@ pub fn linux_syscall(number: u64) -> Option<&'static str> {
 /// Methods the compiler provides on arrays, slices, strings and raw pointers.
 pub const METHODS: &[Builtin] = &[
     builtin!("len"(), "usize", false, "Number of elements of an array, slice or string."),
+    builtin!("as_bytes"(), "&[u8]", false, "The bytes of a string, as a slice."),
     builtin!("as_ptr"(), "*const T", false, "Pointer to the first element of an array, slice or string."),
     builtin!("as_mut_ptr"(), "*mut T", false, "Mutable pointer to the first element of a mutable array or `&mut [T]` slice."),
     builtin!("is_null"(), "bool", false, "Whether a raw pointer is null."),
@@ -178,6 +182,9 @@ pub const KEYWORDS: &[(&str, &str)] = &[
     ("extern", "Uses the UEFI (Microsoft x64) calling convention for a function type."),
     ("import", "Imports another source file: `import \"path.psy\"`."),
     ("sizeof", "Size of a type in bytes: `sizeof(T)`."),
+    ("trait", "Declares a trait: methods a type promises to have, possibly with default bodies."),
+    ("mod", "Declares a module: `mod name { ... }`, whose items are reached as `name::item`."),
+    ("Self", "The type of the enclosing `impl` block."),
     ("true", "Boolean true."),
     ("false", "Boolean false."),
 ];
@@ -285,5 +292,10 @@ pub const SNIPPETS: &[(&str, &str, &str)] = &[
     ("static", "static NAME: T = value", "static ${1:NAME}: ${2:u64} = $0"),
     ("static mut", "static mut NAME: T = value", "static mut ${1:NAME}: ${2:u64} = $0"),
     ("import", "import \"file.psy\"", "import \"${1:file}.psy\""),
+    ("trait", "trait Name { fn method(&self) }", "trait ${1:Name} {\n\tfn ${2:method}(&self)$0\n}"),
+    ("impl for", "impl Trait for Type { }", "impl ${1:Trait} for ${2:Type} {\n\t$0\n}"),
+    ("mod", "mod name { }", "mod ${1:name} {\n\t$0\n}"),
+    ("if let", "if let Some(x) = value { }", "if let ${1:Some(x)} = ${2:value} {\n\t$0\n}"),
+    ("while let", "while let Some(x) = value { }", "while let ${1:Some(x)} = ${2:value} {\n\t$0\n}"),
     ("print", "print(values...)", "print($0)"),
 ];

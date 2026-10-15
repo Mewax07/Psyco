@@ -1,0 +1,79 @@
+mod store {
+    trait Weigh {
+        fn weight(&self) -> u64
+    }
+
+    struct Item {
+        id: u32,
+        kg: u64,
+    }
+
+    impl Weigh for Item {
+        fn weight(&self) -> u64 {
+            return self.kg
+        }
+    }
+
+    enum Error {
+        Empty,
+        TooHeavy(u64),
+    }
+
+    fn heaviest<T: Weigh>(items: &Vec<T>) -> Result<&T, Error> {
+        if items.is_empty() {
+            return Err(Error::Empty)
+        }
+        let mut best = items.at(0)
+        for i in 1..items.len() {
+            let it = items.at(i)
+            if it.weight() > best.weight() {
+                best = it
+            }
+        }
+        if best.weight() > 100 {
+            return Err(Error::TooHeavy(best.weight()))
+        }
+        return Ok(best)
+    }
+
+    fn report(items: &Vec<Item>) -> Result<u32, Error> {
+        let h = heaviest(items)?
+        return Ok(h.id)
+    }
+}
+
+fn describe(r: Result<u32, store::Error>) -> u64 {
+    match r {
+        Ok(id) => return id as u64,
+        Err(store::Error::Empty) => return 1000,
+        Err(store::Error::TooHeavy(kg)) => return 2000 + kg,
+    }
+}
+
+fn main() {
+    let mut items: Vec<store::Item> = Vec::new()
+    print(describe(store::report(&items)))
+    items.push(store::Item { id: 1, kg: 5 })
+    items.push(store::Item { id: 7, kg: 50 })
+    items.push(store::Item { id: 3, kg: 20 })
+    print(describe(store::report(&items)))
+    items.at_mut(0).kg = 300
+    print(describe(store::report(&items)))
+    let mut boxes: Vec<Box<u64>> = Vec::new()
+    for i in 0..3u64 {
+        boxes.push(Box::new(i * 10))
+    }
+    let mut sum: u64 = 0
+    while let Some(b) = boxes.pop() {
+        sum += *b.as_ref()
+        b.free()
+    }
+    boxes.free()
+    items.free()
+    print(sum)
+}
+
+//> 1000
+//> 7
+//> 2300
+//> 30

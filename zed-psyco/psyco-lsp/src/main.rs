@@ -2,6 +2,7 @@ mod analysis;
 mod builtins;
 mod check;
 mod literal;
+mod stdlib;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -311,6 +312,9 @@ impl Server {
     }
 
     fn resolve_import(&self, from: Option<&Path>, import: &str) -> PathBuf {
+        if let Some(name) = stdlib::name_of(import) {
+            return stdlib::path(name);
+        }
         let base = if import.starts_with("std/") {
             self.root.clone()
         } else {
@@ -426,39 +430,60 @@ impl Server {
             path: uri_to_path(uri),
             an: doc.an.clone(),
             let_types: doc.let_types.clone(),
+            alias: None,
         }];
         let mut seen: HashSet<String> = units[0].path.iter().map(|p| path_key(p)).collect();
         let mut next = 0;
         while next < units.len() {
             let from = units[next].path.clone();
-            let imports: Vec<String> = units[next].an.imports.iter().map(|(p, _)| p.clone()).collect();
+            let an = units[next].an.clone();
+            let imports: Vec<(String, Option<String>)> = an
+                .imports
+                .iter()
+                .map(|(p, tok)| (p.clone(), an.import_alias(*tok).map(str::to_string)))
+                .collect();
             next += 1;
-            for import in imports {
+            for (import, alias) in imports {
                 let path = self.resolve_import(from.as_deref(), &import);
-                if !seen.insert(path_key(&path)) {
-                    continue;
+                if let Some(unit) = self.unit_for(path, alias, &mut seen) {
+                    units.push(unit);
                 }
-                let unit = match self.open_doc_for(&path) {
-                    Some((uri, doc)) => Unit {
-                        uri: uri.clone(),
-                        path: Some(path),
-                        an: doc.an.clone(),
-                        let_types: doc.let_types.clone(),
-                    },
-                    None => match fs::read_to_string(&path) {
-                        Ok(text) => Unit {
-                            uri: path_to_uri(&path),
-                            path: Some(path),
-                            an: Arc::new(Analysis::new(text)),
-                            let_types: Arc::default(),
-                        },
-                        Err(_) => continue,
-                    },
-                };
+            }
+        }
+        // The standard library is part of every program.
+        for (name, _) in stdlib::FILES {
+            if let Some(unit) = self.unit_for(stdlib::path(name), None, &mut seen) {
                 units.push(unit);
             }
         }
         Ok(World { units })
+    }
+
+    /// The open document or the file at `path`, once per world.
+    fn unit_for(&self, path: PathBuf, alias: Option<String>, seen: &mut HashSet<String>) -> Option<Unit> {
+        if !seen.insert(path_key(&path)) {
+            return None;
+        }
+        if let Some((uri, doc)) = self.open_doc_for(&path) {
+            return Some(Unit {
+                uri: uri.clone(),
+                path: Some(path),
+                an: doc.an.clone(),
+                let_types: doc.let_types.clone(),
+                alias,
+            });
+        }
+        let text = match stdlib::FILES.iter().find(|(name, _)| stdlib::path(name) == path) {
+            Some((name, _)) => stdlib::source(name, &|p| fs::read_to_string(p).ok()),
+            None => fs::read_to_string(&path).ok()?,
+        };
+        Some(Unit {
+            uri: path_to_uri(&path),
+            path: Some(path),
+            an: Arc::new(Analysis::new(text)),
+            let_types: Arc::default(),
+            alias,
+        })
     }
 
     fn hover(&self, p: HoverParams) -> Result<Option<Hover>, String> {
@@ -761,10 +786,9 @@ impl Server {
                 .into_iter()
                 .rev()
                 .collect();
-            for t in world.find_all(|d| {
-                d.container.as_deref() == Some(owner.as_str())
-                    && matches!(d.kind, DefKind::Variant | DefKind::Method)
-            }) {
+            // Variants, methods, items of a module or of a file imported `as`.
+            let at = an.cursor_index(line, col);
+            for t in world.resolve_path(0, at, &owner, None) {
                 let d = world.def(t);
                 add(def_item(d, d.name.clone()));
             }
@@ -798,8 +822,8 @@ impl Server {
                 for (label, description, body) in builtins::SNIPPETS {
                     let item_snippet = matches!(
                         *label,
-                        "fn" | "fn ->" | "main" | "struct" | "enum" | "impl" | "const" | "static"
-                            | "static mut" | "import"
+                        "fn" | "fn ->" | "main" | "struct" | "enum" | "impl" | "impl for" | "trait"
+                            | "mod" | "const" | "static" | "static mut" | "import"
                     );
                     let in_body_too = matches!(*label, "fn" | "fn ->");
                     if item_snippet != top_level && !in_body_too {
@@ -1029,7 +1053,11 @@ fn syscall_note(world: &World, tok: usize) -> Option<String> {
 fn describe(world: &World, target: Target) -> String {
     let unit = &world.units[target.unit];
     let d = world.def(target);
-    let loop_var = d.kind == DefKind::Local && *unit.an.kind(d.start_tok) == psycoc::TokenKind::For;
+    let start = unit.an.kind(d.start_tok);
+    let loop_var = d.kind == DefKind::Local && *start == psycoc::TokenKind::For;
+    // A local that no `let` nor `for` introduces comes from a pattern.
+    let binding = d.kind == DefKind::Local
+        && !matches!(start, psycoc::TokenKind::For | psycoc::TokenKind::Let);
     let mut code = if loop_var { d.name.clone() } else { d.detail.clone() };
     if d.kind == DefKind::Local && !d.explicit_type {
         let s = unit.an.tokens[d.start_tok].span;
@@ -1042,7 +1070,19 @@ fn describe(world: &World, target: Target) -> String {
     let note = match d.kind {
         DefKind::Field => format!("field of `{owner}`"),
         DefKind::Variant => format!("variant of `{owner}`"),
-        DefKind::Method => format!("method of `{owner}`"),
+        DefKind::Method => {
+            let is_trait = !world
+                .find_all(|t| t.kind == DefKind::Trait && t.name == owner)
+                .is_empty();
+            match unit.an.impl_at(d.start_tok).and_then(|b| b.trait_name.as_deref()) {
+                Some(tr) => format!("method of `{owner}`, from `impl {tr} for {owner}`"),
+                None if is_trait => format!("method of trait `{owner}`"),
+                None => format!("method of `{owner}`"),
+            }
+        }
+        DefKind::TypeParam => format!("type parameter of `{owner}`"),
+        DefKind::Module => "module".into(),
+        DefKind::Local if binding => "bound by a pattern".into(),
         DefKind::Param => "parameter".into(),
         DefKind::Function if d.container.is_some() => {
             let attr = if d.name.starts_with("set_") { "setter" } else { "getter" };
@@ -1064,6 +1104,9 @@ fn describe(world: &World, target: Target) -> String {
     };
     if !note.is_empty() {
         text.push_str(&format!("\n\n*{note}*"));
+    }
+    if let Some(m) = d.module.as_ref().filter(|_| d.kind != DefKind::Module) {
+        text.push_str(&format!("\n\nIn `mod {m}`"));
     }
     if let Some(doc) = unit.an.doc_comment(d) {
         text.push_str(&format!("\n\n{doc}"));
@@ -1087,6 +1130,9 @@ fn symbol_kind(kind: DefKind) -> SymbolKind {
         DefKind::Const => SymbolKind::CONSTANT,
         DefKind::Static => SymbolKind::VARIABLE,
         DefKind::Local | DefKind::Param => SymbolKind::VARIABLE,
+        DefKind::Trait => SymbolKind::INTERFACE,
+        DefKind::Module => SymbolKind::MODULE,
+        DefKind::TypeParam => SymbolKind::TYPE_PARAMETER,
     }
 }
 
@@ -1101,5 +1147,8 @@ fn completion_kind(kind: DefKind) -> CompletionItemKind {
         DefKind::Const => CompletionItemKind::CONSTANT,
         DefKind::Static => CompletionItemKind::VARIABLE,
         DefKind::Local | DefKind::Param => CompletionItemKind::VARIABLE,
+        DefKind::Trait => CompletionItemKind::INTERFACE,
+        DefKind::Module => CompletionItemKind::MODULE,
+        DefKind::TypeParam => CompletionItemKind::TYPE_PARAMETER,
     }
 }

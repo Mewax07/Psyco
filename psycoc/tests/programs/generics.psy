@@ -1,0 +1,147 @@
+struct Pair<A, B> {
+    first: A,
+    second: B,
+}
+
+struct Stack<T> {
+    items: [T; 8],
+    len: usize,
+}
+
+enum Maybe<T> {
+    Nothing,
+    Just(T),
+}
+
+fn max<T>(a: T, b: T) -> T {
+    if a > b {
+        return a
+    }
+    return b
+}
+
+fn swap<A, B>(p: Pair<A, B>) -> Pair<B, A> {
+    return Pair { first: p.second, second: p.first }
+}
+
+fn first_or<T>(items: &[T], fallback: T) -> T {
+    if items.len() == 0 {
+        return fallback
+    }
+    return items[0]
+}
+
+fn size_of_it<T>(x: T) -> usize {
+    return sizeof(T)
+}
+
+impl<T> Stack<T> {
+    fn new(fill: T) -> Stack<T> {
+        return Stack { items: [fill; 8], len: 0 }
+    }
+
+    fn push(&mut self, v: T) {
+        self.items[self.len] = v
+        self.len += 1
+    }
+
+    fn pop(&mut self) -> Maybe<T> {
+        if self.len == 0 {
+            return Maybe::Nothing
+        }
+        self.len -= 1
+        return Maybe::Just(self.items[self.len])
+    }
+
+    fn peek_or(&self, d: T) -> T {
+        if self.len == 0 {
+            return d
+        }
+        return self.items[self.len - 1]
+    }
+
+    fn map_first<U>(&self, f: fn(T) -> U, d: U) -> U {
+        if self.len == 0 {
+            return d
+        }
+        return f(self.items[0])
+    }
+}
+
+impl<T> Maybe<T> {
+    fn unwrap_or(self, d: T) -> T {
+        match self {
+            Maybe::Just(v) => return v,
+            Maybe::Nothing => return d,
+        }
+    }
+
+    fn is_just(self) -> bool {
+        if let Maybe::Just(_) = self {
+            return true
+        }
+        return false
+    }
+}
+
+impl Pair<u8, u8> {
+    fn sum(&self) -> u16 {
+        return self.first as u16 + self.second as u16
+    }
+}
+
+fn double(x: u8) -> u64 {
+    return x as u64 * 2
+}
+
+fn main() {
+    print(max(3, 9), max(200u8, 100), max(-5i16, -7))
+    let a: u32 = 7
+    print(max(a, 1))
+
+    let p = Pair { first: 1u8, second: true }
+    let q = swap(p)
+    print(q.first, q.second)
+    let r: Pair<u8, u8> = Pair { first: 250, second: 10 }
+    print(r.sum())
+
+    let mut s = Stack::new(0u16)
+    s.push(10)
+    s.push(20)
+    print(s.peek_or(0), s.len)
+    print(s.pop().unwrap_or(99), s.pop().unwrap_or(99), s.pop().unwrap_or(99))
+    print(s.pop().is_just())
+
+    let mut t = Stack::<u8>::new(0)
+    t.push(21)
+    print(t.map_first(double, 0))
+
+    let empty: [u64; 0] = []
+    print(first_or(&[5u64, 6], 0), first_or(&empty, 42))
+    print(size_of_it(1u8), size_of_it(p), sizeof(Pair<u16, u64>), sizeof(Maybe<u32>))
+
+    let m: Maybe<i8> = Maybe::Nothing
+    let n = Maybe::Just(-3i8)
+    print(m.unwrap_or(1), n.unwrap_or(1))
+    match n {
+        Maybe::Just(v) if v < 0 => print("negative", v),
+        Maybe::Just(v) => print("positive", v),
+        Maybe::Nothing => print("nothing"),
+    }
+    let f = max::<u64>
+    print(f(4, 8))
+}
+
+//> 9 200 -5
+//> 7
+//> true 1
+//> 260
+//> 20 2
+//> 20 10 99
+//> false
+//> 42
+//> 5 42
+//> 1 2 16 8
+//> 1 -3
+//> negative -3
+//> 8
