@@ -192,7 +192,7 @@ impl Subst<'_> {
                         e.kind = ExprKind::TypePath {
                             ty: t.clone(),
                             member: m,
-                            member_args: take(member_args),
+                            member_args: std::mem::take(member_args),
                         };
                     }
                 }
