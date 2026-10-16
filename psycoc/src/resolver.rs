@@ -46,7 +46,6 @@ pub fn resolve(program: &mut Program) -> Result<(), TypeError> {
         }
     }
 
-    // Full names of the types.
     let rename_type = |module: &str, name: &mut String, types: &mut HashSet<String>| {
         *name = qualify(module, name);
         types.insert(name.clone());
@@ -69,8 +68,6 @@ pub fn resolve(program: &mut Program) -> Result<(), TypeError> {
         }
     }
 
-    // Full names of the values. `T::method` (from a plain impl) is named
-    // after the full name of T.
     for f in &mut program.functions {
         r.module = f.module.clone();
         if let Some((owner, method)) = f.name.split_once("::") {
@@ -92,7 +89,6 @@ pub fn resolve(program: &mut Program) -> Result<(), TypeError> {
         r.consts.insert(c.name.clone());
     }
 
-    // References.
     for s in &mut program.structs {
         r.enter(&s.module, &s.generics);
         r.bounds(&mut s.generics);
@@ -166,7 +162,6 @@ impl Resolver {
         self.locals = vec![HashSet::new()];
     }
 
-    /// Full name of `name` seen from the current module, if `set` has it.
     fn find(&self, name: &str, set: &HashSet<String>) -> Option<String> {
         let mut m = self.module.as_str();
         loop {

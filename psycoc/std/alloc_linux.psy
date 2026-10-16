@@ -1,0 +1,138 @@
+/// Wiki Doc sources:
+///   - https://man7.org/linux/man-pages/man2/brk.2.html
+///   - https://wiki.osdev.org/Memory_Allocation
+
+#![trusted]
+
+/// Allocates `size` zeroed bytes (16-byte aligned). Null if out of memory.
+fn psy_alloc(size: usize) -> *mut u8 {
+    return linux_heap::alloc(size as u64)
+}
+
+/// Frees a block from psy_alloc.
+fn psy_free(ptr: *mut u8) {
+    linux_heap::free(ptr)
+}
+
+/// Generation of the live block at `ptr` (0 if there is none).
+fn psy_generation(ptr: *mut u8) -> u64 {
+    let block = linux_heap::block_of(ptr)
+    if block == 0 {
+        return 0
+    }
+    return linux_heap::word(block, 2).read()
+}
+
+/// Usable bytes of the live block at `ptr` (0 if there is none).
+fn psy_capacity(ptr: *mut u8) -> usize {
+    let block = linux_heap::block_of(ptr)
+    if block == 0 || linux_heap::word(block, 2).read() == 0 {
+        return 0
+    }
+    return (1u64 << linux_heap::word(block, 1).read()) as usize
+}
+
+mod linux_heap {
+    const sys_brk: u64 = 12
+    const header: u64 = 32
+    const min_class: u64 = 4
+    const max_class: u64 = 30
+    const grow_min: u64 = 0x100000
+    const block_magic: u64 = 0x5053594845415021
+
+    static mut heap_start: u64 = 0
+    static mut heap_top: u64 = 0
+    static mut heap_end: u64 = 0
+    static mut free_heads: [u64; 32]
+    static mut next_generation: u64 = 1
+
+    /// Header word `i` of the block at `block`.
+    fn word(block: u64, i: usize) -> *mut u64 {
+        return (block as *mut u64).add(i)
+    }
+
+    /// Smallest size class that holds `size` bytes.
+    fn class_of(size: u64) -> u64 {
+        let mut c = min_class
+        while (1u64 << c) < size {
+            c += 1
+        }
+        return c
+    }
+
+    /// Moves the program break so that `bytes` more bytes fit.
+    fn grow(bytes: u64) -> bool {
+        if heap_start == 0 {
+            let b = syscall(sys_brk, 0, 0, 0) as u64
+            heap_start = (b + 15) / 16 * 16
+            heap_top = heap_start
+            heap_end = b
+        }
+        let mut end = heap_top + bytes
+        if end < heap_end + grow_min {
+            end = heap_end + grow_min
+        }
+        let got = syscall(sys_brk, end, 0, 0) as u64
+        if got < end {
+            return false
+        }
+        heap_end = got
+        return true
+    }
+
+    /// psy_alloc body.
+    fn alloc(size: u64) -> *mut u8 {
+        if size > (1u64 << max_class) {
+            return 0 as *mut u8
+        }
+        let c = class_of(size)
+        let mut block = free_heads[c as usize]
+        if block != 0 {
+            free_heads[c as usize] = word(block, 3).read()
+        } else {
+            let need = header + (1u64 << c)
+            if heap_start == 0 || heap_top + need > heap_end {
+                if !grow(need) {
+                    return 0 as *mut u8
+                }
+            }
+            block = heap_top
+            heap_top += need
+        }
+        word(block, 0).write(block_magic)
+        word(block, 1).write(c)
+        word(block, 2).write(next_generation)
+        word(block, 3).write(0)
+        next_generation += 1
+        memset((block + header) as *mut u8, 0, (1u64 << c) as usize)
+        return (block + header) as *mut u8
+    }
+
+    /// Header of the block whose payload is `ptr` (0 if it is not one).
+    fn block_of(ptr: *mut u8) -> u64 {
+        let addr = ptr as u64
+        if heap_start == 0 || addr < heap_start + header || addr >= heap_top || addr % 16 != 0 {
+            return 0
+        }
+        let block = addr - header
+        if word(block, 0).read() != block_magic {
+            return 0
+        }
+        return block
+    }
+
+    /// psy_free body.
+    fn free(ptr: *mut u8) {
+        let block = block_of(ptr)
+        if block == 0 {
+            panic("free: not a heap pointer")
+        }
+        if word(block, 2).read() == 0 {
+            panic("free: double free")
+        }
+        let c = word(block, 1).read() as usize
+        word(block, 2).write(0)
+        word(block, 3).write(free_heads[c])
+        free_heads[c] = block
+    }
+}

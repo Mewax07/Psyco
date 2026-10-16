@@ -1,5 +1,9 @@
 use std::{
-    cell::Cell, collections::{HashMap, HashSet}, fs::read, mem::replace, path::Path,
+    cell::Cell,
+    collections::{HashMap, HashSet},
+    fs::read,
+    mem::replace,
+    path::Path,
 };
 
 use crate::*;
@@ -302,7 +306,7 @@ impl TypeChecker {
             );
         }
         DEPTH.with(|d| d.set(d.get() + 1));
-        let result = crate::compile_file(&full_str, crate::Target::Linux);
+        let result = compile_file(&full_str, Target::Linux);
         DEPTH.with(|d| d.set(d.get() - 1));
         match result {
             Ok(bytes) => Ok(ExprKind::Bytes(bytes)),

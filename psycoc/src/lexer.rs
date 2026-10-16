@@ -107,7 +107,6 @@ pub enum TokenKind {
 pub struct Span {
     pub line: usize,
     pub col: usize,
-    // source file index
     pub file: usize,
 }
 

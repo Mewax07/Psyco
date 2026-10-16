@@ -1,13 +1,20 @@
 pub mod assembler;
 pub mod ast;
+pub mod bce;
 pub mod codegen;
 pub mod driver;
 pub mod elf;
+pub mod emit;
+pub mod inline;
+pub mod ir;
 pub mod lexer;
+pub mod lower;
+pub mod opt;
 pub mod parser;
 pub mod pe;
-pub mod platform;
 pub mod resolver;
+pub mod platform;
+pub mod regalloc;
 pub mod runtime;
 pub mod typeck;
 
@@ -20,6 +27,5 @@ pub use lexer::*;
 pub use parser::*;
 pub use pe::*;
 pub use platform::*;
-pub use resolver::*;
 pub use runtime::*;
 pub use typeck::*;

@@ -1,3 +1,5 @@
+use std::{collections::HashSet, mem::take};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Reg {
@@ -147,11 +149,42 @@ pub enum Sreg {
     Gs = 5,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Label(usize);
 
 #[derive(Debug, Clone, Copy)]
 pub struct DataLabel(usize);
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Addr {
+    pub base: Reg,
+    pub index: Option<(Reg, u8)>,
+    pub disp: i32,
+}
+
+impl Addr {
+    pub fn base(base: Reg, disp: i32) -> Addr {
+        Addr {
+            base,
+            index: None,
+            disp,
+        }
+    }
+
+    pub fn indexed(base: Reg, index: Reg, scale: u8, disp: i32) -> Addr {
+        Addr {
+            base,
+            index: Some((index, scale)),
+            disp,
+        }
+    }
+}
+
+struct Jump {
+    pos: usize,
+    cond: Option<Cond>,
+    label: Label,
+}
 
 #[derive(Debug, Clone, Copy)]
 pub enum RwLabel {
@@ -178,6 +211,7 @@ pub struct Assembler {
     pub bss_size: usize,
     labels: Vec<Option<usize>>,
     fixups: Vec<Fixup>,
+    jumps: Vec<Jump>,
     abs_fixups: Vec<(usize, AddrTarget, i64)>,
     pub abs_slots: Vec<u64>,
 }
@@ -197,6 +231,7 @@ impl Assembler {
             bss_size: 0,
             labels: Vec::new(),
             fixups: Vec::new(),
+            jumps: Vec::new(),
             abs_fixups: Vec::new(),
             abs_slots: Vec::new(),
         }
@@ -244,6 +279,37 @@ impl Assembler {
         if base.low() == 4 {
             self.byte(0x24);
         }
+        match md {
+            0b01 => self.byte(disp as i8 as u8),
+            0b10 => self.bytes(&disp.to_le_bytes()),
+            _ => {}
+        }
+    }
+
+    fn rex_at(&mut self, w: bool, reg_ext: u8, a: Addr, byte_reg: Option<Reg>) {
+        let x = a.index.map_or(0, |(i, _)| i.ext());
+        let rex = 0x40 | (w as u8) << 3 | reg_ext << 2 | x << 1 | a.base.ext();
+        if rex != 0x40 || byte_reg.is_some_and(|r| (4..8).contains(&(r as u8))) {
+            self.byte(rex);
+        }
+    }
+
+    fn modrm_at(&mut self, reg: u8, a: Addr) {
+        let Some((index, scale)) = a.index else {
+            self.modrm_mem(reg, a.base, a.disp);
+            return;
+        };
+        assert!(index != Reg::Rsp, "ICE: rsp as an index");
+        let disp = a.disp;
+        let md = if disp == 0 && a.base.low() != 5 {
+            0b00
+        } else if (-128..=127).contains(&disp) {
+            0b01
+        } else {
+            0b10
+        };
+        self.byte(md << 6 | (reg & 7) << 3 | 0b100);
+        self.byte(scale << 6 | index.low() << 3 | a.base.low());
         match md {
             0b01 => self.byte(disp as i8 as u8),
             0b10 => self.bytes(&disp.to_le_bytes()),
@@ -336,6 +402,115 @@ impl Assembler {
         self.bytes(&[0; 4]); // fix in link()
     }
 
+    pub fn relax(&mut self) {
+        if self.jumps.is_empty() {
+            return;
+        }
+        self.jumps.sort_by_key(|j| j.pos);
+        let long = |j: &Jump| if j.cond.is_some() { 6 } else { 5 };
+        let mut size: Vec<usize> = self.jumps.iter().map(long).collect();
+        let target =
+            |s: &Self, j: &Jump| s.labels[j.label.0].expect("ICE: jump to an unbound label");
+        for (k, j) in self.jumps.iter().enumerate() {
+            if target(self, j) == j.pos + long(j) {
+                size[k] = 0;
+            }
+        }
+        loop {
+            let mut saved = Vec::with_capacity(size.len() + 1);
+            let mut acc = 0;
+            for (k, j) in self.jumps.iter().enumerate() {
+                saved.push(acc);
+                acc += long(j) - size[k];
+            }
+            saved.push(acc);
+            let new_pos = |p: usize| {
+                let k = self.jumps.partition_point(|j| j.pos < p);
+                p - saved[k]
+            };
+            let mut changed = false;
+            for (k, j) in self.jumps.iter().enumerate() {
+                if size[k] != long(j) {
+                    continue;
+                }
+                let start = new_pos(j.pos);
+                let disp = new_pos(target(self, j)) as i64 - (start + 2) as i64;
+                if (-128..=127).contains(&disp) {
+                    size[k] = 2;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        let mut saved = Vec::with_capacity(size.len() + 1);
+        let mut acc = 0;
+        for (k, j) in self.jumps.iter().enumerate() {
+            saved.push(acc);
+            acc += long(j) - size[k];
+        }
+        saved.push(acc);
+        let jumps = take(&mut self.jumps);
+        let new_pos = |p: usize| {
+            let k = jumps.partition_point(|j| j.pos < p);
+            p - saved[k]
+        };
+        let labels: Vec<Option<usize>> = self.labels.iter().map(|l| l.map(new_pos)).collect();
+
+        let mut code = Vec::with_capacity(self.code.len());
+        let mut cursor = 0;
+        let mut jump_fixups = HashSet::new();
+        for (k, j) in jumps.iter().enumerate() {
+            code.extend_from_slice(&self.code[cursor..j.pos]);
+            cursor = j.pos + long(j);
+            jump_fixups.insert(j.pos + long(j) - 4);
+            let t = labels[j.label.0].unwrap();
+            match size[k] {
+                0 => {}
+                2 => {
+                    let disp = t as i64 - (code.len() + 2) as i64;
+                    code.push(match j.cond {
+                        Some(c) => 0x70 + c as u8,
+                        None => 0xEB,
+                    });
+                    code.push(disp as i8 as u8);
+                }
+                _ => {
+                    match j.cond {
+                        Some(c) => code.extend_from_slice(&[0x0F, 0x80 + c as u8]),
+                        None => code.push(0xE9),
+                    }
+                    code.extend_from_slice(&[0; 4]);
+                }
+            }
+        }
+        code.extend_from_slice(&self.code[cursor..]);
+
+        let mut fixups: Vec<Fixup> = self
+            .fixups
+            .iter()
+            .filter(|f| !jump_fixups.contains(&f.pos))
+            .map(|f| Fixup {
+                pos: new_pos(f.pos),
+                target: f.target,
+            })
+            .collect();
+        for (k, j) in jumps.iter().enumerate() {
+            if size[k] == long(j) {
+                let pos = new_pos(j.pos) + long(j) - 4;
+                fixups.push(Fixup {
+                    pos,
+                    target: AddrTarget::Code(j.label),
+                });
+            }
+        }
+        self.code = code;
+        self.labels = labels;
+        self.fixups = fixups;
+    }
+
     pub fn abs_address(&mut self, offset: usize, target: AddrTarget, addend: i64) {
         self.abs_fixups.push((offset, target, addend));
     }
@@ -409,11 +584,21 @@ impl Assembler {
     }
 
     pub fn jmp(&mut self, label: Label) {
+        self.jumps.push(Jump {
+            pos: self.code.len(),
+            cond: None,
+            label,
+        });
         self.byte(0xE9);
         self.rel32(AddrTarget::Code(label))
     }
 
     pub fn jcc(&mut self, cc: Cond, label: Label) {
+        self.jumps.push(Jump {
+            pos: self.code.len(),
+            cond: Some(cc),
+            label,
+        });
         self.bytes(&[0x0F, 0x80 + cc as u8]);
         self.rel32(AddrTarget::Code(label));
     }
@@ -478,74 +663,113 @@ impl Assembler {
     }
 
     pub fn load_sized(&mut self, dst: Reg, base: Reg, disp: i32, size: u64, signed: bool) {
-        match (size, signed) {
-            (1, false) => {
-                self.rex(false, dst.ext(), base.ext());
-                self.bytes(&[0x0F, 0xB6]);
-            }
-            (1, true) => {
-                self.rex(true, dst.ext(), base.ext());
-                self.bytes(&[0x0F, 0xBE]);
-            }
-            (2, false) => {
-                self.rex(false, dst.ext(), base.ext());
-                self.bytes(&[0x0F, 0xB7]);
-            }
-            (2, true) => {
-                self.rex(true, dst.ext(), base.ext());
-                self.bytes(&[0x0F, 0xBF]);
-            }
-            (4, false) => {
-                self.rex(false, dst.ext(), base.ext());
-                self.byte(0x8B);
-            }
-            (4, true) => {
-                self.rex(true, dst.ext(), base.ext());
-                self.byte(0x63); // movsxd
-            }
-            (8, _) => {
-                self.rex(true, dst.ext(), base.ext());
-                self.byte(0x8B);
-            }
+        self.load_sized_at(dst, Addr::base(base, disp), size, signed);
+    }
+
+    pub fn load_sized_at(&mut self, dst: Reg, a: Addr, size: u64, signed: bool) {
+        let (w, op): (bool, &[u8]) = match (size, signed) {
+            (1, false) => (false, &[0x0F, 0xB6]),
+            (1, true) => (true, &[0x0F, 0xBE]),
+            (2, false) => (false, &[0x0F, 0xB7]),
+            (2, true) => (true, &[0x0F, 0xBF]),
+            (4, false) => (false, &[0x8B]),
+            (4, true) => (true, &[0x63]), // movsxd
+            (8, _) => (true, &[0x8B]),
             _ => panic!("ICE: load of size {size}"),
-        }
-        self.modrm_mem(dst as u8, base, disp);
+        };
+        self.rex_at(w, dst.ext(), a, None);
+        self.bytes(op);
+        self.modrm_at(dst as u8, a);
     }
 
     pub fn store(&mut self, base: Reg, disp: i32, src: Reg) {
-        self.rex(true, src.ext(), base.ext());
-        self.byte(0x89);
-        self.modrm_mem(src as u8, base, disp);
+        self.store_sized(base, disp, src, 8);
     }
 
     pub fn store8(&mut self, base: Reg, src: Reg) {
-        self.rex_byte(src.ext(), base.ext(), src);
-        self.byte(0x88);
-        self.modrm_mem(src as u8, base, 0);
+        self.store_sized(base, 0, src, 1);
     }
 
     pub fn store_sized(&mut self, base: Reg, disp: i32, src: Reg, size: u64) {
+        self.store_sized_at(Addr::base(base, disp), src, size);
+    }
+
+    pub fn store_sized_at(&mut self, a: Addr, src: Reg, size: u64) {
         match size {
             1 => {
-                self.rex_byte(src.ext(), base.ext(), src);
+                self.rex_at(false, src.ext(), a, Some(src));
                 self.byte(0x88);
             }
             2 => {
                 self.byte(0x66);
-                self.rex(false, src.ext(), base.ext());
+                self.rex_at(false, src.ext(), a, None);
                 self.byte(0x89);
             }
             4 => {
-                self.rex(false, src.ext(), base.ext());
+                self.rex_at(false, src.ext(), a, None);
                 self.byte(0x89);
             }
             8 => {
-                self.rex(true, src.ext(), base.ext());
+                self.rex_at(true, src.ext(), a, None);
                 self.byte(0x89);
             }
             _ => panic!("ICE: store of size {size}"),
         }
-        self.modrm_mem(src as u8, base, disp);
+        self.modrm_at(src as u8, a);
+    }
+
+    pub fn store_imm_at(&mut self, a: Addr, imm: i32, size: u64) {
+        match size {
+            1 => {
+                self.rex_at(false, 0, a, None);
+                self.byte(0xC6);
+            }
+            2 => {
+                self.byte(0x66);
+                self.rex_at(false, 0, a, None);
+                self.byte(0xC7);
+            }
+            4 => {
+                self.rex_at(false, 0, a, None);
+                self.byte(0xC7);
+            }
+            8 => {
+                self.rex_at(true, 0, a, None);
+                self.byte(0xC7);
+            }
+            _ => panic!("ICE: store of size {size}"),
+        }
+        self.modrm_at(0, a);
+        match size {
+            1 => self.byte(imm as u8),
+            2 => self.bytes(&(imm as u16).to_le_bytes()),
+            _ => self.bytes(&imm.to_le_bytes()),
+        }
+    }
+
+    pub fn lea_at(&mut self, dst: Reg, a: Addr) {
+        self.rex_at(true, dst.ext(), a, None);
+        self.byte(0x8D);
+        self.modrm_at(dst as u8, a);
+    }
+
+    pub fn alu_rm(&mut self, op: Alu, dst: Reg, a: Addr) {
+        self.rex_at(true, dst.ext(), a, None);
+        self.byte(op.rr_opcode() + 2);
+        self.modrm_at(dst as u8, a);
+    }
+
+    pub fn cmp_mi(&mut self, a: Addr, imm: i32) {
+        self.rex_at(true, 0, a, None);
+        if let Ok(imm8) = i8::try_from(imm) {
+            self.byte(0x83);
+            self.modrm_at(7, a);
+            self.byte(imm8 as u8);
+        } else {
+            self.byte(0x81);
+            self.modrm_at(7, a);
+            self.bytes(&imm.to_le_bytes());
+        }
     }
 
     pub fn extend(&mut self, r: Reg, size: u64, signed: bool) {
@@ -584,9 +808,7 @@ impl Assembler {
     }
 
     pub fn lea(&mut self, dst: Reg, base: Reg, disp: i32) {
-        self.rex(true, dst.ext(), base.ext());
-        self.byte(0x8D);
-        self.modrm_mem(dst as u8, base, disp);
+        self.lea_at(dst, Addr::base(base, disp));
     }
 
     pub fn lea_data(&mut self, dst: Reg, data: DataLabel) {
@@ -732,6 +954,51 @@ impl Assembler {
 
     pub fn rep_stosb(&mut self) {
         self.bytes(&[0xF3, 0xAA]);
+    }
+
+    pub fn rep_stosw(&mut self) {
+        self.bytes(&[0x66, 0xF3, 0xAB]);
+    }
+
+    pub fn rep_stosd(&mut self) {
+        self.bytes(&[0xF3, 0xAB]);
+    }
+
+    pub fn rep_stosq(&mut self) {
+        self.bytes(&[0xF3, 0x48, 0xAB]);
+    }
+
+    pub fn rep_movsq(&mut self) {
+        self.bytes(&[0xF3, 0x48, 0xA5]);
+    }
+
+    pub fn movd_xmm_r(&mut self, x: u8, r: Reg) {
+        self.byte(0x66);
+        self.rex(false, x >> 3, r.ext());
+        self.bytes(&[0x0F, 0x6E]);
+        self.modrm_rr(x, r);
+    }
+
+    pub fn pshufd(&mut self, dst: u8, src: u8, imm: u8) {
+        self.byte(0x66);
+        self.rex(false, dst >> 3, src >> 3);
+        self.bytes(&[0x0F, 0x70]);
+        self.byte(0b11 << 6 | (dst & 7) << 3 | (src & 7));
+        self.byte(imm);
+    }
+
+    pub fn movdqu_load(&mut self, x: u8, a: Addr) {
+        self.byte(0xF3);
+        self.rex_at(false, x >> 3, a, None);
+        self.bytes(&[0x0F, 0x6F]);
+        self.modrm_at(x, a);
+    }
+
+    pub fn movdqu_store(&mut self, a: Addr, x: u8) {
+        self.byte(0xF3);
+        self.rex_at(false, x >> 3, a, None);
+        self.bytes(&[0x0F, 0x7F]);
+        self.modrm_at(x, a);
     }
 
     pub fn cld(&mut self) {
