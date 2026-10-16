@@ -358,6 +358,12 @@ fn kernel_high(addr: u64) -> u64 {
     return addr - base + kernel_virt_base
 }
 
+/// Moves the addresses stored in statics (function tables, strings) to the
+/// higher half, where the kernel runs from now on.
+fn rebase_kernel_statics() {
+    rebase_statics(kernel_virt_base - get_image_base())
+}
+
 /// Direct-map alias of a physical address.
 fn phys_to_virt(phys: u64) -> u64 {
     return direct_map_base + phys

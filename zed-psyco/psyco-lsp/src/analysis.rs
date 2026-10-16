@@ -1516,10 +1516,15 @@ impl World {
             let all = self.find_all(|d| {
                 d.name == name && matches!(d.kind, DefKind::Field | DefKind::Method)
             });
-            return match self.receiver_type(unit, tok) {
+            let found = match self.receiver_type(unit, tok) {
                 Some(ty) => self.members_of(&ty, all),
                 None => all,
             };
+            // `x.len()` is the method, `x.len` the field, when both exist.
+            let call = *an.kind(tok + 1) == TokenKind::LParen;
+            let wanted = if call { DefKind::Method } else { DefKind::Field };
+            let preferred: Vec<Target> = found.iter().copied().filter(|t| self.def(*t).kind == wanted).collect();
+            return if preferred.is_empty() { found } else { preferred };
         }
         if let Some(owner) = an.struct_literal_name(tok) {
             let fields = self.find_all(|d| {
@@ -1532,7 +1537,22 @@ impl World {
         if let Some(def) = an.local_at(name, tok) {
             return vec![Target { unit, def }];
         }
-        self.find_item(unit, name)
+        let items = self.find_item(unit, name);
+        if !items.is_empty() {
+            return items;
+        }
+        self.prelude_variants(Some(name))
+    }
+
+    /// `Some`, `None`, `Ok` and `Err` are used without `Option::` /
+    /// `Result::`, like the checker allows for these two prelude enums.
+    pub fn prelude_variants(&self, name: Option<&str>) -> Vec<Target> {
+        self.find_all(|d| {
+            d.kind == DefKind::Variant
+                && matches!(d.container.as_deref(), Some("Option" | "Result"))
+                && matches!(d.name.as_str(), "Some" | "None" | "Ok" | "Err")
+                && name.is_none_or(|n| d.name == n)
+        })
     }
 
     pub fn references(&self, target: Target, units: impl Iterator<Item = usize>) -> Vec<(usize, usize)> {

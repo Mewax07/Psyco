@@ -12,6 +12,7 @@
 #![trusted]
 
 const max_exit_attempts: i64 = 8
+const efi_file_mode_read: u64 = 1
 
 const mem_loader_code: u32 = 1
 const mem_loader_data: u32 = 2
@@ -168,7 +169,19 @@ struct LoadedImage {
     unload: *mut u8,
 }
 
-// What the rest of the kernel sees of one memory map entry.
+struct SimpleFileSystem {
+    revision: u64,
+    open_volume: extern fn(*mut SimpleFileSystem, *mut *mut EfiFile) -> u64,
+}
+
+struct EfiFile {
+    revision: u64,
+    open: extern fn(*mut EfiFile, *mut *mut EfiFile, *const u16, u64, u64) -> u64,
+    close: extern fn(*mut EfiFile) -> u64,
+    delete: *mut u8,
+    read: extern fn(*mut EfiFile, *mut usize, *mut u8) -> u64,
+}
+
 struct MemRegion {
     kind: u32,
     start: u64,
@@ -182,6 +195,8 @@ static mut map_desc_size: usize = 0
 
 #[getter]
 static mut boot_services_done: bool = false
+
+static mut boot_device: *mut u8 = 0 as *mut u8
 
 // Where the firmware loaded our PE image (physical, page aligned).
 #[getter]
@@ -212,8 +227,48 @@ fn read_loaded_image() {
         return
     }
     let image = li as *mut LoadedImage
+    boot_device = (*image).device_handle
     image_base = (*image).image_base as u64
     image_size = (*image).image_size
+}
+
+/// Reads a file of the boot volume (`path` like u"\\psyos.cfg") into `buf`
+/// with the firmware's file system; returns the bytes read, or -1. Only
+/// before ExitBootServices.
+fn efi_read_file(path: *const u16, buf: &mut [u8]) -> i64 {
+    if boot_services_done || boot_device.is_null() {
+        return -1
+    }
+    let guid = Guid {
+        d1: 0x964e5b22,
+        d2: 0x6459,
+        d3: 0x11d2,
+        d4: [0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b],
+    }
+    let bs = (*st).boot_services
+    let mut fs = 0 as *mut u8
+    if (*bs).handle_protocol(boot_device, &guid as *const Guid, &mut fs as *mut *mut u8) != 0 || fs.is_null() {
+        return -1
+    }
+    let sfs = fs as *mut SimpleFileSystem
+    let mut root = 0 as *mut EfiFile
+    if (*sfs).open_volume(sfs, &mut root as *mut *mut EfiFile) != 0 || root.is_null() {
+        return -1
+    }
+    let mut file = 0 as *mut EfiFile
+    let status = (*root).open(root, &mut file as *mut *mut EfiFile, path, efi_file_mode_read, 0)
+    if status != 0 || file.is_null() {
+        (*root).close(root)
+        return -1
+    }
+    let mut size: usize = buf.len()
+    let status = (*file).read(file, &mut size as *mut usize, buf.as_mut_ptr())
+    (*file).close(file)
+    (*root).close(root)
+    if status != 0 {
+        return -1
+    }
+    return size as i64
 }
 
 /// Reads the memory map into `map`, returns its key (-1 on error).
@@ -289,14 +344,6 @@ fn free_pages() -> u64 {
         }
     }
     return pages
-}
-
-/// Byte `i` of a string (bounds checked).
-fn str_byte(s: Str, i: usize) -> u8 {
-    if i >= s.len() {
-        panic("str_byte: index out of bounds")
-    }
-    return s.as_ptr().add(i).read()
 }
 
 /// Current date and time from the firmware clock.

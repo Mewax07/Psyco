@@ -5,18 +5,18 @@
 /// keeps, from its saved rsp upwards:
 ///   r15, r14, r13, r12, rbx, rbp, resume address
 /// The context_switch intrinsic pushes exactly that and pops the other one.
-/// The other registers need no saving: psy code never keeps a value in a
-/// register across a call.
+/// The other registers need no saving: psy code keeps values across a call
+/// only in rbx, rbp and r12-r15 (callee-saved, like System V).
 
 #![trusted]
 
 const context_words: u64 = 8
-const stack_aligh: u64 = 16
+const stack_align: u64 = 16
 
 /// Prepares a new stack so that switching to it calls `start()`.
 /// Returns the rsp to give to context_switch_to.
 fn context_new(stack_top: u64, start: fn()) -> u64 {
-    let top = stack_top & ~(stack_aligh - 1)
+    let top = stack_top & ~(stack_align - 1)
     let p = top as *mut u64
     p.sub(1).write(0)
     p.sub(2).write(start as u64)

@@ -1,0 +1,28 @@
+/// Wiki Doc sources:
+///   - https://wiki.osdev.org/SSE
+///   - https://wiki.osdev.org/CPU_Registers_x86-64#CR0
+///   - https://wiki.osdev.org/CPU_Registers_x86-64#CR4
+///
+/// SSE, used by the compiler's fast memory primitives (memcpy, memset32:
+/// 16-byte moves). UEFI already turns it on for its applications; the
+/// kernel sets the bits again so it does not depend on it. xmm0-xmm3 are
+/// saved by the interrupt and system call entry stubs.
+
+#![trusted]
+
+const cr0_mp: u64 = 1 << 1
+const cr0_em: u64 = 1 << 2
+const cr4_osfxsr: u64 = 1 << 9
+const cr4_osxmmexcpt: u64 = 1 << 10
+
+/// Enables SSE: no x87 emulation, FXSAVE/FXRSTOR and SSE exceptions known
+/// to the OS.
+fn sse_init() {
+    write_cr0((read_cr0() & ~cr0_em) | cr0_mp)
+    write_cr4(read_cr4() | cr4_osfxsr | cr4_osxmmexcpt)
+}
+
+/// Whether SSE is enabled (CR4.OSFXSR set, CR0.EM clear).
+fn sse_enabled() -> bool {
+    return read_cr4() & cr4_osfxsr != 0 && read_cr0() & cr0_em == 0
+}

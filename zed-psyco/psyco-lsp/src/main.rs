@@ -847,6 +847,9 @@ impl Server {
             for t in world.find_all(|d| d.kind.is_item()) {
                 add(def_item(world.def(t), world.def(t).name.clone()));
             }
+            for t in world.prelude_variants(None) {
+                add(def_item(world.def(t), world.def(t).name.clone()));
+            }
             for b in builtins::BUILTINS {
                 add(CompletionItem {
                     label: b.name.into(),

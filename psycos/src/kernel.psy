@@ -4,7 +4,8 @@
 ///   - https://wiki.osdev.org/X86_Interrupts#From_the_CPU's_perspective
 ///
 /// Kernel entry point and shell.
-/// Boot (firmware tables, low addresses): efi_init -> fb_init -> con_init ->
+/// Boot (firmware tables, low addresses): efi_init -> config_load ->
+/// fb_init_mode (video= of psyos.cfg, else the largest mode) -> con_init ->
 /// exit_boot_services -> cli -> cpu_init -> pmm_init -> paging_init ->
 /// enter_higher_half(kmain).
 /// kmain (our tables, higher half, kernel stack): cpu_init again ->
@@ -13,10 +14,12 @@
 
 import "efi.psy"
 import "fb.psy"
+import "config.psy"
 import "console.psy"
 import "keyboard.psy"
 import "stack.psy"
 import "gdt.psy"
+import "sse.psy"
 import "exceptions.psy"
 import "debug.psy"
 import "timer.psy"
@@ -75,8 +78,9 @@ fn line_is(cmd: Str) -> bool {
     if line_len != cmd.len() {
         return false
     }
+    let bytes = cmd.as_bytes()
     for i in 0..line_len {
-        if line[i] != str_byte(cmd, i) {
+        if line[i] != bytes[i] {
             return false
         }
     }
@@ -88,8 +92,9 @@ fn line_starts_with(prefix: Str) -> bool {
     if line_len < prefix.len() {
         return false
     }
-    for i in 0..prefix.len() {
-        if line[i] != str_byte(prefix, i) {
+    let bytes = prefix.as_bytes()
+    for i in 0..bytes.len() {
+        if line[i] != bytes[i] {
             return false
         }
     }
@@ -290,6 +295,18 @@ fn cmd_fb() {
     puts(", ")
     put_u64(get_fb_size() as u64 / bytes_per_kib)
     puts(" KiB\n")
+    puts("modes:")
+    for i in 0..get_mode_count() {
+        let m = video_mode(i)
+        putc(' ')
+        if i == get_mode_current() {
+            putc('*')
+        }
+        put_u64(m.width as u64)
+        putc('x')
+        put_u64(m.height as u64)
+    }
+    putc('\n')
 
     let colors = [0xFFFFFFu32, 0xFFFF00u32, 0x00FFFFu32, 0x00FF00u32, 0xFF00FFu32, 0xFF0000u32, 0x0000FFu32, 0x000000u32]
     let bar = w / 8
@@ -503,11 +520,11 @@ fn line_word(start: usize, buf: &mut [u8]) -> usize {
 /// Index of the program whose name is in `name[..len]`, or -1.
 fn find_program(name: &[u8], len: usize) -> i64 {
     for i in 0..program_count {
-        let candidate = program_name(i)
+        let candidate = program_name(i).as_bytes()
         if candidate.len() == len {
             let mut same = true
             for j in 0..len {
-                if str_byte(candidate, j) != name[j] {
+                if candidate[j] != name[j] {
                     same = false
                 }
             }
@@ -530,9 +547,9 @@ fn start_program(name: &[u8], len: usize) -> i64 {
     }
     if get_fat_mounted() && len + 5 <= 64 {
         let mut path = [0u8; 64]
-        let prefix = "/bin/"
-        for i in 0..5usize {
-            path[i] = str_byte(prefix, i)
+        let prefix = "/bin/".as_bytes()
+        for i in 0..prefix.len() {
+            path[i] = prefix[i]
         }
         for i in 0..len {
             path[5 + i] = name[i]
@@ -908,6 +925,7 @@ fn read_line() {
 /// GDT, TSS and exception handlers (run again after moving to the
 /// higher half, so every address the CPU keeps is a high one).
 fn cpu_init() {
+    sse_init()
     gdt_init()
     exceptions_init()
 }
@@ -915,7 +933,9 @@ fn cpu_init() {
 /// UEFI entry point: takes over the machine, then jumps to the higher half.
 fn main() {
     efi_init()
-    has_fb = fb_init()
+    config_load()
+    let video = config_video()
+    has_fb = fb_init_mode(video.width, video.height)
     con_init(has_fb)
 
     // From here on, no more firmware boot services.
@@ -932,6 +952,10 @@ fn main() {
 /// Runs in the higher half, on the kernel stack: finishes the setup and
 /// starts the shell.
 fn kmain() {
+    rebase_kernel_statics()
+    if (program_name(0) as *const u8 as u64) < kernel_virt_base {
+        panic("statics still point to the low half")
+    }
     cpu_init()
     // Firmware page tables, GDT, IDT and stack are no longer used.
     reclaimed_pages = pmm_reclaim_boot_services()

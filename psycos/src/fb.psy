@@ -4,8 +4,9 @@
 ///   - https://uefi.org/specs/UEFI/2.10/12_Protocols_Console_Support.html
 ///
 /// Linear framebuffer from the UEFI Graphics Output Protocol (GOP).
-/// fb_init() must run before ExitBootServices: it only reads the address of
-/// the framebuffer. After that, drawing writes straight to video memory.
+/// fb_init() must run before ExitBootServices: it lists the video modes,
+/// can switch mode (fb_init_mode) and reads the address of the
+/// framebuffer. After that, drawing writes straight to video memory.
 /// Colors are always 0x00RRGGBB, whatever the byte order of the screen.
 
 #![trusted]
@@ -15,6 +16,7 @@ import "efi.psy"
 const pixel_rgb: u32 = 0
 const pixel_bgr: u32 = 1
 const bytes_per_pixel: usize = 4
+const max_modes: usize = 64
 
 struct GopModeInfo {
     version: u32,
@@ -38,10 +40,16 @@ struct GopMode {
 }
 
 struct Gop {
-    query_mode: *mut u8,
-    set_mode: *mut u8,
+    query_mode: extern fn(*mut Gop, u32, *mut usize, *mut *mut GopModeInfo) -> u64,
+    set_mode: extern fn(*mut Gop, u32) -> u64,
     blt: *mut u8,
     mode: *mut GopMode,
+}
+
+struct VideoMode {
+    number: u32,
+    width: u32,
+    height: u32,
 }
 
 #[getter]
@@ -55,8 +63,24 @@ static mut fb_height: usize = 0
 static mut fb_stride: usize = 0
 static mut fb_rgb: bool = false
 
-/// Finds the GOP and saves the framebuffer (false if none is usable).
+static mut modes: [VideoMode; 64]
+#[getter]
+static mut mode_count: usize = 0
+#[getter]
+static mut mode_current: usize = 0
+
 fn fb_init() -> bool {
+    return fb_setup(false, 0, 0)
+}
+
+/// Like fb_init, but switches to `want_w` x `want_h` if the firmware has
+/// it, else to the largest mode (0 x 0: the largest).
+fn fb_init_mode(want_w: usize, want_h: usize) -> bool {
+    return fb_setup(true, want_w, want_h)
+}
+
+/// Finds the GOP, lists its modes, switches mode if asked, reads the result.
+fn fb_setup(switch: bool, want_w: usize, want_h: usize) -> bool {
     let guid = Guid {
         d1: 0x9042a9de,
         d2: 0x23dc,
@@ -64,26 +88,82 @@ fn fb_init() -> bool {
         d4: [0x96, 0xfb, 0x7a, 0xde, 0xd0, 0x80, 0x51, 0x6a],
     }
     let bs = (*st).boot_services
-    let mut gop = 0 as *mut u8
-    let status = (*bs).locate_protocol(&guid as *const Guid, 0 as *mut u8, &mut gop as *mut *mut u8)
-    if status != 0 || gop.is_null() {
+    let mut found = 0 as *mut u8
+    let status = (*bs).locate_protocol(&guid as *const Guid, 0 as *mut u8, &mut found as *mut *mut u8)
+    if status != 0 || found.is_null() {
         return false
     }
+    let gop = found as *mut Gop
+    list_modes(gop)
+    let choice = choose_mode(want_w, want_h)
+    if switch && choice < mode_count && modes[choice].number != (*(*gop).mode).mode {
+        (*gop).set_mode(gop, modes[choice].number)
+    }
+    return read_mode(gop)
+}
 
-    let mode = (*(gop as *mut Gop)).mode
+/// Fills `modes` with the 32-bit modes of the GOP.
+fn list_modes(gop: *mut Gop) {
+    mode_count = 0
+    let max = (*(*gop).mode).max_mode
+    for n in 0..max {
+        let mut size: usize = 0
+        let mut info = 0 as *mut GopModeInfo
+        if (*gop).query_mode(gop, n, &mut size as *mut usize, &mut info as *mut *mut GopModeInfo) != 0 || info.is_null() {
+            continue
+        }
+        let format = (*info).pixel_format
+        if (format == pixel_rgb || format == pixel_bgr) && mode_count < max_modes {
+            modes[mode_count] = VideoMode { number: n, width: (*info).width, height: (*info).height }
+            mode_count += 1
+        }
+    }
+}
+
+/// Index in `modes` of the requested size, else of the largest mode.
+fn choose_mode(want_w: usize, want_h: usize) -> usize {
+    let mut best = mode_count
+    let mut best_area: usize = 0
+    for i in 0..mode_count {
+        let w = modes[i].width as usize
+        let h = modes[i].height as usize
+        if w == want_w && h == want_h {
+            return i
+        }
+        if w * h > best_area {
+            best = i
+            best_area = w * h
+        }
+    }
+    return best
+}
+
+/// Saves the framebuffer of the current mode.
+fn read_mode(gop: *mut Gop) -> bool {
+    let mode = (*gop).mode
     let info = (*mode).info
     let format = (*info).pixel_format
     if format != pixel_rgb && format != pixel_bgr {
         return false
     }
-
     fb_base = (*mode).frame_buffer_base as *mut u32
     fb_size = (*mode).frame_buffer_size
     fb_width = (*info).width as usize
     fb_height = (*info).height as usize
     fb_stride = (*info).pixels_per_scan_line as usize
     fb_rgb = format == pixel_rgb
+    mode_current = mode_count
+    for i in 0..mode_count {
+        if modes[i].number == (*mode).mode {
+            mode_current = i
+        }
+    }
     return !fb_base.is_null() && fb_width > 0 && fb_height > 0
+}
+
+/// The `i`-th video mode listed at boot.
+fn video_mode(i: usize) -> VideoMode {
+    return modes[i]
 }
 
 /// Uses another virtual address for the same framebuffer.
@@ -131,9 +211,7 @@ fn fill_rect(x: usize, y: usize, w: usize, h: usize, color: u32) {
     let c = to_native(color)
     let mut row = fb_base.add(y * fb_stride + x)
     for j in 0..ch {
-        for i in 0..cw {
-            row.add(i).write(c)
-        }
+        memset32(row, c, cw)
         row = row.add(fb_stride)
     }
 }

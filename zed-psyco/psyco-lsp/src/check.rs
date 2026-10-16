@@ -114,6 +114,11 @@ impl Checker<'_> {
         // becomes module `m`, and the same file may be loaded once per alias.
         // The standard library files come last, unless imported explicitly.
         let mut paths: Vec<Option<PathBuf>> = vec![path.map(Path::to_path_buf)];
+        // File names as the driver gives them to the checker: standard library
+        // files are `std/x.psy`, which is how it knows to check their
+        // functions only when they are used.
+        let mut names: Vec<String> =
+            vec![path.map_or_else(String::new, |p| p.to_string_lossy().into_owned())];
         let mut origin: Vec<Option<Span>> = vec![None];
         let mut seen: HashSet<(String, Option<String>)> =
             path.map(|p| ((loader.key)(p), None)).into_iter().collect();
@@ -153,6 +158,10 @@ impl Checker<'_> {
             if std_name == Some(stdlib::ALLOC_LINUX) {
                 alloc_linux = Some(file);
             }
+            names.push(match std_name {
+                Some(name) => name.to_string(),
+                None => target.to_string_lossy().into_owned(),
+            });
             paths.push(Some(target));
             origin.push(root);
             let parsed = Lexer::with_file(&src, file)
@@ -219,11 +228,10 @@ impl Checker<'_> {
             if span.file == 0 {
                 return (span, message);
             }
-            let file = paths
+            let file = names
                 .get(span.file)
-                .cloned()
-                .flatten()
-                .map_or_else(|| "<import>".into(), |p| p.to_string_lossy().replace('\\', "/"));
+                .filter(|n| !n.is_empty())
+                .map_or_else(|| "<import>".into(), |n| n.replace('\\', "/"));
             // Files without an `import` of their own (the standard library)
             // are reported at the top of the document.
             let root = origin
@@ -246,12 +254,7 @@ impl Checker<'_> {
         let mut stubbed = HashSet::new();
         loop {
             let mut attempt = program.clone();
-            // `include_bytes` / `include_program` resolve paths from the file names.
-            let files = paths
-                .iter()
-                .map(|p| p.as_ref().map_or_else(String::new, |p| p.to_string_lossy().into_owned()))
-                .collect();
-            let e = match TypeChecker::new().with_files(files).check_program(&mut attempt) {
+            let e = match TypeChecker::new().with_files(names.clone()).check_program(&mut attempt) {
                 Ok(info) => {
                     if let Some(let_types) = let_types.as_deref_mut() {
                         for f in bodies(&attempt) {
