@@ -36,29 +36,29 @@ const exit_killed: i64 = 137
 const time_slice: u64 = 2
 
 enum TaskState: u8 {
-	Free,
-	Ready,
-	Running,
-	Sleeping,
-	Dead,
+    Free,
+    Ready,
+    Running,
+    Sleeping,
+    Dead,
 }
 
 struct Task {
-	id: u64,
-	state: TaskState,
-	rsp: u64,
-	has_stack: bool,
-	entry: fn(),
-	name: [u8; 16],
-	name_len: usize,
-	wake_tick: u64,
-	run_ticks: u64,
-	switches: u64,
-	cr3: u64,
-	is_user: bool,
-	user_entry: u64,
-	user_stack: u64,
-	exit_code: i64,
+    id: u64,
+    state: TaskState,
+    rsp: u64,
+    has_stack: bool,
+    entry: fn(),
+    name: [u8; 16],
+    name_len: usize,
+    wake_tick: u64,
+    run_ticks: u64,
+    switches: u64,
+    cr3: u64,
+    is_user: bool,
+    user_entry: u64,
+    user_stack: u64,
+    exit_code: i64,
 }
 
 static mut tasks: [Task; 16]
@@ -94,8 +94,9 @@ fn set_name(slot: usize, name: Str) {
     if n > task_name_max {
         n = task_name_max
     }
+    let bytes = name.as_bytes()
     for i in 0..n {
-        tasks[slot].name[i] = str_byte(name, i)
+        tasks[slot].name[i] = bytes[i]
     }
     tasks[slot].name_len = n
 }

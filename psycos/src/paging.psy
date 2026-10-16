@@ -344,6 +344,10 @@ fn paging_init() {
     if fb != 0 && fb + get_fb_size() as u64 <= identity_limit {
         fb_move(direct_map_base + fb)
     }
+    let back = fb_back_phys()
+    if back != 0 && back + get_fb_size() as u64 <= identity_limit {
+        fb_move_back(direct_map_base + back)
+    }
 }
 
 /// Higher-half alias of an address inside the kernel image.

@@ -3687,6 +3687,7 @@ fn builtin_sig(name: &str) -> Option<(Vec<Type>, Type, bool)> {
         "load_cs" | "load_ds" | "ltr" => (vec![u(U16)], Type::Unit, true),
         "memcpy" => (vec![raw_mut_u8, raw_u8, u(Usize)], Type::Unit, true),
         "memset" => (vec![raw_mut_u8, u(U8), u(Usize)], Type::Unit, true),
+        "memset32" => (vec![Type::raw(u(U32), true), u(U32), u(Usize)], Type::Unit, true),
         "efi_image_handle" | "efi_system_table" => (vec![], Type::raw(Type::U8, true), false),
         "switch_stack" => (
             vec![

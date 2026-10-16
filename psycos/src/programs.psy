@@ -38,11 +38,12 @@ fn program_elf(i: usize) -> Str {
 /// Index of the program called `name`, or -1.
 fn program_find(name: Str) -> i64 {
     for i in 0..program_count {
-        let candidate = program_name(i)
-        if candidate.len() == name.len() {
+        let candidate = program_name(i).as_bytes()
+        let wanted = name.as_bytes()
+        if candidate.len() == wanted.len() {
             let mut same = true
-            for j in 0..name.len() {
-                if str_byte(candidate, j) != str_byte(name, j) {
+            for j in 0..wanted.len() {
+                if candidate[j] != wanted[j] {
                     same = false
                 }
             }

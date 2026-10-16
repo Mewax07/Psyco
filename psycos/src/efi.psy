@@ -13,6 +13,7 @@
 
 const max_exit_attempts: i64 = 8
 const efi_file_mode_read: u64 = 1
+const allocate_any_pages: u32 = 0
 
 const mem_loader_code: u32 = 1
 const mem_loader_data: u32 = 2
@@ -94,8 +95,8 @@ struct BootServices {
     hdr: TableHeader,
     raise_tpl: *mut u8,
     restore_tpl: *mut u8,
-    allocate_pages: *mut u8,
-    free_pages: *mut u8,
+    allocate_pages: extern fn(u32, u32, usize, *mut u64) -> u64,
+    free_pages: extern fn(u64, usize) -> u64,
     get_memory_map: extern fn(*mut usize, *mut u8, *mut usize, *mut usize, *mut u32) -> u64,
     allocate_pool: *mut u8,
     free_pool: *mut u8,
@@ -269,6 +270,28 @@ fn efi_read_file(path: *const u16, buf: &mut [u8]) -> i64 {
         return -1
     }
     return size as i64
+}
+
+/// Allocates `pages` pages of firmware memory that stay ours after
+/// ExitBootServices (loader data); returns the physical address, or 0.
+fn efi_alloc_pages(pages: usize) -> u64 {
+    if boot_services_done {
+        return 0
+    }
+    let bs = (*st).boot_services
+    let mut addr: u64 = 0
+    if (*bs).allocate_pages(allocate_any_pages, mem_loader_data, pages, &mut addr as *mut u64) != 0 {
+        return 0
+    }
+    return addr
+}
+
+/// Gives back pages from efi_alloc_pages (before ExitBootServices).
+fn efi_free_pages(addr: u64, pages: usize) {
+    if !boot_services_done && addr != 0 {
+        let bs = (*st).boot_services
+        (*bs).free_pages(addr, pages)
+    }
 }
 
 /// Reads the memory map into `map`, returns its key (-1 on error).

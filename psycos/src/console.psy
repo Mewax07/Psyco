@@ -56,8 +56,10 @@ fn clear() {
     con_x = 0
     con_y = 0
     if con_ready {
+        fb_batch_begin()
         fill_rect(0, 0, get_fb_width(), get_fb_height(), con_bg)
         draw_cursor(con_fg)
+        fb_batch_end()
     }
 }
 
@@ -118,6 +120,7 @@ fn putc(c: u8) {
     if !con_ready {
         return
     }
+    fb_batch_begin()
     draw_cursor(con_bg)
     if c == '\n' {
         newline()
@@ -140,13 +143,17 @@ fn putc(c: u8) {
         }
     }
     draw_cursor(con_fg)
+    fb_batch_end()
 }
 
 /// Prints a string.
 fn puts(s: Str) {
-    for i in 0..s.len() {
-        putc(str_byte(s, i))
+    fb_batch_begin()
+    let bytes = s.as_bytes()
+    for i in 0..bytes.len() {
+        putc(bytes[i])
     }
+    fb_batch_end()
 }
 
 /// Prints an unsigned number in decimal.

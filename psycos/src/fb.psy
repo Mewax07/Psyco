@@ -12,11 +12,14 @@
 #![trusted]
 
 import "efi.psy"
+import "sync.psy"
 
 const pixel_rgb: u32 = 0
 const pixel_bgr: u32 = 1
 const bytes_per_pixel: usize = 4
 const max_modes: usize = 64
+const max_dirty: usize = 16
+const fb_page_bytes: usize = 4096
 
 struct GopModeInfo {
     version: u32,
@@ -46,6 +49,13 @@ struct Gop {
     mode: *mut GopMode,
 }
 
+struct DirtyRect {
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+}
+
 struct VideoMode {
     number: u32,
     width: u32,
@@ -63,12 +73,26 @@ static mut fb_height: usize = 0
 static mut fb_stride: usize = 0
 static mut fb_rgb: bool = false
 
+static mut back: *mut u32
+static mut back_stride: usize = 0
+static mut back_phys: u64 = 0
+static mut back_pages: usize = 0
+#[getter]
+static mut fb_double: bool = false
+static mut dirty: [DirtyRect; 16]
+static mut dirty_count: usize = 0
+static mut batch_depth: usize = 0
+#[getter]
+static mut flushed_bytes: u64 = 0
+
 static mut modes: [VideoMode; 64]
 #[getter]
 static mut mode_count: usize = 0
 #[getter]
 static mut mode_current: usize = 0
 
+/// Finds the GOP and saves the framebuffer of the firmware's current mode
+/// (false if none is usable). Before ExitBootServices only.
 fn fb_init() -> bool {
     return fb_setup(false, 0, 0)
 }
@@ -99,7 +123,35 @@ fn fb_setup(switch: bool, want_w: usize, want_h: usize) -> bool {
     if switch && choice < mode_count && modes[choice].number != (*(*gop).mode).mode {
         (*gop).set_mode(gop, modes[choice].number)
     }
-    return read_mode(gop)
+    if !read_mode(gop) {
+        return false
+    }
+    setup_back_buffer()
+    return true
+}
+
+/// Allocates the RAM copy of the screen (or draws straight to video
+/// memory if the firmware has no memory for it).
+fn setup_back_buffer() {
+    let pages = (fb_width * fb_height * bytes_per_pixel + fb_page_bytes - 1) / fb_page_bytes
+    if pages > back_pages {
+        efi_free_pages(back_phys, back_pages)
+        back_phys = efi_alloc_pages(pages)
+        back_pages = pages
+        if back_phys == 0 {
+            back_pages = 0
+        }
+    }
+    dirty_count = 0
+    fb_double = back_phys != 0
+    if fb_double {
+        back = back_phys as *mut u32
+        back_stride = fb_width
+        memset32(back, 0, fb_width * fb_height)
+    } else {
+        back = fb_base
+        back_stride = fb_stride
+    }
 }
 
 /// Fills `modes` with the 32-bit modes of the GOP.
@@ -169,6 +221,134 @@ fn video_mode(i: usize) -> VideoMode {
 /// Uses another virtual address for the same framebuffer.
 fn fb_move(new_base: u64) {
     fb_base = new_base as *mut u32
+    if !fb_double {
+        back = fb_base
+    }
+}
+
+/// Physical address of the RAM copy (0 if none).
+fn fb_back_phys() -> u64 {
+    if fb_double {
+        return back_phys
+    }
+    return 0
+}
+
+/// Uses another virtual address for the RAM copy.
+fn fb_move_back(new_base: u64) {
+    if fb_double {
+        back = new_base as *mut u32
+    }
+}
+
+/// Starts gathering changes (calls nest); fb_batch_end copies them.
+fn fb_batch_begin() {
+    batch_depth += 1
+}
+
+/// Ends a batch; the outermost one flushes.
+fn fb_batch_end() {
+    if batch_depth > 0 {
+        batch_depth -= 1
+    }
+    if batch_depth == 0 {
+        fb_flush()
+    }
+}
+
+/// Whether two rectangles overlap or touch.
+fn touching(a: DirtyRect, b: DirtyRect) -> bool {
+    return a.x <= b.x + b.w && b.x <= a.x + a.w && a.y <= b.y + b.h && b.y <= a.y + a.h
+}
+
+/// Smallest rectangle holding both.
+fn rect_union(a: DirtyRect, b: DirtyRect) -> DirtyRect {
+    let x0 = smaller(a.x, b.x)
+    let y0 = smaller(a.y, b.y)
+    let x1 = larger(a.x + a.w, b.x + b.w)
+    let y1 = larger(a.y + a.h, b.y + b.h)
+    return DirtyRect { x: x0, y: y0, w: x1 - x0, h: y1 - y0 }
+}
+
+/// Smaller of two values.
+fn smaller(a: usize, b: usize) -> usize {
+    if a < b {
+        return a
+    }
+    return b
+}
+
+/// Larger of two values.
+fn larger(a: usize, b: usize) -> usize {
+    if a > b {
+        return a
+    }
+    return b
+}
+
+/// Records a changed (clipped, non-empty) rectangle; flushes outside a
+/// batch.
+fn mark_dirty(x: usize, y: usize, w: usize, h: usize) {
+    if !fb_double {
+        return
+    }
+    let was_on = irq_save()
+    let mut r = DirtyRect { x: x, y: y, w: w, h: h }
+    let mut i: usize = 0
+    while i < dirty_count {
+        if touching(dirty[i], r) {
+            r = rect_union(dirty[i], r)
+            dirty_count -= 1
+            dirty[i] = dirty[dirty_count]
+            i = 0
+        } else {
+            i += 1
+        }
+    }
+    if dirty_count == max_dirty {
+        for k in 0..dirty_count {
+            r = rect_union(dirty[k], r)
+        }
+        dirty_count = 0
+    }
+    dirty[dirty_count] = r
+    dirty_count += 1
+    irq_restore(was_on)
+    if batch_depth == 0 {
+        fb_flush()
+    }
+}
+
+/// Copies the changed rectangles from the RAM copy to video memory.
+fn fb_flush() {
+    if !fb_double {
+        return
+    }
+    let was_on = irq_save()
+    for i in 0..dirty_count {
+        let r = dirty[i]
+        for j in 0..r.h {
+            let src = back.add((r.y + j) * back_stride + r.x)
+            let dst = fb_base.add((r.y + j) * fb_stride + r.x)
+            memcpy(dst as *mut u8, src as *const u8, r.w * bytes_per_pixel)
+        }
+        flushed_bytes += (r.w * r.h * bytes_per_pixel) as u64
+    }
+    dirty_count = 0
+    irq_restore(was_on)
+}
+
+/// Number of rectangles waiting to be copied.
+fn fb_dirty_count() -> usize {
+    return dirty_count
+}
+
+/// Reads a pixel of video memory itself (tests: what is on screen).
+fn screen_pixel(x: usize, y: usize) -> u32 {
+    if x >= fb_width || y >= fb_height {
+        return 0
+    }
+    return to_native(fb_base.add(y * fb_stride + x).read())
 }
 
 /// Converts 0x00RRGGBB to the framebuffer byte order (its own inverse).
@@ -184,7 +364,8 @@ fn put_pixel(x: usize, y: usize, color: u32) {
     if x >= fb_width || y >= fb_height {
         return
     }
-    fb_base.add(y * fb_stride + x).write(to_native(color))
+    back.add(y * back_stride + x).write(to_native(color))
+    mark_dirty(x, y, 1, 1)
 }
 
 /// Reads one pixel back (0 outside the screen).
@@ -192,7 +373,7 @@ fn get_pixel(x: usize, y: usize) -> u32 {
     if x >= fb_width || y >= fb_height {
         return 0
     }
-    return to_native(fb_base.add(y * fb_stride + x).read())
+    return to_native(back.add(y * back_stride + x).read())
 }
 
 /// Fills a rectangle, clipped to the screen.
@@ -208,12 +389,16 @@ fn fill_rect(x: usize, y: usize, w: usize, h: usize, color: u32) {
     if ch > fb_height - y {
         ch = fb_height - y
     }
+    if cw == 0 || ch == 0 {
+        return
+    }
     let c = to_native(color)
-    let mut row = fb_base.add(y * fb_stride + x)
+    let mut row = back.add(y * back_stride + x)
     for j in 0..ch {
         memset32(row, c, cw)
-        row = row.add(fb_stride)
+        row = row.add(back_stride)
     }
+    mark_dirty(x, y, cw, ch)
 }
 
 /// Moves the whole screen up by `dy` pixel rows and clears the bottom.
@@ -223,7 +408,10 @@ fn fb_scroll_up(dy: usize, color: u32) {
         fill_rect(0, 0, fb_width, fb_height, color)
         return
     }
-    let line = fb_stride * bytes_per_pixel
-    memcpy(fb_base as *mut u8, fb_base.add(dy * fb_stride) as *const u8, (fb_height - dy) * line)
+    fb_batch_begin()
+    let line = back_stride * bytes_per_pixel
+    memcpy(back as *mut u8, back.add(dy * back_stride) as *const u8, (fb_height - dy) * line)
+    mark_dirty(0, 0, fb_width, fb_height - dy)
     fill_rect(0, fb_height - dy, fb_width, dy, color)
+    fb_batch_end()
 }

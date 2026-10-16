@@ -85,11 +85,25 @@ pub fn compile_file(path: &str, target: Target) -> Result<Vec<u8>, String> {
     compile_program(program, &sources, target)
 }
 
-pub fn compile_program(
+pub fn compile_program(program: Program, sources: &Sources, target: Target) -> Result<Vec<u8>, String> {
+    compile_program_stats(program, sources, target).map(|(b, _)| b)
+}
+
+pub fn compile_file_stats(path: &str, target: Target) -> Result<(Vec<u8>, usize), String> {
+    let (program, sources) = load(path)?;
+    compile_program_stats(program, &sources, target)
+}
+
+pub fn compile_program_stats(program: Program, sources: &Sources, target: Target) -> Result<(Vec<u8>, usize), String> {
+    compile_program_with(program, sources, target, Options::default())
+}
+
+pub fn compile_program_with(
     mut program: Program,
     sources: &Sources,
     target: Target,
-) -> Result<Vec<u8>, String> {
+    opts: Options,
+) -> Result<(Vec<u8>, usize), String> {
     let in_file = |span: &Span, f: &str| sources.paths.get(span.file).is_some_and(|p| p == f);
     let own_heap = program
         .functions
@@ -104,7 +118,7 @@ pub fn compile_program(
         .with_files(sources.paths.clone())
         .check_program(&mut program)
         .map_err(|e| sources.describe(e.span, "type", &e.message))?;
-    Ok(Codegen::new(&info).generate(&program, target))
+    Ok(Codegen::new(&info).with_options(opts).generate_with_stats(&program, target))
 }
 
 fn parse(src: &str, file: usize, sources: &Sources) -> Result<Program, String> {
