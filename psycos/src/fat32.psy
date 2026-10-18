@@ -3,14 +3,6 @@
 ///   - https://wiki.osdev.org/FAT#FAT_32
 ///   - https://wiki.osdev.org/FAT#Long_File_Names
 ///   - https://wiki.osdev.org/MBR_(x86)
-///
-/// FAT32 file system on the virtio disk (normal code: it only handles
-/// bytes and goes through blk_read / blk_write).
-/// The volume is either the whole disk or the first FAT32 partition of an
-/// MBR. Reading understands long file names (LFN). New files and
-/// directories get 8.3 names (lowercase kept with the NT flags, like
-/// Windows); both FAT copies are updated on every change.
-/// Paths are absolute, "/" separated, case-insensitive: /bin/hello
 
 import "virtio_blk.psy"
 
@@ -18,6 +10,7 @@ const sector_bytes: u64 = 512
 const dir_entry_size: u64 = 32
 const max_cluster_bytes: u64 = 32768
 const name_max: usize = 64
+const chain_error: u64 = 0xFFFFFFFFFFFFFFFF
 
 const fat_mask: u64 = 0x0FFFFFFF
 const fat_free: u64 = 0
@@ -49,17 +42,16 @@ const fixed_date: u64 = 0x5C21
 const fixed_time: u64 = 0x6000
 
 struct DirEntry {
-	found: bool,
-	name: [u8; 64],
-	name_len: usize,
-	attr: u8,
-	cluster: u64,
-	size: u64,
-	entry_cluster: u64,
-	entry_index: u64,
-	first_cluster: u64,
-	first_index: u64,
-	entry_count: u64,
+    name: [u8; 64],
+    name_len: usize,
+    attr: u8,
+    cluster: u64,
+    size: u64,
+    entry_cluster: u64,
+    entry_index: u64,
+    first_cluster: u64,
+    first_index: u64,
+    entry_count: u64,
 }
 
 struct DirIter {
@@ -103,29 +95,24 @@ static mut dir_buf: [u8; 32768]
 static mut dir_buf_cluster: u64 = 0
 static mut data_buf: [u8; 32768]
 
-/// Little-endian u16 at `offset`.
 fn le16(b: &[u8], offset: usize) -> u64 {
     return b[offset] as u64 | ((b[offset + 1] as u64) << 8)
 }
 
-/// Little-endian u32 at `offset`.
 fn le32(b: &[u8], offset: usize) -> u64 {
     return le16(b, offset) | (le16(b, offset + 2) << 16)
 }
 
-/// Stores a little-endian u16 at `offset`.
 fn put16(b: &mut [u8], offset: usize, v: u64) {
     b[offset] = (v & 0xFF) as u8
     b[offset + 1] = ((v >> 8) & 0xFF) as u8
 }
 
-/// Stores a little-endian u32 at `offset`.
 fn put32(b: &mut [u8], offset: usize, v: u64) {
     put16(b, offset, v & 0xFFFF)
     put16(b, offset + 2, (v >> 16) & 0xFFFF)
 }
 
-/// ASCII uppercase.
 fn upper(c: u8) -> u8 {
     if c >= 'a' && c <= 'z' {
         return c - 32
@@ -133,7 +120,6 @@ fn upper(c: u8) -> u8 {
     return c
 }
 
-/// ASCII lowercase.
 fn lower(c: u8) -> u8 {
     if c >= 'A' && c <= 'Z' {
         return c + 32
@@ -141,27 +127,22 @@ fn lower(c: u8) -> u8 {
     return c
 }
 
-/// Reads volume sectors.
 fn vol_read(first: u64, count: u64, buf: &mut [u8]) -> bool {
     return blk_read(fat_partition_start + first, count, buf)
 }
 
-/// Writes volume sectors.
 fn vol_write(first: u64, count: u64, buf: &[u8]) -> bool {
     return blk_write(fat_partition_start + first, count, buf)
 }
 
-/// First sector of a data cluster.
 fn cluster_sector(cluster: u64) -> u64 {
     return data_start + (cluster - 2) * sectors_per_cluster
 }
 
-/// True if `cluster` is a valid data cluster number.
 fn valid_cluster(cluster: u64) -> bool {
     return cluster >= 2 && cluster < fat_total_clusters + 2
 }
 
-/// Reads a whole cluster into `buf`.
 fn read_cluster(cluster: u64, buf: &mut [u8]) -> bool {
     if !valid_cluster(cluster) {
         return false
@@ -169,7 +150,6 @@ fn read_cluster(cluster: u64, buf: &mut [u8]) -> bool {
     return vol_read(cluster_sector(cluster), sectors_per_cluster, buf)
 }
 
-/// Writes a whole cluster from `buf`.
 fn write_cluster(cluster: u64, buf: &[u8]) -> bool {
     if !valid_cluster(cluster) {
         return false
@@ -180,7 +160,6 @@ fn write_cluster(cluster: u64, buf: &[u8]) -> bool {
     return vol_write(cluster_sector(cluster), sectors_per_cluster, buf)
 }
 
-/// True if `sector` holds a FAT32 boot sector we can use.
 fn is_fat32_boot(b: &[u8]) -> bool {
     if b[510] != 0x55 || b[511] != 0xAA {
         return false
@@ -192,7 +171,6 @@ fn is_fat32_boot(b: &[u8]) -> bool {
     return spc != 0 && spc & (spc - 1) == 0 && spc * sector_bytes <= max_cluster_bytes && b[16] != 0
 }
 
-/// Finds the volume (whole disk or MBR partition) and reads its layout.
 fn fat_mount() -> bool {
     fat_mounted = false
     if !get_blk_ready() {
@@ -251,7 +229,6 @@ fn fat_mount() -> bool {
     return fat_mounted
 }
 
-/// Loads the FAT sector that holds `cluster` into the cache.
 fn load_fat_sector(cluster: u64) -> bool {
     let s = cluster * 4 / sector_bytes
     if fat_cache_sector == s {
@@ -264,7 +241,6 @@ fn load_fat_sector(cluster: u64) -> bool {
     return true
 }
 
-/// Next cluster after `cluster` (0 = free, >= fat_eoc_min = end of chain).
 fn fat_get(cluster: u64) -> u64 {
     if !valid_cluster(cluster) || !load_fat_sector(cluster) {
         return fat_eoc
@@ -272,7 +248,6 @@ fn fat_get(cluster: u64) -> u64 {
     return le32(&fat_cache, (cluster * 4 % sector_bytes) as usize) & fat_mask
 }
 
-/// Sets the FAT entry of `cluster` in every copy of the FAT.
 fn fat_set(cluster: u64, value: u64) -> bool {
     if !valid_cluster(cluster) || !load_fat_sector(cluster) {
         return false
@@ -288,12 +263,10 @@ fn fat_set(cluster: u64, value: u64) -> bool {
     return true
 }
 
-/// True if a FAT value ends a chain.
 fn is_end(value: u64) -> bool {
     return value >= fat_eoc_min || value < 2 || value == fat_bad
 }
 
-/// Counts the free clusters (whole FAT scan).
 fn count_free() -> u64 {
     let mut free: u64 = 0
     for c in 2..fat_total_clusters + 2 {
@@ -304,7 +277,6 @@ fn count_free() -> u64 {
     return free
 }
 
-/// Stores the free cluster count and the next free hint in FSInfo.
 fn sync_fsinfo() {
     if fsinfo_sector == 0 || !vol_read(fsinfo_sector, 1, &mut sector) {
         return
@@ -314,7 +286,6 @@ fn sync_fsinfo() {
     vol_write(fsinfo_sector, 1, &sector)
 }
 
-/// Takes a free cluster, marks it end of chain, zeroes it (0 if full).
 fn alloc_cluster() -> u64 {
     let total = fat_total_clusters
     for step in 0..total {
@@ -338,7 +309,6 @@ fn alloc_cluster() -> u64 {
     return 0
 }
 
-/// Frees a whole chain starting at `cluster`.
 fn free_chain(cluster: u64) {
     let mut c = cluster
     while valid_cluster(c) {
@@ -352,7 +322,6 @@ fn free_chain(cluster: u64) {
     }
 }
 
-/// Makes `dir_buf` hold `cluster`.
 fn load_dir_cluster(cluster: u64) -> bool {
     if dir_buf_cluster == cluster {
         return true
@@ -364,7 +333,6 @@ fn load_dir_cluster(cluster: u64) -> bool {
     return true
 }
 
-/// Iterator over the directory starting at `cluster`.
 fn dir_open(cluster: u64) -> DirIter {
     return DirIter {
         cluster: cluster,
@@ -379,7 +347,6 @@ fn dir_open(cluster: u64) -> DirIter {
     }
 }
 
-/// Moves to the next 32-byte slot, following the cluster chain.
 fn dir_advance(it: &mut DirIter) {
     it.index += 1
     if it.index * dir_entry_size >= fat_cluster_bytes {
@@ -393,7 +360,6 @@ fn dir_advance(it: &mut DirIter) {
     }
 }
 
-/// Checksum of an 8.3 name, as stored in its long name entries.
 fn short_checksum(b: &[u8], offset: usize) -> u8 {
     let mut sum: u8 = 0
     for i in 0..11usize {
@@ -402,7 +368,6 @@ fn short_checksum(b: &[u8], offset: usize) -> u8 {
     return sum
 }
 
-/// Adds the 13 characters of a long name entry to the iterator.
 fn take_lfn(it: &mut DirIter, b: &[u8], offset: usize) {
     let order = b[offset]
     let seq = (order & 0x1F) as usize
@@ -436,7 +401,6 @@ fn take_lfn(it: &mut DirIter, b: &[u8], offset: usize) {
     }
 }
 
-/// Builds "NAME.EXT" from a short entry (lowercase flags applied).
 fn short_display(b: &[u8], offset: usize, out: &mut DirEntry) {
     let ntres = b[offset + 12]
     let mut n: usize = 0
@@ -469,8 +433,6 @@ fn short_display(b: &[u8], offset: usize, out: &mut DirEntry) {
     out.name_len = n
 }
 
-/// Next entry of a directory ("." and ".." included, volume label and
-/// deleted entries skipped). False at the end.
 fn dir_next(it: &mut DirIter, out: &mut DirEntry) -> bool {
     while !it.done {
         if !load_dir_cluster(it.cluster) {
@@ -499,7 +461,6 @@ fn dir_next(it: &mut DirIter, out: &mut DirEntry) -> bool {
             dir_advance(it)
             continue
         }
-        out.found = true
         out.attr = attr
         out.cluster = (le16(&dir_buf, offset + 20) << 16) | le16(&dir_buf, offset + 26)
         out.size = le32(&dir_buf, offset + 28)
@@ -526,10 +487,8 @@ fn dir_next(it: &mut DirIter, out: &mut DirEntry) -> bool {
     return false
 }
 
-/// An entry that was not found.
-fn no_entry() -> DirEntry {
+fn blank_entry() -> DirEntry {
     return DirEntry {
-        found: false,
         name: [0u8; 64],
         name_len: 0,
         attr: 0,
@@ -543,10 +502,8 @@ fn no_entry() -> DirEntry {
     }
 }
 
-/// The root directory as an entry.
 fn root_entry() -> DirEntry {
-    let mut e = no_entry()
-    e.found = true
+    let mut e = blank_entry()
     e.attr = attr_directory
     e.cluster = root_cluster
     e.name[0] = '/'
@@ -554,12 +511,10 @@ fn root_entry() -> DirEntry {
     return e
 }
 
-/// True if `e` is a directory.
 fn is_dir(e: &DirEntry) -> bool {
     return e.attr & attr_directory != 0
 }
 
-/// Case-insensitive match of an entry name with path[start..end].
 fn name_matches(e: &DirEntry, path: &[u8], start: usize, end: usize) -> bool {
     if e.name_len != end - start {
         return false
@@ -572,22 +527,20 @@ fn name_matches(e: &DirEntry, path: &[u8], start: usize, end: usize) -> bool {
     return true
 }
 
-/// Entry called path[start..end] in directory `cluster`.
-fn find_in_dir(cluster: u64, path: &[u8], start: usize, end: usize) -> DirEntry {
+fn find_in_dir(cluster: u64, path: &[u8], start: usize, end: usize) -> Option<DirEntry> {
     let mut it = dir_open(cluster)
-    let mut e = no_entry()
+    let mut e = blank_entry()
     while dir_next(&mut it, &mut e) {
         if name_matches(&e, path, start, end) {
-            return e
+            return Some(e)
         }
     }
-    return no_entry()
+    return None
 }
 
-/// Looks up an absolute path ("/", "/bin", "/bin/hello").
-fn fat_lookup(path: &[u8]) -> DirEntry {
+fn fat_lookup(path: &[u8]) -> Option<DirEntry> {
     if !fat_mounted || path.len() == 0 || path[0] != '/' {
-        return no_entry()
+        return None
     }
     let mut current = root_entry()
     let mut start: usize = 1
@@ -598,15 +551,15 @@ fn fat_lookup(path: &[u8]) -> DirEntry {
         }
         if end > start {
             if !is_dir(&current) {
-                return no_entry()
+                return None
             }
             let mut dir_cluster = current.cluster
             if dir_cluster == 0 {
                 dir_cluster = root_cluster
             }
-            current = find_in_dir(dir_cluster, path, start, end)
-            if !current.found {
-                return current
+            match find_in_dir(dir_cluster, path, start, end) {
+                Some(e) => current = e,
+                None => return None,
             }
             if current.cluster == 0 && is_dir(&current) {
                 current.cluster = root_cluster
@@ -614,13 +567,11 @@ fn fat_lookup(path: &[u8]) -> DirEntry {
         }
         start = end + 1
     }
-    return current
+    return Some(current)
 }
 
-/// Reads up to buf.len() bytes of a file from byte `offset`; returns the
-/// number of bytes read.
 fn fat_read(e: &DirEntry, offset: u64, buf: &mut [u8]) -> u64 {
-    if !e.found || is_dir(e) || offset >= e.size {
+    if is_dir(e) || offset >= e.size {
         return 0
     }
     let mut want = e.size - offset
@@ -661,7 +612,6 @@ fn fat_read(e: &DirEntry, offset: u64, buf: &mut [u8]) -> u64 {
     return done
 }
 
-/// Index of the last '/' in path (0 for "/name").
 fn last_slash(path: &[u8]) -> usize {
     let mut at: usize = 0
     for i in 0..path.len() {
@@ -672,8 +622,6 @@ fn last_slash(path: &[u8]) -> usize {
     return at
 }
 
-/// Builds the 11-byte 8.3 name of path[start..end] into `raw` (entry
-/// layout) with the lowercase flags. False if the name does not fit 8.3.
 fn make_short_name(path: &[u8], start: usize, end: usize, raw: &mut [u8]) -> bool {
     for i in 0..11usize {
         raw[i] = ' '
@@ -741,7 +689,6 @@ fn make_short_name(path: &[u8], start: usize, end: usize, raw: &mut [u8]) -> boo
     return true
 }
 
-/// Writes the 32-byte entry `raw` at (cluster, index).
 fn write_entry(cluster: u64, index: u64, raw: &[u8]) -> bool {
     if !load_dir_cluster(cluster) {
         return false
@@ -756,7 +703,6 @@ fn write_entry(cluster: u64, index: u64, raw: &[u8]) -> bool {
     return ok
 }
 
-/// Fills the cluster, size, attribute and dates of an entry.
 fn fill_entry(raw: &mut [u8], attr: u8, cluster: u64, size: u64) {
     raw[11] = attr
     put16(raw, 14, fixed_time)
@@ -769,7 +715,6 @@ fn fill_entry(raw: &mut [u8], attr: u8, cluster: u64, size: u64) {
     put32(raw, 28, size)
 }
 
-/// Stores `raw` in a free slot of directory `dir` (grows it if full).
 fn add_entry(dir: u64, raw: &[u8]) -> bool {
     let mut cluster = dir
     loop {
@@ -794,17 +739,26 @@ fn add_entry(dir: u64, raw: &[u8]) -> bool {
     }
 }
 
-/// Parent directory cluster of `path`, and the range of its last name.
-fn parent_of(path: &[u8]) -> DirEntry {
+fn parent_of(path: &[u8]) -> Option<DirEntry> {
     let slash = last_slash(path)
     if slash == 0 {
-        return root_entry()
+        return Some(root_entry())
     }
     return fat_lookup(&path[..slash])
 }
 
-/// Writes `data` to the cluster chain of a file (allocating it); returns
-/// the first cluster (0 for an empty file, u64 max on error).
+fn parent_dir(path: &[u8]) -> Option<DirEntry> {
+    if !fat_mounted || path.len() < 2 || path[0] != '/' {
+        return None
+    }
+    if let Some(p) = parent_of(path) {
+        if is_dir(&p) {
+            return Some(p)
+        }
+    }
+    return None
+}
+
 fn write_chain(data: &[u8]) -> u64 {
     let mut first: u64 = 0
     let mut previous: u64 = 0
@@ -816,7 +770,7 @@ fn write_chain(data: &[u8]) -> u64 {
             if first != 0 {
                 free_chain(first)
             }
-            return 0xFFFFFFFFFFFFFFFF
+            return chain_error
         }
         if previous == 0 {
             first = c
@@ -841,71 +795,63 @@ fn write_chain(data: &[u8]) -> u64 {
     return first
 }
 
-/// Creates or replaces the file `path` with `data`.
 fn fat_write_file(path: &[u8], data: &[u8]) -> bool {
     let ok = fat_write_file_inner(path, data)
     sync_fsinfo()
     return ok
 }
 
-/// Body of fat_write_file.
 fn fat_write_file_inner(path: &[u8], data: &[u8]) -> bool {
-    if !fat_mounted || path.len() < 2 || path[0] != '/' {
-        return false
-    }
-    let parent = parent_of(path)
-    if !parent.found || !is_dir(&parent) {
+    let Some(parent) = parent_dir(path) else {
         return false
     }
     let start = last_slash(path) + 1
-    let existing = find_in_dir(parent.cluster, path, start, path.len())
-    if existing.found && is_dir(&existing) {
-        return false
-    }
     let mut raw = [0u8; 32]
-    if existing.found {
-        if !load_dir_cluster(existing.entry_cluster) {
-            return false
+    match find_in_dir(parent.cluster, path, start, path.len()) {
+        Some(existing) => {
+            if is_dir(&existing) || !load_dir_cluster(existing.entry_cluster) {
+                return false
+            }
+            let offset = (existing.entry_index * dir_entry_size) as usize
+            for i in 0..32usize {
+                raw[i] = dir_buf[offset + i]
+            }
+            if existing.cluster != 0 {
+                free_chain(existing.cluster)
+            }
+            let first = write_chain(data)
+            if first == chain_error {
+                return false
+            }
+            fill_entry(&mut raw, attr_archive, first, data.len() as u64)
+            return write_entry(existing.entry_cluster, existing.entry_index, &raw)
         }
-        let offset = (existing.entry_index * dir_entry_size) as usize
-        for i in 0..32usize {
-            raw[i] = dir_buf[offset + i]
+        None => {
+            if !make_short_name(path, start, path.len(), &mut raw) {
+                return false
+            }
+            let first = write_chain(data)
+            if first == chain_error {
+                return false
+            }
+            fill_entry(&mut raw, attr_archive, first, data.len() as u64)
+            return add_entry(parent.cluster, &raw)
         }
-        if existing.cluster != 0 {
-            free_chain(existing.cluster)
-        }
-    } else if !make_short_name(path, start, path.len(), &mut raw) {
-        return false
     }
-    let first = write_chain(data)
-    if first == 0xFFFFFFFFFFFFFFFF {
-        return false
-    }
-    fill_entry(&mut raw, attr_archive, first, data.len() as u64)
-    if existing.found {
-        return write_entry(existing.entry_cluster, existing.entry_index, &raw)
-    }
-    return add_entry(parent.cluster, &raw)
 }
 
-/// Creates the directory `path` (with its "." and ".." entries).
 fn fat_mkdir(path: &[u8]) -> bool {
     let ok = fat_mkdir_inner(path)
     sync_fsinfo()
     return ok
 }
 
-/// Body of fat_mkdir.
 fn fat_mkdir_inner(path: &[u8]) -> bool {
-    if !fat_mounted || path.len() < 2 || path[0] != '/' {
-        return false
-    }
-    let parent = parent_of(path)
-    if !parent.found || !is_dir(&parent) {
+    let Some(parent) = parent_dir(path) else {
         return false
     }
     let start = last_slash(path) + 1
-    if find_in_dir(parent.cluster, path, start, path.len()).found {
+    if find_in_dir(parent.cluster, path, start, path.len()).is_some() {
         return false
     }
     let mut raw = [0u8; 32]
@@ -934,10 +880,9 @@ fn fat_mkdir_inner(path: &[u8]) -> bool {
     return add_entry(parent.cluster, &raw)
 }
 
-/// True if a directory holds nothing but "." and "..".
 fn dir_is_empty(cluster: u64) -> bool {
     let mut it = dir_open(cluster)
-    let mut e = no_entry()
+    let mut e = blank_entry()
     while dir_next(&mut it, &mut e) {
         let dots = (e.name_len == 1 && e.name[0] == '.') || (e.name_len == 2 && e.name[0] == '.' && e.name[1] == '.')
         if !dots {
@@ -947,17 +892,17 @@ fn dir_is_empty(cluster: u64) -> bool {
     return true
 }
 
-/// Deletes a file or an empty directory.
 fn fat_delete(path: &[u8]) -> bool {
     let ok = fat_delete_inner(path)
     sync_fsinfo()
     return ok
 }
 
-/// Body of fat_delete.
 fn fat_delete_inner(path: &[u8]) -> bool {
-    let e = fat_lookup(path)
-    if !e.found || e.entry_count == 0 {
+    let Some(e) = fat_lookup(path) else {
+        return false
+    }
+    if e.entry_count == 0 {
         return false
     }
     if is_dir(&e) && !dir_is_empty(e.cluster) {

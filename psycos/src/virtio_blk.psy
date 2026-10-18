@@ -1,15 +1,11 @@
 /// Wiki Doc sources:
 ///   - https://wiki.osdev.org/Virtio
 ///   - https://docs.oasis-open.org/virtio/virtio/v1.2/virtio-v1.2.html
-///
-/// virtio block device, legacy (I/O port) interface, as QEMU provides it
-/// with `-drive file=disk.img,if=virtio,format=raw`.
-/// One virtqueue, one request at a time, completion by polling. Data goes
-/// through a contiguous bounce buffer, so callers can use any buffer.
 
 #![trusted]
 
 import "pci.psy"
+import "bytes.psy"
 import "paging.psy"
 import "sync.psy"
 
@@ -62,12 +58,10 @@ static mut blk_requests: u64 = 0
 #[getter]
 static mut blk_errors: u64 = 0
 
-/// Kernel pointer to physical address `phys`.
 fn dma_ptr(phys: u64) -> *mut u8 {
     return phys_to_virt(phys) as *mut u8
 }
 
-/// Writes descriptor `i` of the queue.
 fn set_descriptor(i: u64, addr: u64, len: u32, flags: u16, next: u16) {
     let d = dma_ptr(queue_phys + i * 16)
     (d as *mut u64).write(addr)
@@ -76,25 +70,20 @@ fn set_descriptor(i: u64, addr: u64, len: u32, flags: u16, next: u16) {
     (d.add(14) as *mut u16).write(next)
 }
 
-/// Pointer to the avail ring index.
 fn avail_idx() -> *mut u16 {
     return dma_ptr(queue_phys + queue_size * 16 + 2) as *mut u16
 }
 
-/// Pointer to slot `i` of the avail ring.
 fn avail_slot(i: u64) -> *mut u16 {
     return dma_ptr(queue_phys + queue_size * 16 + 4 + 2 * i) as *mut u16
 }
 
-/// Pointer to the used ring index.
 fn used_idx() -> *mut u16 {
     return dma_ptr(queue_phys + used_offset + 2) as *mut u16
 }
 
-/// Finds the device, sets up queue 0 and the buffers (false if absent).
 fn blk_init() -> bool {
-    let a = pci_find(virtio_vendor, virtio_blk_legacy, virtio_blk_modern)
-    if !a.found {
+    let Some(a) = pci_find(virtio_vendor, virtio_blk_legacy, virtio_blk_modern) else {
         return false
     }
     io_base = pci_io_bar(&a, 0)
@@ -118,7 +107,7 @@ fn blk_init() -> bool {
     let avail_end = queue_size * 16 + 6 + 2 * queue_size
     used_offset = (avail_end + queue_align - 1) / queue_align * queue_align
     let total = used_offset + 6 + 8 * queue_size
-    let pages = (total + size_4k - 1) / size_4k
+    let pages = pages_for(total)
     queue_phys = pmm_alloc_pages(pages)
     request_phys = pmm_alloc_page()
     bounce_phys = pmm_alloc_pages(bounce_pages)
@@ -139,7 +128,6 @@ fn blk_init() -> bool {
     return true
 }
 
-/// Sends one request and waits for it. The data is in the bounce buffer.
 fn blk_request(kind: u32, sector: u64, count: u64) -> bool {
     let header = dma_ptr(request_phys)
     (header as *mut u32).write(kind)
@@ -179,7 +167,6 @@ fn blk_request(kind: u32, sector: u64, count: u64) -> bool {
     return true
 }
 
-/// Checks a transfer: device ready, buffer big enough, inside the disk.
 fn blk_check(sector: u64, count: u64, buf_len: usize) -> bool {
     if !blk_ready || count == 0 {
         return false
@@ -190,7 +177,6 @@ fn blk_check(sector: u64, count: u64, buf_len: usize) -> bool {
     return sector < blk_sectors && count <= blk_sectors - sector
 }
 
-/// Reads `count` sectors starting at `sector` into `buf`.
 fn blk_read(sector: u64, count: u64, buf: &mut [u8]) -> bool {
     if !blk_check(sector, count, buf.len()) {
         return false
@@ -213,7 +199,6 @@ fn blk_read(sector: u64, count: u64, buf: &mut [u8]) -> bool {
     return ok
 }
 
-/// Writes `count` sectors from `buf` starting at `sector`.
 fn blk_write(sector: u64, count: u64, buf: &[u8]) -> bool {
     if !blk_check(sector, count, buf.len()) {
         return false

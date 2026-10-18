@@ -27,3 +27,15 @@
 (static_item
   "static" @context
   name: (_) @name) @item
+
+(mod_item
+  "mod" @context
+  name: (_) @name) @item
+
+(trait_item
+  "trait" @context
+  name: (_) @name) @item
+
+(function_signature_item
+  "fn" @context
+  name: (_) @name) @item

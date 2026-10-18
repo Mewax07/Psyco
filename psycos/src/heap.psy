@@ -2,20 +2,6 @@
 ///   - https://wiki.osdev.org/Memory_Allocation
 ///   - https://wiki.osdev.org/Heap
 ///   - https://wiki.osdev.org/Memory_management
-///
-/// Kernel heap: a block allocator with boundary tags, in its own virtual
-/// range. It grows on demand (physical pages from the PMM, mapped with
-/// map_page) and merges free neighbours on kfree.
-///
-/// Block layout (16-byte aligned):
-///   [size | used][prev_size][generation][magic][payload ...]
-/// `size` includes the 32-byte header. `prev_size` finds the block before,
-/// `generation` is unique per allocation (used by the safe buffers to catch
-/// use-after-free), `magic` catches wild pointers.
-///
-/// kalloc/kfree are the raw interface. Normal code uses the typed buffers
-/// below (ByteBuf, U32Buf, U64Buf): every access is bounds checked and
-/// checked against the allocation generation.
 
 #![trusted]
 
@@ -42,22 +28,18 @@ static mut heap_used_bytes: u64 = 0
 #[getter]
 static mut heap_allocations: u64 = 0
 
-/// Header word `i` of the block at `block`.
 fn word(block: u64, i: usize) -> *mut u64 {
     return (block as *mut u64).add(i)
 }
 
-/// Total size of a block (header included).
 fn block_size(block: u64) -> u64 {
     return word(block, 0).read() & ~used_bit
 }
 
-/// True if the block is allocated.
 fn block_used(block: u64) -> bool {
     return word(block, 0).read() & used_bit != 0
 }
 
-/// Writes the header of a block and the prev_size of the block after it.
 fn set_block(block: u64, size: u64, used: bool, prev_size: u64) {
     let mut first = size
     if used {
@@ -72,7 +54,6 @@ fn set_block(block: u64, size: u64, used: bool, prev_size: u64) {
     }
 }
 
-/// Bytes needed for a payload of `size` (header added, aligned).
 fn needed(size: u64) -> u64 {
     let n = (size + header_size + block_align - 1) / block_align * block_align
     if n < min_block {
@@ -81,7 +62,6 @@ fn needed(size: u64) -> u64 {
     return n
 }
 
-/// Maps more pages at the end of the heap; merges with a free last block.
 fn heap_grow(min_bytes: u64) -> bool {
     let mut bytes = (min_bytes + size_4k - 1) / size_4k * size_4k
     if bytes < heap_grow_min {
@@ -120,7 +100,6 @@ fn heap_grow(min_bytes: u64) -> bool {
     return true
 }
 
-/// Checks that `ptr` is the payload of a live block; returns the block.
 fn block_of(ptr: *mut u8) -> u64 {
     let addr = ptr as u64
     if addr < heap_base + header_size || addr >= heap_end || addr % block_align != 0 {
@@ -136,7 +115,6 @@ fn block_of(ptr: *mut u8) -> u64 {
     return block
 }
 
-/// Sets up an empty heap (needs paging).
 fn heap_init() {
     heap_end = heap_base
     heap_used_bytes = 0
@@ -144,7 +122,6 @@ fn heap_init() {
     heap_ready = heap_grow(heap_grow_min)
 }
 
-/// Allocates `size` zeroed bytes (16-byte aligned). Null if out of memory.
 fn kalloc(size: u64) -> *mut u8 {
     let was_on = irq_save()
     let p = kalloc_locked(size)
@@ -152,7 +129,6 @@ fn kalloc(size: u64) -> *mut u8 {
     return p
 }
 
-/// kalloc body (interrupts already off).
 fn kalloc_locked(size: u64) -> *mut u8 {
     if !heap_ready || size == 0 || size > heap_max {
         return 0 as *mut u8
@@ -185,14 +161,12 @@ fn kalloc_locked(size: u64) -> *mut u8 {
     }
 }
 
-/// Frees a block from kalloc, merging it with free neighbours.
 fn kfree(ptr: *mut u8) {
     let was_on = irq_save()
     kfree_locked(ptr)
     irq_restore(was_on)
 }
 
-/// kfree body (interrupts already off).
 fn kfree_locked(ptr: *mut u8) {
     let mut block = block_of(ptr)
     let mut size = block_size(block)
@@ -214,7 +188,6 @@ fn kfree_locked(ptr: *mut u8) {
     set_block(block, size, false, word(block, 1).read())
 }
 
-/// Generation of the live allocation at `ptr` (0 if it was freed).
 fn heap_generation(ptr: *mut u8) -> u64 {
     let addr = ptr as u64
     if addr < heap_base + header_size || addr >= heap_end {
@@ -227,12 +200,10 @@ fn heap_generation(ptr: *mut u8) -> u64 {
     return word(block, 2).read()
 }
 
-/// Bytes currently mapped for the heap.
 fn heap_mapped_bytes() -> u64 {
     return heap_end - heap_base
 }
 
-/// Walks every block and checks the heap structure (for tests).
 fn heap_check() -> bool {
     let mut b = heap_base
     let mut prev: u64 = 0
@@ -261,174 +232,21 @@ fn heap_check() -> bool {
     return b == heap_end && used == heap_used_bytes
 }
 
-struct ByteBuf {
-    ptr: *mut u8,
-    count: usize,
-    generation: u64,
+fn psy_alloc(size: usize) -> *mut u8 {
+    return kalloc(size as u64)
 }
 
-struct U32Buf {
-    ptr: *mut u32,
-    count: usize,
-    generation: u64,
+fn psy_free(ptr: *mut u8) {
+    kfree(ptr)
 }
 
-struct U64Buf {
-    ptr: *mut u64,
-    count: usize,
-    generation: u64,
+fn psy_generation(ptr: *mut u8) -> u64 {
+    return heap_generation(ptr)
 }
 
-/// Panics unless the buffer is still allocated and `i` is in bounds.
-fn check_access(ptr: *mut u8, generation: u64, i: usize, count: usize) {
-    if generation == 0 || heap_generation(ptr) != generation {
-        panic("buffer: use after free")
+fn psy_capacity(ptr: *mut u8) -> usize {
+    if heap_generation(ptr) == 0 {
+        return 0
     }
-    if i >= count {
-        panic("buffer: index out of bounds")
-    }
-}
-
-/// New zeroed byte buffer (panics if the heap is full).
-fn byte_buf(count: usize) -> ByteBuf {
-    let p = kalloc(count as u64)
-    if p.is_null() {
-        panic("byte_buf: out of memory")
-    }
-    return ByteBuf {
-        ptr: p,
-        count: count,
-        generation: heap_generation(p)
-    }
-}
-
-/// New zeroed u32 buffer.
-fn u32_buf(count: usize) -> U32Buf {
-    let p = kalloc(count as u64 * 4)
-    if p.is_null() {
-        panic("u32_buf: out of memory")
-    }
-    return U32Buf {
-        ptr: p as *mut u32,
-        count: count,
-        generation: heap_generation(p)
-    }
-}
-
-/// New zeroed u64 buffer.
-fn u64_buf(count: usize) -> U64Buf {
-    let p = kalloc(count as u64 * 8)
-    if p.is_null() {
-        panic("u64_buf: out of memory")
-    }
-    return U64Buf {
-        ptr: p as *mut u64,
-        count: count,
-        generation: heap_generation(p)
-    }
-}
-
-impl ByteBuf {
-    /// Number of elements.
-    fn length(&self) -> usize {
-        return self.count
-    }
-
-    /// Element `i` (checked).
-    fn get(&self, i: usize) -> u8 {
-        check_access(self.ptr, self.generation, i, self.count)
-        return self.ptr.add(i).read()
-    }
-
-    /// Sets element `i` (checked).
-    fn set(&mut self, i: usize, v: u8) {
-        check_access(self.ptr, self.generation, i, self.count)
-        self.ptr.add(i).write(v)
-    }
-
-    /// Copies `src` into the buffer at index `at` (checked).
-    fn copy_from(&mut self, at: usize, src: &[u8]) {
-        check_access(self.ptr, self.generation, 0, 1)
-        if at > self.count || src.len() > self.count - at {
-            panic("buffer: copy out of bounds")
-        }
-        memcpy(self.ptr.add(at), src.as_ptr(), src.len())
-    }
-
-    /// Copies bytes from index `at` of the buffer into `dst` (checked).
-    fn copy_to(&self, at: usize, dst: &mut [u8]) {
-        check_access(self.ptr, self.generation, 0, 1)
-        if at > self.count || dst.len() > self.count - at {
-            panic("buffer: copy out of bounds")
-        }
-        memcpy(dst.as_mut_ptr(), self.ptr.add(at), dst.len())
-    }
-
-    /// Sets every element to `v`.
-    fn fill(&mut self, v: u8) {
-        check_access(self.ptr, self.generation, 0, self.count + 1)
-        memset(self.ptr, v, self.count)
-    }
-
-    /// Gives the memory back; the buffer is empty afterwards.
-    fn free(&mut self) {
-        check_access(self.ptr, self.generation, 0, 1)
-        kfree(self.ptr)
-        self.count = 0
-        self.generation = 0
-    }
-}
-
-impl U32Buf {
-    /// Number of elements.
-    fn length(&self) -> usize {
-        return self.count
-    }
-
-    /// Element `i` (checked).
-    fn get(&self, i: usize) -> u32 {
-        check_access(self.ptr as *mut u8, self.generation, i, self.count)
-        return self.ptr.add(i).read()
-    }
-
-    /// Sets element `i` (checked).
-    fn set(&mut self, i: usize, v: u32) {
-        check_access(self.ptr as *mut u8, self.generation, i, self.count)
-        self.ptr.add(i).write(v)
-    }
-
-    /// Gives the memory back; the buffer is empty afterwards.
-    fn free(&mut self) {
-        check_access(self.ptr as *mut u8, self.generation, 0, 1)
-        kfree(self.ptr as *mut u8)
-        self.count = 0
-        self.generation = 0
-    }
-}
-
-impl U64Buf {
-    /// Number of elements.
-    fn length(&self) -> usize {
-        return self.count
-    }
-
-    /// Element `i` (checked).
-    fn get(&self, i: usize) -> u64 {
-        check_access(self.ptr as *mut u8, self.generation, i, self.count)
-        return self.ptr.add(i).read()
-    }
-
-    /// Sets element `i` (checked).
-    fn set(&mut self, i: usize, v: u64) {
-        check_access(self.ptr as *mut u8, self.generation, i, self.count)
-        self.ptr.add(i).write(v)
-    }
-
-    /// Gives the memory back; the buffer is empty afterwards.
-    fn free(&mut self) {
-        check_access(self.ptr as *mut u8, self.generation, 0, 1)
-        kfree(self.ptr as *mut u8)
-        self.count = 0
-        self.generation = 0
-    }
+    return (block_size(ptr as u64 - header_size) - header_size) as usize
 }

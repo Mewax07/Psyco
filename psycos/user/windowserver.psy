@@ -1,0 +1,647 @@
+/// Wiki Doc sources:
+///   - https://wiki.osdev.org/Drawing_In_a_Linear_Framebuffer
+///   - https://wiki.osdev.org/Message_Passing
+
+import "psy/sys.psy" as sys
+import "psy/abi.psy" as abi
+import "psy/gfx.psy" as gfx
+import "psy/wm.psy" as wm
+
+const max_windows: usize = 16
+const max_dirty: usize = 16
+const wallpaper: u32 = 0x204060
+const idle_ms: u64 = 200
+const title_on: u32 = 0xE0E0E0
+const title_off: u32 = 0xA8A8A8
+const title_text: u32 = 0x202020
+const border_color: u32 = 0x404040
+const close_color: u32 = 0xE05050
+const minimize_color: u32 = 0xE0B030
+const maximize_color: u32 = 0x40B040
+const button_r: i64 = 6
+const step: i64 = 20
+const bar_color: u32 = 0x303030
+const button_on: u32 = 0x5A7AB0
+const button_off: u32 = 0x707070
+const button_min: u32 = 0x484848
+const bar_text: u32 = 0xFFFFFF
+const button_w: i64 = 120
+const button_gap: i64 = 4
+
+struct Window {
+    used: bool,
+    id: u64,
+    owner: u64,
+    events: u64,
+    surface: u64,
+    pixels: gfx::Canvas,
+    x: i64,
+    y: i64,
+    title: [u8; 32],
+    title_len: usize,
+    minimized: bool,
+    maximized: bool,
+    saved: gfx::Rect,
+}
+
+static mut windows: [Window; 16]
+static mut zorder: [usize; 16]
+static mut zcount: usize = 0
+static mut next_id: u64 = 1
+static mut screen: gfx::Canvas
+static mut back: gfx::Canvas
+static mut dirty: [gfx::Rect; 16]
+static mut dirty_count: usize = 0
+static mut server_port: u64 = 0
+static mut focused: u64 = 0
+static mut input_held: bool = false
+static mut esc_pending: bool = false
+static mut bar_sig: u64 = 0
+
+fn damage(r: gfx::Rect) {
+    let a = gfx::intersect(r, gfx::bounds(&back))
+    if gfx::is_empty(a) {
+        return
+    }
+    if dirty_count == max_dirty {
+        let mut all = a
+        for i in 0..dirty_count {
+            all = gfx::union(all, dirty[i])
+        }
+        dirty[0] = all
+        dirty_count = 1
+        return
+    }
+    dirty[dirty_count] = a
+    dirty_count += 1
+}
+
+fn window_rect(i: usize) -> gfx::Rect {
+    return gfx::rect(windows[i].x, windows[i].y, windows[i].pixels.width, windows[i].pixels.height)
+}
+
+fn frame_rect(i: usize) -> gfx::Rect {
+    let b = wm::border
+    return gfx::rect(windows[i].x - b, windows[i].y - b - wm::title_h, windows[i].pixels.width + 2 * b, windows[i].pixels.height + 2 * b + wm::title_h)
+}
+
+fn title_rect(i: usize) -> gfx::Rect {
+    let f = frame_rect(i)
+    return gfx::rect(f.x, f.y, f.w, wm::title_h + wm::border)
+}
+
+fn draw_frame(i: usize, clip: gfx::Rect) {
+    let f = frame_rect(i)
+    let t = title_rect(i)
+    if gfx::is_empty(gfx::intersect(f, clip)) {
+        return
+    }
+    let mut bar = title_off
+    if windows[i].id == focused {
+        bar = title_on
+    }
+    gfx::frame(&back, f, clip, border_color)
+    gfx::fill(&back, gfx::rect(t.x + 1, t.y + 1, t.w - 2, t.h - 1), clip, bar)
+    let cy = t.y + wm::title_h / 2
+    gfx::disc(&back, t.x + 12, cy, button_r, clip, close_color)
+    gfx::disc(&back, t.x + 30, cy, button_r, clip, minimize_color)
+    gfx::disc(&back, t.x + 48, cy, button_r, clip, maximize_color)
+    let n = windows[i].title_len
+    let s = &windows[i].title[0..n]
+    let tw = gfx::text_width(s)
+    let mut tx = t.x + (t.w - tw) / 2
+    if tx < t.x + 60 {
+        tx = t.x + 60
+    }
+    let inner = gfx::intersect(clip, gfx::rect(t.x + 60, t.y, t.w - 62, t.h))
+    gfx::text(&back, tx, t.y + (wm::title_h - gfx::char_h()) / 2 + 1, s, title_text, bar, inner)
+}
+
+fn compose_rect(r: gfx::Rect) {
+    gfx::fill(&back, r, r, wallpaper)
+    for k in 0..zcount {
+        let i = zorder[k]
+        if windows[i].minimized {
+            continue
+        }
+        draw_frame(i, r)
+        gfx::blit(&back, windows[i].x, windows[i].y, &windows[i].pixels, r)
+    }
+    draw_taskbar(r)
+    gfx::copy(&screen, &back, r)
+}
+
+fn taskbar_rect() -> gfx::Rect {
+    return gfx::rect(0, back.height - wm::taskbar_h, back.width, wm::taskbar_h)
+}
+
+fn button_rect(k: usize) -> gfx::Rect {
+    return gfx::rect(button_gap + k as i64 * (button_w + button_gap), back.height - wm::taskbar_h + 2, button_w, wm::taskbar_h - 4)
+}
+
+fn bar_slot(k: usize) -> Option<usize> {
+    let mut n: usize = 0
+    for i in 0..max_windows {
+        if windows[i].used {
+            if n == k {
+                return Some(i)
+            }
+            n += 1
+        }
+    }
+    return None
+}
+
+fn draw_button(k: usize, i: usize, clip: gfx::Rect) {
+    let b = button_rect(k)
+    let mut color = button_off
+    if windows[i].minimized {
+        color = button_min
+    } else if windows[i].id == focused {
+        color = button_on
+    }
+    gfx::fill(&back, b, clip, color)
+    let inner = gfx::intersect(clip, gfx::rect(b.x + 4, b.y, b.w - 8, b.h))
+    let ty = b.y + (b.h - gfx::char_h()) / 2
+    let mut tx = b.x + 6
+    if k < 9 {
+        let mut d = [0u8; 1]
+        d[0] = 49 + k as u8
+        gfx::text(&back, tx, ty, &d, bar_text, color, inner)
+        tx += 2 * gfx::char_w()
+    }
+    let n = windows[i].title_len
+    gfx::text(&back, tx, ty, &windows[i].title[0..n], bar_text, color, inner)
+}
+
+fn draw_clock(clip: gfx::Rect) {
+    let t = taskbar_rect()
+    let c = sys::time()
+    let mut s = [0u8; 5]
+    s[0] = 48 + (c.hour / 10) as u8
+    s[1] = 48 + (c.hour % 10) as u8
+    s[2] = 58
+    s[3] = 48 + (c.minute / 10) as u8
+    s[4] = 48 + (c.minute % 10) as u8
+    let x = t.x + t.w - gfx::text_width(&s) - 8
+    gfx::text(&back, x, t.y + (t.h - gfx::char_h()) / 2, &s, bar_text, bar_color, clip)
+}
+
+fn draw_taskbar(clip: gfx::Rect) {
+    let t = taskbar_rect()
+    if gfx::is_empty(gfx::intersect(t, clip)) {
+        return
+    }
+    gfx::fill(&back, t, clip, bar_color)
+    let mut k: usize = 0
+    for i in 0..max_windows {
+        if windows[i].used {
+            draw_button(k, i, clip)
+            k += 1
+        }
+    }
+    draw_clock(clip)
+}
+
+fn mix(h: u64, v: u64) -> u64 {
+    return ((h << 7) | (h >> 57)) ^ v
+}
+
+fn bar_signature() -> u64 {
+    let c = sys::time()
+    let mut h = mix(focused, c.hour * 60 + c.minute)
+    for i in 0..max_windows {
+        if windows[i].used {
+            h = mix(h, windows[i].id)
+            h = mix(h, windows[i].minimized as u64)
+            for k in 0..windows[i].title_len {
+                h = mix(h, windows[i].title[k] as u64)
+            }
+        }
+    }
+    return h
+}
+
+fn refresh_bar() {
+    let s = bar_signature()
+    if s != bar_sig {
+        bar_sig = s
+        damage(taskbar_rect())
+    }
+}
+
+fn compose() {
+    for i in 0..dirty_count {
+        compose_rect(dirty[i])
+    }
+    dirty_count = 0
+}
+
+fn find(id: u64) -> Option<usize> {
+    for i in 0..max_windows {
+        if windows[i].used && windows[i].id == id {
+            return Some(i)
+        }
+    }
+    return None
+}
+
+fn z_remove(i: usize) {
+    let mut k: usize = 0
+    while k < zcount {
+        if zorder[k] == i {
+            for j in k..zcount - 1 {
+                zorder[j] = zorder[j + 1]
+            }
+            zcount -= 1
+            return
+        }
+        k += 1
+    }
+}
+
+fn z_top(i: usize) {
+    z_remove(i)
+    zorder[zcount] = i
+    zcount += 1
+}
+
+fn top_at(x: i64, y: i64) -> u64 {
+    let mut k = zcount
+    while k > 0 {
+        k -= 1
+        let i = zorder[k]
+        if !windows[i].minimized && gfx::contains(frame_rect(i), x, y) {
+            return windows[i].id
+        }
+    }
+    return 0
+}
+
+fn top_id() -> u64 {
+    let mut k = zcount
+    while k > 0 {
+        k -= 1
+        if !windows[zorder[k]].minimized {
+            return windows[zorder[k]].id
+        }
+    }
+    return 0
+}
+
+fn notify(i: usize, kind: u64, a: u64, b: u64) {
+    let mut m = sys::Message { sender: 0, kind: kind, data: [0u64; 6] }
+    m.data[0] = windows[i].id
+    m.data[1] = a
+    m.data[2] = b
+    sys::send(windows[i].events, &m)
+}
+
+fn update_focus() {
+    let now = top_id()
+    if now == focused {
+        return
+    }
+    if let Some(i) = find(focused) {
+        notify(i, wm::ev_focus, 0, 0)
+        damage(title_rect(i))
+    }
+    focused = now
+    if let Some(i) = find(now) {
+        notify(i, wm::ev_focus, 1, 0)
+        damage(title_rect(i))
+    }
+    if zcount > 0 && !input_held {
+        input_held = sys::input_claim(server_port) == 0
+    }
+    if zcount == 0 && input_held {
+        sys::input_release()
+        input_held = false
+    }
+}
+
+fn clamp(v: u64, lo: u64, hi: u64) -> u64 {
+    if v < lo {
+        return lo
+    }
+    if v > hi {
+        return hi
+    }
+    return v
+}
+
+fn store_title(i: usize, m: &sys::Message) {
+    let mut n = m.data[1] as usize
+    if n > wm::title_max {
+        n = wm::title_max
+    }
+    for k in 0..n {
+        windows[i].title[k] = (m.data[2 + k / 8] >> ((k % 8) * 8)) as u8
+    }
+    windows[i].title_len = n
+}
+
+fn title_word(id: u64) -> u64 {
+    let Some(i) = find(id) else {
+        return 0
+    }
+    let mut w: u64 = 0
+    for k in 0..8usize {
+        if k < windows[i].title_len {
+            w = w | ((windows[i].title[k] as u64) << (k * 8))
+        }
+    }
+    return w
+}
+
+fn attach_surface(i: usize, id: u64) {
+    let base = sys::surface_map(id)
+    let info = sys::surface_info(id)
+    if base < 0 || info < 0 {
+        return
+    }
+    damage(frame_rect(i))
+    sys::surface_unmap(windows[i].surface)
+    let w = (info as u64 & 0xFFFFFFFF) as i64
+    let h = (info as u64 >> 32) as i64
+    windows[i].surface = id
+    windows[i].pixels = gfx::canvas(base as u64, w, h, w)
+    damage(frame_rect(i))
+}
+
+fn ask_size(i: usize, w: i64, h: i64) {
+    let ww = clamp(w as u64, wm::min_side, back.width as u64)
+    let hh = clamp(h as u64, wm::min_side, back.height as u64)
+    notify(i, wm::ev_resize, ww, hh)
+}
+
+fn move_by(i: usize, dx: i64, dy: i64) {
+    damage(frame_rect(i))
+    windows[i].x += dx
+    windows[i].y += dy
+    damage(frame_rect(i))
+}
+
+fn toggle_maximize(i: usize) {
+    damage(frame_rect(i))
+    if windows[i].maximized {
+        let s = windows[i].saved
+        windows[i].maximized = false
+        windows[i].x = s.x
+        windows[i].y = s.y
+        ask_size(i, s.w, s.h)
+    } else {
+        windows[i].saved = gfx::rect(windows[i].x, windows[i].y, windows[i].pixels.width, windows[i].pixels.height)
+        windows[i].maximized = true
+        windows[i].x = wm::border
+        windows[i].y = wm::border + wm::title_h
+        ask_size(i, back.width - 2 * wm::border, back.height - wm::taskbar_h - wm::title_h - 2 * wm::border)
+    }
+    damage(frame_rect(i))
+}
+
+fn cycle() {
+    if zcount == 0 {
+        return
+    }
+    let i = zorder[0]
+    windows[i].minimized = false
+    z_top(i)
+    damage(frame_rect(i))
+}
+
+fn restore(k: usize) {
+    let Some(i) = bar_slot(k) else {
+        return
+    }
+    windows[i].minimized = false
+    z_top(i)
+    damage(frame_rect(i))
+}
+
+fn wm_command(c: u64) {
+    if c == wm::key_tab {
+        cycle()
+        return
+    }
+    if c >= 49 && c <= 57 {
+        restore((c - 49) as usize)
+        return
+    }
+    let Some(i) = find(focused) else {
+        return
+    }
+    let w = windows[i].pixels.width
+    let h = windows[i].pixels.height
+    match c {
+        109 => {
+            windows[i].minimized = true
+            damage(frame_rect(i))
+        }
+        120 => toggle_maximize(i),
+        113 => notify(i, wm::ev_close, 0, 0),
+        104 => move_by(i, 0 - step, 0),
+        108 => move_by(i, step, 0),
+        107 => move_by(i, 0, 0 - step),
+        106 => move_by(i, 0, step),
+        72 => ask_size(i, w - step, h),
+        76 => ask_size(i, w + step, h),
+        75 => ask_size(i, w, h - step),
+        74 => ask_size(i, w, h + step),
+        _ => {}
+    }
+}
+
+fn on_key(c: u64) {
+    if esc_pending {
+        esc_pending = false
+        if c != wm::key_esc {
+            wm_command(c)
+            return
+        }
+    } else if c == wm::key_esc {
+        esc_pending = true
+        return
+    }
+    if let Some(i) = find(focused) {
+        notify(i, wm::ev_key, c, 0)
+    }
+}
+
+fn create_window(m: &sys::Message) {
+    let Some(i) = free_slot() else {
+        return
+    }
+    let base = sys::surface_map(m.data[0])
+    let info = sys::surface_info(m.data[0])
+    if base < 0 || info < 0 {
+        return
+    }
+    let w = (info as u64 & 0xFFFFFFFF) as i64
+    let h = (info as u64 >> 32) as i64
+    windows[i] = Window {
+        used: true,
+        id: next_id,
+        owner: m.sender,
+        events: m.data[1],
+        surface: m.data[0],
+        pixels: gfx::canvas(base as u64, w, h, w),
+        x: m.data[2] as i64,
+        y: m.data[3] as i64,
+        title: [0u8; 32],
+        title_len: 0,
+        minimized: false,
+        maximized: false,
+        saved: gfx::rect(0, 0, 0, 0),
+    }
+    next_id += 1
+    z_top(i)
+    damage(frame_rect(i))
+    let mut r = sys::Message { sender: 0, kind: wm::created, data: [0u64; 6] }
+    r.data[0] = windows[i].id
+    sys::send(windows[i].events, &r)
+}
+
+fn free_slot() -> Option<usize> {
+    for i in 0..max_windows {
+        if !windows[i].used {
+            return Some(i)
+        }
+    }
+    return None
+}
+
+fn remove_window(i: usize) {
+    damage(frame_rect(i))
+    z_remove(i)
+    sys::surface_unmap(windows[i].surface)
+    windows[i].used = false
+}
+
+fn owned(m: &sys::Message) -> Option<usize> {
+    let Some(i) = find(m.data[0]) else {
+        return None
+    }
+    if windows[i].owner != m.sender {
+        return None
+    }
+    return Some(i)
+}
+
+fn handle(m: &sys::Message) {
+    match m.kind {
+        wm::create => create_window(m),
+        wm::present => {
+            if let Some(i) = owned(m) {
+                let r = gfx::rect(m.data[1] as i64, m.data[2] as i64, m.data[3] as i64, m.data[4] as i64)
+                damage(gfx::intersect(gfx::rect(windows[i].x + r.x, windows[i].y + r.y, r.w, r.h), window_rect(i)))
+            }
+        }
+        wm::destroy => {
+            if let Some(i) = owned(m) {
+                remove_window(i)
+            }
+        }
+        wm::move_to => {
+            if let Some(i) = owned(m) {
+                move_by(i, m.data[1] as i64 - windows[i].x, m.data[2] as i64 - windows[i].y)
+            }
+        }
+        wm::raise => {
+            if let Some(i) = owned(m) {
+                windows[i].minimized = false
+                z_top(i)
+                damage(frame_rect(i))
+            }
+        }
+        wm::probe => {
+            refresh_bar()
+            compose()
+            let x = m.data[0] as i64
+            let y = m.data[1] as i64
+            let mut r = sys::Message { sender: 0, kind: wm::probe_reply, data: [0u64; 6] }
+            r.data[0] = gfx::pixel(&back, x, y) as u64
+            r.data[1] = top_at(x, y)
+            r.data[2] = gfx::pixel(&screen, x, y) as u64
+            r.data[3] = focused
+            r.data[4] = title_word(r.data[1])
+            sys::send(m.data[2], &r)
+        }
+        wm::set_title => {
+            if let Some(i) = owned(m) {
+                store_title(i, m)
+                damage(title_rect(i))
+            }
+        }
+        wm::resize => {
+            if let Some(i) = owned(m) {
+                ask_size(i, m.data[1] as i64, m.data[2] as i64)
+            }
+        }
+        wm::attach => {
+            if let Some(i) = owned(m) {
+                attach_surface(i, m.data[1])
+            }
+        }
+        wm::ask_close => {
+            if let Some(i) = owned(m) {
+                notify(i, wm::ev_close, 0, 0)
+            }
+        }
+        abi::msg_key => {
+            if m.sender == 0 {
+                on_key(m.data[0])
+            }
+        }
+        wm::crash => {
+            ud2()
+        }
+        _ => {}
+    }
+    update_focus()
+}
+
+fn check_clients() {
+    for i in 0..max_windows {
+        if windows[i].used && !sys::task_alive(windows[i].owner) {
+            remove_window(i)
+        }
+    }
+    update_focus()
+}
+
+fn main() {
+    let fb = sys::display_claim()
+    if fb < 0 {
+        print("windowserver: the display is taken")
+        exit(1)
+    }
+    let mut info = sys::DisplayInfo { width: 0, height: 0, stride: 0, rgb: 0 }
+    sys::display_info(&mut info)
+    let w = info.width as i64
+    let h = info.height as i64
+    screen = gfx::canvas(fb as u64, w, h, info.stride as i64)
+    let mem = sys::map((w * h * 4) as u64)
+    if mem < 0 {
+        exit(2)
+    }
+    back = gfx::canvas(mem as u64, w, h, w)
+    let port = sys::port_create() as u64
+    server_port = port
+    sys::publish(port, "window")
+    damage(gfx::bounds(&back))
+    compose()
+    print("windowserver: ready", w, h)
+    let mut m = sys::Message { sender: 0, kind: 0, data: [0u64; 6] }
+    loop {
+        if sys::recv_timeout(port, &mut m, idle_ms) == 0 {
+            handle(&m)
+            while sys::try_recv(port, &mut m) == 0 {
+                handle(&m)
+            }
+        }
+        check_clients()
+        refresh_bar()
+        compose()
+    }
+}

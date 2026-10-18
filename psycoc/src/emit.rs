@@ -262,7 +262,9 @@ impl<'e> Emitter<'e> {
             Inst::Store { mem, src, size } => {
                 let a = self.mem(*mem, Rax, Rdx);
                 match *src {
-                    Op::I(i) if i32::try_from(i).is_ok() => self.asm.store_imm_at(a, i as i32, *size as u64),
+                    Op::I(i) if i32::try_from(i).is_ok() => {
+                        self.asm.store_imm_at(a, i as i32, *size as u64)
+                    }
                     _ => {
                         let s = self.get(*src, Rcx);
                         self.asm.store_sized_at(a, s, *size as u64);
@@ -510,7 +512,9 @@ impl<'e> Emitter<'e> {
             (Op::I(i), Some(alu)) if i32::try_from(i).is_ok() => self.asm.alu_ri(alu, d, i as i32),
             (Op::I(i), None) if i32::try_from(i).is_ok() => self.asm.imul_ri(d, d, i as i32),
             (Op::V(v), Some(alu)) if matches!(self.loc(v), Loc::Spill(_)) => {
-                let Loc::Spill(sl) = self.loc(v) else { unreachable!() };
+                let Loc::Spill(sl) = self.loc(v) else {
+                    unreachable!()
+                };
                 let off = self.spill_off(sl);
                 self.asm.alu_rm(alu, d, Addr::base(Rbp, off));
             }
@@ -731,7 +735,10 @@ impl<'e> Emitter<'e> {
                 for a in args.iter().rev() {
                     self.push_op(*a);
                 }
-                for r in [Rax, Rdi, Rsi, Rdx].into_iter().take(args.len()) {
+                for r in [Rax, Rdi, Rsi, Rdx, R10, R8, R9]
+                    .into_iter()
+                    .take(args.len())
+                {
                     self.asm.pop(r);
                 }
                 self.asm.syscall();

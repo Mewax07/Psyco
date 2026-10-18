@@ -136,6 +136,8 @@ pub fn header_comment(text: &str) -> Option<String> {
     let lines: Vec<&str> = text
         .lines()
         .map(str::trim)
+        // `#![trusted]` may come first.
+        .skip_while(|l| l.starts_with("#!") || l.is_empty())
         .take_while(|l| l.starts_with("//"))
         .map(|l| {
             let l = l.trim_start_matches('/');
@@ -410,7 +412,7 @@ impl Analysis {
     pub fn is_syscall_number(&self, i: usize) -> bool {
         i >= 2
             && *self.kind(i - 1) == TokenKind::LParen
-            && self.ident(i - 2) == Some("syscall")
+            && matches!(self.ident(i - 2), Some("syscall" | "syscall6"))
             && !self.is_member(i - 2)
             && *self.kind_before(i, 3) != TokenKind::Fn
             && matches!(self.kind(i + 1), TokenKind::Comma | TokenKind::RParen)
@@ -691,6 +693,16 @@ impl Analysis {
                         patterns.push(p);
                     }
                 }
+                // `let Some(x) = value else { ... }`: the bindings live on
+                // after the statement, to the end of the block.
+                TokenKind::Let
+                    if self.ident(i + 1).is_some()
+                        && matches!(self.kind(i + 2), TokenKind::LParen | TokenKind::ColonColon) =>
+                {
+                    if let Some(eq) = self.pattern_end(i) {
+                        patterns.push((i + 1, eq, self.block_end(i)));
+                    }
+                }
                 TokenKind::Fn => {
                     if self.ident(i + 1).is_some() {
                         let container = impls
@@ -708,6 +720,22 @@ impl Analysis {
                 TokenKind::Import => {
                     if let TokenKind::Str(bytes) = self.kind(i + 1) {
                         let path = String::from_utf8_lossy(bytes).into_owned();
+                        // `import "x.psy" as m`: `m` names the file's module.
+                        if let Some(alias) = self.import_alias(i + 1).map(str::to_string) {
+                            self.push(Def {
+                                detail: format!("import \"{path}\" as {alias}"),
+                                name: alias,
+                                kind: DefKind::Module,
+                                tok: i + 3,
+                                start_tok: i,
+                                end_tok: i + 3,
+                                container: None,
+                                params: Vec::new(),
+                                scope: None,
+                                explicit_type: true,
+                                module: None,
+                            });
+                        }
                         self.imports.push((path, i + 1));
                     }
                 }
@@ -827,6 +855,21 @@ impl Analysis {
             }
         }
         arms
+    }
+
+    /// The `=` after the pattern of a `let` at `i`.
+    fn pattern_end(&self, i: usize) -> Option<usize> {
+        let mut depth = 0i32;
+        for j in i + 1..self.tokens.len().min(i + 64) {
+            match self.kind(j) {
+                TokenKind::LParen | TokenKind::LBracket => depth += 1,
+                TokenKind::RParen | TokenKind::RBracket => depth -= 1,
+                TokenKind::Eq if depth == 0 => return Some(j),
+                TokenKind::LBrace | TokenKind::RBrace => return None,
+                _ => {}
+            }
+        }
+        None
     }
 
     /// `if let PAT = value { ... }` / `while let`: the pattern and the block.
@@ -1424,6 +1467,8 @@ impl World {
                         .iter()
                         .enumerate()
                         .filter(|(_, d)| d.kind.is_item() && named(d) && d.module.is_none())
+                        // The file's own `import ... as x` are not its items.
+                        .filter(|(_, d)| !(d.kind == DefKind::Module && d.detail.starts_with("import ")))
                         .map(|(def, _)| Target { unit: u, def }),
                 );
             }

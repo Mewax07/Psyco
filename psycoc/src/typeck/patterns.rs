@@ -132,6 +132,30 @@ impl TypeChecker {
         Ok(t && e)
     }
 
+    pub(super) fn check_let_else(
+        &mut self,
+        pat: &mut Pattern,
+        value: &mut Expr,
+        else_block: &mut Block,
+        span: Span,
+    ) -> TypeResult<bool> {
+        let vt = self.check_expr(value, None)?;
+        self.check_matchable(&vt, value.span)?;
+        let origin = self.scrutinee_origin(value);
+        let mut bindings = Vec::new();
+        self.check_pattern(pat, &vt, None, origin, &mut bindings)?;
+        if !self.check_block(else_block)? {
+            return self.err(
+                "the 'else' block of 'let PATTERN = VALUE else' must leave (return, break, continue, panic or exit)",
+                span,
+            );
+        }
+        for b in bindings {
+            self.declare_local(&b.name, b.local);
+        }
+        Ok(false)
+    }
+
     pub(super) fn check_while_let(
         &mut self,
         pat: &mut Pattern,

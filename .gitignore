@@ -1,0 +1,15 @@
+target/
+extension.wasm
+grammars/
+
+# local test with wsl
+*.efi
+*.fd
+*.ld
+*.out
+*.o
+*.img
+esp/
+
+# not finished
+docs/

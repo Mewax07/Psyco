@@ -1,0 +1,16 @@
+/// Wiki Doc sources:
+///   - https://man7.org/linux/man-pages/man2/munmap.2.html
+
+#![trusted]
+
+import "psy/sys.psy" as sys
+
+fn main() {
+    let a = sys::map(4096) as u64
+    (a as *mut u64).write(1)
+    print("mapped page written")
+    sys::unmap(a, 4096)
+    print("touching it after unmap...")
+    (a as *mut u64).write(2)
+    print("not reached")
+}

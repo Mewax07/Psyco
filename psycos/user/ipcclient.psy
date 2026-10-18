@@ -1,0 +1,60 @@
+/// Wiki Doc sources:
+///   - https://wiki.osdev.org/Message_Passing
+
+import "psy/sys.psy" as sys
+import "psy/abi.psy" as abi
+
+const bogus_port: u64 = 0x7F05
+const queue_capacity: u64 = 16
+
+fn find_server() -> u64 {
+    for i in 0..100u64 {
+        let id = sys::lookup("echo")
+        if id >= 0 {
+            return id as u64
+        }
+        sys::sleep_ms(10)
+    }
+    exit(3)
+    return 0
+}
+
+fn queue_limits(port: u64) {
+    let m = sys::Message { sender: 0, kind: 7, data: [0u64; 6] }
+    let mut sent: u64 = 0
+    while sys::send(port, &m) == 0 {
+        sent += 1
+    }
+    print("queue full after:", sent, "then", sys::send(port, &m))
+    let mut got = sys::Message { sender: 0, kind: 0, data: [0u64; 6] }
+    let mut read: u64 = 0
+    while sys::try_recv(port, &mut got) == 0 {
+        read += 1
+    }
+    print("read back:", read, "sender is us:", got.sender == sys::getpid(), "kind:", got.kind)
+}
+
+fn main() {
+    let server = find_server()
+    let mine = sys::port_create()
+    print("ports:", mine > 0, mine as u64 != server)
+    print("name taken:", sys::publish(mine as u64, "echo") == -abi::err_busy)
+    let mut m = sys::Message { sender: 0, kind: 0, data: [0u64; 6] }
+    print("not the owner:", sys::try_recv(server, &mut m) == -abi::err_perm)
+    print("bad port:", sys::send(bogus_port, &m) == -abi::err_badf)
+    print("unknown name:", sys::lookup("nobody") == -abi::err_noent)
+    queue_limits(mine as u64)
+
+    for i in 1..4u64 {
+        let mut q = sys::Message { sender: 0, kind: 100 * i, data: [0u64; 6] }
+        q.data[0] = mine as u64
+        q.data[1] = 21 * i
+        sys::send(server, &q)
+        let mut r = sys::Message { sender: 0, kind: 0, data: [0u64; 6] }
+        sys::recv(mine as u64, &mut r)
+        print("reply", i, ":", r.kind, r.data[1], r.data[0] == sys::getpid(), r.sender == r.data[2])
+    }
+    sys::sleep_ms(50)
+    print("server gone:", sys::lookup("echo") == -abi::err_noent, sys::send(server, &m) == -abi::err_badf)
+    print("destroy:", sys::port_destroy(mine as u64), sys::port_destroy(mine as u64) == -abi::err_badf)
+}

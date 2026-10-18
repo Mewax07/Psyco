@@ -181,7 +181,13 @@ impl<'c, 'a> Lower<'c, 'a> {
             return n;
         }
         if k > 0 && (k as u64).is_power_of_two() {
-            return self.bin(BinK::Shl, n, Op::I(k.trailing_zeros() as i64), Ty::U64, Arith::Plain);
+            return self.bin(
+                BinK::Shl,
+                n,
+                Op::I(k.trailing_zeros() as i64),
+                Ty::U64,
+                Arith::Plain,
+            );
         }
         self.bin(BinK::Mul, n, Op::I(k), Ty::U64, Arith::Plain)
     }
@@ -409,6 +415,21 @@ impl<'c, 'a> Lower<'c, 'a> {
                 self.jump(end);
                 self.switch_to(end);
             }
+            Stmt::LetElse {
+                pat,
+                value,
+                else_block,
+                ..
+            } => {
+                let root = self.scrutinee(value);
+                let else_b = self.new_block();
+                self.pat_test(pat, root, else_b);
+                let ok = self.cur;
+                self.switch_to(else_b);
+                self.block(else_block);
+                self.switch_to(ok);
+                self.pat_bind(pat, root);
+            }
             Stmt::WhileLet {
                 pat, value, body, ..
             } => {
@@ -519,7 +540,11 @@ impl<'c, 'a> Lower<'c, 'a> {
             None => {
                 let v = self.scalar(value);
                 let size = self.ty(&t).size;
-                self.emit(Inst::Store { mem: dst, src: v, size });
+                self.emit(Inst::Store {
+                    mem: dst,
+                    src: v,
+                    size,
+                });
             }
             Some(op) => {
                 let ty = self.ty(&t);
@@ -538,9 +563,7 @@ impl<'c, 'a> Lower<'c, 'a> {
     fn init(&mut self, dst: Mem, e: &Expr, t: &Type) {
         match &e.kind {
             ExprKind::StructLit { fields, .. } => {
-                let Type::Struct(sid) = t else {
-                    unreachable!()
-                };
+                let Type::Struct(sid) = t else { unreachable!() };
                 for (name, value, _) in fields {
                     let fl = self.cg.info.field(*sid, name).clone();
                     self.init(dst.offset(fl.offset as i32), value, &fl.r#type);
@@ -562,7 +585,10 @@ impl<'c, 'a> Lower<'c, 'a> {
                 let (elem, n) = ((**elem).clone(), *n);
                 let esize = self.size(&elem);
                 if is_zero(&self.cg.info, value) {
-                    self.emit(Inst::Zero { dst, size: esize * n });
+                    self.emit(Inst::Zero {
+                        dst,
+                        size: esize * n,
+                    });
                 } else if elem.is_aggregate() {
                     let tmp = Mem::Slot(self.slot_ty(&elem), 0);
                     self.init(tmp, value, &elem);
@@ -577,7 +603,10 @@ impl<'c, 'a> Lower<'c, 'a> {
                     } else {
                         // A loop: i in 0..n
                         let i = self.vreg();
-                        self.emit(Inst::Mov { dst: i, src: Op::I(0) });
+                        self.emit(Inst::Mov {
+                            dst: i,
+                            src: Op::I(0),
+                        });
                         let body = self.new_block();
                         let end = self.new_block();
                         self.jump(body);
@@ -646,7 +675,11 @@ impl<'c, 'a> Lower<'c, 'a> {
             _ => {
                 let v = self.scalar(e);
                 let size = self.ty(t).size;
-                self.emit(Inst::Store { mem: dst, src: v, size });
+                self.emit(Inst::Store {
+                    mem: dst,
+                    src: v,
+                    size,
+                });
             }
         }
     }
@@ -698,7 +731,11 @@ impl<'c, 'a> Lower<'c, 'a> {
                 let t = e.r#type().clone();
                 let s = Mem::Slot(self.slot_ty(&t), 0);
                 let size = self.ty(&t).size;
-                self.emit(Inst::Store { mem: s, src: v, size });
+                self.emit(Inst::Store {
+                    mem: s,
+                    src: v,
+                    size,
+                });
                 PlaceL::Mem(s)
             }
         }
@@ -791,17 +828,19 @@ impl<'c, 'a> Lower<'c, 'a> {
                 let label = self.cg.functions[name];
                 Val::S(self.sym(Sym::Code(label)))
             }
-            ExprKind::Var(_) | ExprKind::Field { .. } | ExprKind::Index { .. } => match self.place(e) {
-                PlaceL::Reg(r) => Val::S(Op::V(r)),
-                PlaceL::Mem(m) => {
-                    if t.is_aggregate() {
-                        Val::A(m)
-                    } else {
-                        let ty = self.ty(&t);
-                        Val::S(self.load(m, ty))
+            ExprKind::Var(_) | ExprKind::Field { .. } | ExprKind::Index { .. } => {
+                match self.place(e) {
+                    PlaceL::Reg(r) => Val::S(Op::V(r)),
+                    PlaceL::Mem(m) => {
+                        if t.is_aggregate() {
+                            Val::A(m)
+                        } else {
+                            let ty = self.ty(&t);
+                            Val::S(self.load(m, ty))
+                        }
                     }
                 }
-            },
+            }
             ExprKind::Unary { op, operand } => self.unary(*op, operand, &t),
             ExprKind::Binary { op, lhs, rhs } => match op {
                 BinOp::And | BinOp::Or => {
@@ -811,10 +850,16 @@ impl<'c, 'a> Lower<'c, 'a> {
                     let end = self.new_block();
                     self.cond_br(e, tb, fb);
                     self.switch_to(tb);
-                    self.emit(Inst::Mov { dst: res, src: Op::I(1) });
+                    self.emit(Inst::Mov {
+                        dst: res,
+                        src: Op::I(1),
+                    });
                     self.jump(end);
                     self.switch_to(fb);
-                    self.emit(Inst::Mov { dst: res, src: Op::I(0) });
+                    self.emit(Inst::Mov {
+                        dst: res,
+                        src: Op::I(0),
+                    });
                     self.jump(end);
                     self.switch_to(end);
                     Val::S(Op::V(res))
@@ -838,12 +883,18 @@ impl<'c, 'a> Lower<'c, 'a> {
                     Type::Int(it) if matches!(from, Type::Int(_) | Type::Enum(_) | Type::Bool) => {
                         let f = self.ty(&from);
                         let (ts, tsg) = (it.size() as u8, it.signed());
-                        if f.size > ts || (f.size == ts && f.signed != tsg) || (f.size < ts && f.signed && !tsg) {
+                        if f.size > ts
+                            || (f.size == ts && f.signed != tsg)
+                            || (f.size < ts && f.signed && !tsg)
+                        {
                             let dst = self.vreg();
                             self.emit(Inst::Ext {
                                 dst,
                                 a: v,
-                                ty: Ty { size: ts, signed: tsg },
+                                ty: Ty {
+                                    size: ts,
+                                    signed: tsg,
+                                },
                             });
                             return Val::S(Op::V(dst));
                         }
@@ -868,7 +919,9 @@ impl<'c, 'a> Lower<'c, 'a> {
                 self.init(s, e, &t);
                 Val::A(s)
             }
-            ExprKind::Range { base, start, end } => self.range(base, start.as_deref(), end.as_deref()),
+            ExprKind::Range { base, start, end } => {
+                self.range(base, start.as_deref(), end.as_deref())
+            }
             ExprKind::Unsize(inner) => {
                 let Type::Ref(arr, _) = inner.r#type() else {
                     unreachable!()
@@ -878,7 +931,11 @@ impl<'c, 'a> Lower<'c, 'a> {
                 };
                 let p = self.scalar(inner);
                 let s = Mem::Slot(self.slot(16, 8), 0);
-                self.emit(Inst::Store { mem: s, src: p, size: 8 });
+                self.emit(Inst::Store {
+                    mem: s,
+                    src: p,
+                    size: 8,
+                });
                 self.emit(Inst::Store {
                     mem: s.offset(8),
                     src: Op::I(n as i64),
@@ -898,7 +955,10 @@ impl<'c, 'a> Lower<'c, 'a> {
             | ExprKind::Sizeof(_)
             | ExprKind::Turbofish { .. }
             | ExprKind::TypePath { .. }
-            | ExprKind::Try(_) => panic!("ICE: {:?} should have been rewritten by the type checker", e.kind),
+            | ExprKind::Try(_) => panic!(
+                "ICE: {:?} should have been rewritten by the type checker",
+                e.kind
+            ),
         }
     }
 
@@ -1077,7 +1137,14 @@ impl<'c, 'a> Lower<'c, 'a> {
         Val::A(slot)
     }
 
-    fn lower_try(&mut self, inner: &Expr, ok: usize, fail: usize, ret_sum: usize, ret_fail: usize) -> Val {
+    fn lower_try(
+        &mut self,
+        inner: &Expr,
+        ok: usize,
+        fail: usize,
+        ret_sum: usize,
+        ret_fail: usize,
+    ) -> Val {
         let Type::Sum(id) = inner.r#type().clone() else {
             unreachable!()
         };
@@ -1116,7 +1183,9 @@ impl<'c, 'a> Lower<'c, 'a> {
         }
 
         self.switch_to(fail_b);
-        let sret = self.sret.expect("ICE: '?' in a function without an enum result");
+        let sret = self
+            .sret
+            .expect("ICE: '?' in a function without an enum result");
         let dst = Mem::Base(Op::V(sret), 0);
         match rl.niche {
             Some(_) => self.emit(Inst::Zero { dst, size: rl.size }),
@@ -1138,7 +1207,11 @@ impl<'c, 'a> Lower<'c, 'a> {
             } else {
                 let ty = self.ty(&et);
                 let v = self.load(src, ty);
-                self.emit(Inst::Store { mem: d, src: v, size: ty.size });
+                self.emit(Inst::Store {
+                    mem: d,
+                    src: v,
+                    size: ty.size,
+                });
             }
         }
         self.terminate(Term::Ret(Some(Op::V(sret))));
@@ -1192,7 +1265,9 @@ impl<'c, 'a> Lower<'c, 'a> {
             let t = a.r#type().clone();
             let fresh = match &a.kind {
                 ExprKind::Unsize(_) | ExprKind::Range { .. } => true,
-                ExprKind::Call { target, .. } => matches!(target, CallTarget::Direct(_) | CallTarget::Indirect),
+                ExprKind::Call { target, .. } => {
+                    matches!(target, CallTarget::Direct(_) | CallTarget::Indirect)
+                }
                 _ => false,
             };
             if t.is_aggregate() && fresh {
@@ -1265,7 +1340,10 @@ impl<'c, 'a> Lower<'c, 'a> {
                         t if self.signed(t) => rt.print_int,
                         _ => rt.print_uint,
                     };
-                    self.emit(Inst::CallRt { routine, arg: Some(v) });
+                    self.emit(Inst::CallRt {
+                        routine,
+                        arg: Some(v),
+                    });
                 }
                 self.emit(Inst::CallRt {
                     routine: rt.print_newline,
@@ -1328,8 +1406,8 @@ impl<'c, 'a> Lower<'c, 'a> {
                 self.intr(Intr::Wrmsr, o, false)
             }
             "rdtsc" => self.intr(Intr::Rdtsc, Vec::new(), true),
-            "invlpg" | "lgdt" | "lidt" | "load_cs" | "load_ds" | "ltr" | "memcpy" | "memset" | "memset32"
-            | "context_switch" | "rebase_statics" | "set_syscall_stack" => {
+            "invlpg" | "lgdt" | "lidt" | "load_cs" | "load_ds" | "ltr" | "memcpy" | "memset"
+            | "memset32" | "context_switch" | "rebase_statics" | "set_syscall_stack" => {
                 let kind = match name {
                     "invlpg" => Intr::Invlpg,
                     "lgdt" => Intr::Lgdt,
@@ -1347,7 +1425,7 @@ impl<'c, 'a> Lower<'c, 'a> {
                 let o = ops(self);
                 self.intr(kind, o, false)
             }
-            "syscall" => {
+            "syscall" | "syscall6" => {
                 let o = ops(self);
                 self.intr(Intr::Syscall, o, true)
             }
@@ -1360,7 +1438,11 @@ impl<'c, 'a> Lower<'c, 'a> {
                 let p = self.scalar(&args[0]);
                 let n = self.scalar(&args[1]);
                 let s = Mem::Slot(self.slot(16, 8), 0);
-                self.emit(Inst::Store { mem: s, src: p, size: 8 });
+                self.emit(Inst::Store {
+                    mem: s,
+                    src: p,
+                    size: 8,
+                });
                 self.emit(Inst::Store {
                     mem: s.offset(8),
                     src: n,
@@ -1419,7 +1501,11 @@ impl<'c, 'a> Lower<'c, 'a> {
                     size: 8,
                 });
                 let p = self.bin(BinK::Add, s, Op::I(8), Ty::U64, Arith::Plain);
-                self.emit(Inst::Store { mem: slot, src: p, size: 8 });
+                self.emit(Inst::Store {
+                    mem: slot,
+                    src: p,
+                    size: 8,
+                });
                 Val::A(slot)
             }
             ("is_null", Type::Raw(..)) => {
@@ -1567,7 +1653,10 @@ impl<'c, 'a> Lower<'c, 'a> {
                         let PLoc::Mem(mem) = loc else {
                             panic!("ICE: reference to a value slot")
                         };
-                        (Val::S(self.mem_addr(mem)), Type::Ref(Box::new(vt.clone()), *m))
+                        (
+                            Val::S(self.mem_addr(mem)),
+                            Type::Ref(Box::new(vt.clone()), *m),
+                        )
                     }
                     None => match loc {
                         PLoc::Val(o) => (Val::S(o), vt.clone()),
@@ -1583,7 +1672,11 @@ impl<'c, 'a> Lower<'c, 'a> {
                     (VarL::Reg(r), Val::S(o)) => self.emit(Inst::Mov { dst: r, src: o }),
                     (VarL::Mem(m), Val::S(o)) => {
                         let size = self.ty(&t).size;
-                        self.emit(Inst::Store { mem: m, src: o, size });
+                        self.emit(Inst::Store {
+                            mem: m,
+                            src: o,
+                            size,
+                        });
                     }
                     (VarL::Mem(m), Val::A(src)) => {
                         let size = self.size(&t);
@@ -1672,10 +1765,15 @@ impl<'c, 'a> Lower<'c, 'a> {
 }
 
 fn simple_match(scrutinee: &Expr, arms: &[MatchArm]) -> bool {
-    matches!(scrutinee.r#type(), Type::Int(_) | Type::Bool | Type::Enum(_))
-        && arms.iter().all(|a| {
-            a.guard.is_none() && a.pats.iter().all(|p| matches!(p.kind, PatKind::Const(_) | PatKind::Wild))
-        })
+    matches!(
+        scrutinee.r#type(),
+        Type::Int(_) | Type::Bool | Type::Enum(_)
+    ) && arms.iter().all(|a| {
+        a.guard.is_none()
+            && a.pats
+                .iter()
+                .all(|p| matches!(p.kind, PatKind::Const(_) | PatKind::Wild))
+    })
 }
 
 fn pat_binds(p: &Pattern) -> bool {
@@ -1782,6 +1880,10 @@ fn stmt_addr(s: &Stmt, out: &mut HashSet<String>) {
             if let Some(b) = else_block {
                 collect_addr_taken(b, out);
             }
+        }
+        Stmt::LetElse { value, else_block, .. } => {
+            expr_addr(value, out);
+            collect_addr_taken(else_block, out);
         }
         Stmt::WhileLet { value, body, .. } => {
             expr_addr(value, out);

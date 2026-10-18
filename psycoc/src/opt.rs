@@ -120,13 +120,25 @@ fn eval_bin(op: BinK, a: i64, b: i64, ty: Ty, mode: Arith) -> Option<i64> {
         }
         BinK::Shl | BinK::Shr => {
             if !(0..bits).contains(&b) {
-                return if mode == Arith::Checked { None } else { Some(0) };
+                return if mode == Arith::Checked {
+                    None
+                } else {
+                    Some(0)
+                };
             }
             if op == BinK::Shl {
                 let r = (a as u64).wrapping_shl(b as u32) as i64;
-                return Some(if mode == Arith::Plain { r } else { canon(r as i128, ty) });
+                return Some(if mode == Arith::Plain {
+                    r
+                } else {
+                    canon(r as i128, ty)
+                });
             }
-            return Some(if ty.signed { a >> b } else { ((a as u64) >> b) as i64 });
+            return Some(if ty.signed {
+                a >> b
+            } else {
+                ((a as u64) >> b) as i64
+            });
         }
     };
     match mode {
@@ -166,7 +178,14 @@ fn def_counts(f: &Func, live: &[bool]) -> (Vec<u32>, Vec<u32>) {
 fn simplify_cfg(f: &mut Func) -> bool {
     let mut changed = false;
     for b in &mut f.blocks {
-        if let Term::Br { cc, a, b: bb, t, f: ff } = b.term {
+        if let Term::Br {
+            cc,
+            a,
+            b: bb,
+            t,
+            f: ff,
+        } = b.term
+        {
             if t == ff {
                 b.term = Term::Jmp(t);
                 changed = true;
@@ -276,7 +295,9 @@ fn propagate(f: &mut Func) -> bool {
                 }
                 match src {
                     Op::I(_) => subst[*dst as usize] = Some(*src),
-                    Op::V(y) if defs[*y as usize] == 1 && y != dst => subst[*dst as usize] = Some(*src),
+                    Op::V(y) if defs[*y as usize] == 1 && y != dst => {
+                        subst[*dst as usize] = Some(*src)
+                    }
                     _ => {}
                 }
             }
@@ -350,7 +371,9 @@ fn fold_inst(i: &Inst) -> Option<Option<Inst>> {
             ty,
             mode,
         } => match (op, k) {
-            (BinK::Add | BinK::Sub | BinK::Or | BinK::Xor | BinK::Shl | BinK::Shr, 0) => mov(dst, a),
+            (BinK::Add | BinK::Sub | BinK::Or | BinK::Xor | BinK::Shl | BinK::Shr, 0) => {
+                mov(dst, a)
+            }
             (BinK::Mul | BinK::Div, 1) => mov(dst, a),
             (BinK::Mul | BinK::And, 0) => mov(dst, Op::I(0)),
             (BinK::Mul, _) if mode != Arith::Checked => power_of_two(k).map(|s| {
@@ -383,7 +406,9 @@ fn fold_inst(i: &Inst) -> Option<Option<Inst>> {
                     mode: Arith::Plain,
                 })
             }),
-            (BinK::Shl | BinK::Shr, _) if mode == Arith::Checked && (0..ty.size as i64 * 8).contains(&k) => {
+            (BinK::Shl | BinK::Shr, _)
+                if mode == Arith::Checked && (0..ty.size as i64 * 8).contains(&k) =>
+            {
                 Some(Some(Inst::Bin {
                     dst,
                     op,
@@ -415,11 +440,28 @@ fn fold_inst(i: &Inst) -> Option<Option<Inst>> {
             a: Op::I(x),
             b: Op::I(y),
         } => mov(dst, Op::I(eval_cond(cc, x, y) as i64)),
-        Inst::Ext { dst, a: Op::I(x), ty } => mov(dst, Op::I(canon(x as i128, ty))),
-        Inst::BitNot { dst, a: Op::I(x), ty } => mov(dst, Op::I(canon(!x as i128, ty))),
-        Inst::Neg { dst, a: Op::I(x), ty } => {
+        Inst::Ext {
+            dst,
+            a: Op::I(x),
+            ty,
+        } => mov(dst, Op::I(canon(x as i128, ty))),
+        Inst::BitNot {
+            dst,
+            a: Op::I(x),
+            ty,
+        } => mov(dst, Op::I(canon(!x as i128, ty))),
+        Inst::Neg {
+            dst,
+            a: Op::I(x),
+            ty,
+        } => {
             let r = -(x as i128);
-            in_range(r, ty).then(|| Some(Inst::Mov { dst, src: Op::I(r as i64) }))
+            in_range(r, ty).then(|| {
+                Some(Inst::Mov {
+                    dst,
+                    src: Op::I(r as i64),
+                })
+            })
         }
         Inst::Check {
             a: Op::I(x),
@@ -456,7 +498,11 @@ fn coalesce(f: &mut Func) -> bool {
     for block in &mut f.blocks {
         let mut j = 0;
         while j < block.insts.len() {
-            let Inst::Mov { dst: x, src: Op::V(t) } = block.insts[j] else {
+            let Inst::Mov {
+                dst: x,
+                src: Op::V(t),
+            } = block.insts[j]
+            else {
                 j += 1;
                 continue;
             };
@@ -536,7 +582,9 @@ fn fold_addresses(f: &mut Func) -> bool {
         }
         for i in &block.insts {
             match *i {
-                Inst::Addr { dst, mem } if defs[dst as usize] == 1 => known[dst as usize] = Some(mem),
+                Inst::Addr { dst, mem } if defs[dst as usize] == 1 => {
+                    known[dst as usize] = Some(mem)
+                }
                 Inst::Bin {
                     dst,
                     op: BinK::Add,
@@ -544,7 +592,10 @@ fn fold_addresses(f: &mut Func) -> bool {
                     b: Op::I(k),
                     mode: Arith::Plain,
                     ..
-                } if defs[dst as usize] == 1 && defs[y as usize] == 1 && i32::try_from(k).is_ok() => {
+                } if defs[dst as usize] == 1
+                    && defs[y as usize] == 1
+                    && i32::try_from(k).is_ok() =>
+                {
                     known[dst as usize] = Some(Mem::Base(Op::V(y), k as i32))
                 }
                 _ => {}
@@ -587,7 +638,11 @@ fn sroa(f: &mut Func) -> bool {
             continue;
         }
         for i in &block.insts {
-            if let Inst::Addr { mem: Mem::Slot(s, _), .. } = i {
+            if let Inst::Addr {
+                mem: Mem::Slot(s, _),
+                ..
+            } = i
+            {
                 cand[*s] = false;
                 continue;
             }
@@ -610,7 +665,9 @@ fn sroa(f: &mut Func) -> bool {
         return false;
     }
     let mut words: HashMap<(SlotId, i32), VReg> = HashMap::new();
-    let mut word = |f: &mut Func, s: SlotId, off: i32| *words.entry((s, off / 8)).or_insert_with(|| f.new_vreg());
+    let mut word = |f: &mut Func, s: SlotId, off: i32| {
+        *words.entry((s, off / 8)).or_insert_with(|| f.new_vreg())
+    };
     let is_cand = |m: &Mem| matches!(m, Mem::Slot(s, _) if cand[*s]);
     let mut changed = false;
     for b in 0..f.blocks.len() {
@@ -670,7 +727,10 @@ fn sroa(f: &mut Func) -> bool {
                 } if cand[s] => {
                     for k in 0..(size / 8) as i32 {
                         let w = word(f, s, o + 8 * k);
-                        out.push(Inst::Mov { dst: w, src: Op::I(0) });
+                        out.push(Inst::Mov {
+                            dst: w,
+                            src: Op::I(0),
+                        });
                     }
                 }
                 other => {
@@ -689,10 +749,15 @@ fn select_addressing(f: &mut Func) {
     for block in &mut f.blocks {
         for k in 0..block.insts.len() {
             let mems_k = mems(&block.insts[k]);
-            let Some(pos) = mems_k.iter().position(|m| matches!(m, Mem::Base(Op::V(_), _))) else {
+            let Some(pos) = mems_k
+                .iter()
+                .position(|m| matches!(m, Mem::Base(Op::V(_), _)))
+            else {
                 continue;
             };
-            let Mem::Base(Op::V(a), d) = mems_k[pos] else { unreachable!() };
+            let Mem::Base(Op::V(a), d) = mems_k[pos] else {
+                unreachable!()
+            };
             let Some(i) = (0..k).rev().find(|&i| block.insts[i].def() == Some(a)) else {
                 continue;
             };
@@ -706,7 +771,9 @@ fn select_addressing(f: &mut Func) {
             else {
                 continue;
             };
-            let written = |from: usize, v: VReg, insts: &[Inst]| insts[from + 1..k].iter().any(|x| x.def() == Some(v));
+            let written = |from: usize, v: VReg, insts: &[Inst]| {
+                insts[from + 1..k].iter().any(|x| x.def() == Some(v))
+            };
             if written(i, b, &block.insts) || written(i, t, &block.insts) {
                 continue;
             }

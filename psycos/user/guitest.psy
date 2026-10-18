@@ -1,0 +1,128 @@
+/// Wiki Doc sources:
+///   - https://wiki.osdev.org/Message_Passing
+
+import "psy/sys.psy" as sys
+import "psy/gfx.psy" as gfx
+import "psy/wm.psy" as wm
+import "psy/libgui.psy" as gui
+
+const color_a: u32 = 0x308040
+const color_b: u32 = 0x806030
+
+static mut a: gui::Window
+static mut b: gui::Window
+
+fn name(id: u64) -> Str {
+    if id == a.id {
+        return "Hello"
+    }
+    if id == b.id {
+        return "Second"
+    }
+    return "?"
+}
+
+fn draw(win: &gui::Window, color: u32, label: Str) {
+    let c = &win.canvas
+    gfx::fill(c, gfx::bounds(c), gfx::bounds(c), color)
+    gfx::text(c, 8, 8, label.as_bytes(), 0xFFFFFF, color, gfx::bounds(c))
+    gui::present_all(win)
+}
+
+fn show_probe(x: u64, y: u64) {
+    let mut e = gui::Event { kind: 0, window: 0, a: 0, b: 0, c: 0 }
+    gui::probe(x, y, &mut e)
+    print("probe", x, y, ": window", e.window, "focus", e.b, "color", e.a, "renamed", e.c == gui::title_word("Renamed"))
+}
+
+fn color_at(x: u64, y: u64) -> u64 {
+    let mut e = gui::Event { kind: 0, window: 0, a: 0, b: 0, c: 0 }
+    gui::probe(x, y, &mut e)
+    return e.a
+}
+
+fn show_decor() {
+    print("decor", color_at(150, 49), color_at(380, 129), color_at(71, 49), color_at(211, 129), color_at(231, 129))
+}
+
+fn show_bar() {
+    let c = sys::time()
+    let ok = c.year >= 2020 && c.month >= 1 && c.month <= 12 && c.hour < 24 && c.minute < 60
+    print("bar", color_at(600, 585), color_at(110, 585), color_at(234, 585), "clock", ok)
+}
+
+fn focused(id: u64) -> &mut gui::Window {
+    if id == a.id {
+        return &mut a
+    }
+    return &mut b
+}
+
+fn on_key(id: u64, c: u64) -> bool {
+    if c == 10 || c == 13 {
+        return true
+    }
+    print("key", c, name(id))
+    let win = focused(id)
+    match c {
+        49 => gui::raise(&a),
+        50 => gui::raise(&b),
+        116 => gui::set_title(win, "Renamed"),
+        112 => show_probe(100, 100),
+        100 => show_decor(),
+        98 => show_bar(),
+        114 => gui::request_size(win, 300, 200),
+        99 => gui::request_close(win),
+        120 => {
+            gui::crash_server()
+            return false
+        }
+        _ => {}
+    }
+    return true
+}
+
+fn main() {
+    if !gui::connect() {
+        exit(3)
+    }
+    let Some(wa) = gui::open(240, 120, 60, 60, "Hello") else {
+        exit(4)
+    }
+    a = wa
+    draw(&a, color_a, "Hello")
+    let Some(wb) = gui::open(200, 100, 200, 140, "Second") else {
+        exit(5)
+    }
+    b = wb
+    draw(&b, color_b, "Second")
+    print("opened", a.id, b.id)
+    let mut e = gui::Event { kind: 0, window: 0, a: 0, b: 0, c: 0 }
+    loop {
+        gui::wait(&mut e)
+        match e.kind {
+            wm::ev_focus => print("focus", name(e.window), e.a),
+            wm::ev_key => {
+                if !on_key(e.window, e.a) {
+                    break
+                }
+            }
+            wm::ev_resize => {
+                let win = focused(e.window)
+                if gui::reshape(win, e.a, e.b) {
+                    draw(win, color_a, "Bigger")
+                    print("resize", name(e.window), e.a, e.b)
+                    show_probe(355, 255)
+                }
+            }
+            wm::ev_close => {
+                let n = name(e.window)
+                gui::close(focused(e.window))
+                print("closed", n)
+            }
+            _ => {}
+        }
+    }
+    sys::sleep_ms(100)
+    print("server alive:", sys::lookup("window") >= 0)
+}

@@ -1,31 +1,27 @@
 /// Wiki Doc sources:
 ///   - https://uefi.org/specs/UEFI/2.10/13_Protocols_Media_Access.html
-///
-/// Boot configuration: `\psyos.cfg` on the boot volume, read with the
-/// firmware's file system before ExitBootServices. One `key=value` per
-/// line, `#` starts a comment. Known keys:
-///   video=1024x768   screen mode (the largest one if absent or unknown)
-///   video=max        the largest mode
 
 import "efi.psy"
+import "bytes.psy"
+
+const config_max: usize = 1024
 
 struct VideoSize {
-	width: usize,
-	height: usize,
+    width: usize,
+    height: usize,
 }
 
 struct ConfigRange {
-	start: usize,
-	end: usize,
+    start: usize,
+    end: usize,
 }
 
 static mut config_text: [u8; 1024]
 #[getter]
 static mut config_len: usize = 0
 
-/// Reads `\psycos.cfg` (empty if there is none).
 fn config_load() {
-    let n = efi_read_file(u"\\psycos.cfg", &mut config_text)
+    let n = efi_read_file(u"\\psyos.cfg", &mut config_text)
     if n > 0 {
         config_len = n as usize
     } else {
@@ -33,9 +29,7 @@ fn config_load() {
     }
 }
 
-/// The value of `key` (the bytes after `key=` up to the end of the line),
-/// as a range [start, end] of config_text; start == end if absent.
-fn config_find(key: Str) -> ConfigRange {
+fn config_find(key: Str) -> Option<ConfigRange> {
     let k = key.as_bytes()
     let mut line: usize = 0
     while line < config_len {
@@ -48,22 +42,15 @@ fn config_find(key: Str) -> ConfigRange {
             value_end -= 1
         }
         if value_end - line > k.len() && config_text[line + k.len()] == '=' {
-            let mut same = true
-            for i in 0..k.len() {
-                if config_text[line + i] != k[i] {
-                    same = false
-                }
-            }
-            if same {
-                return ConfigRange { start: line + k.len() + 1, end: value_end }
+            if bytes_equal(&config_text[line..line + k.len()], k) {
+                return Some(ConfigRange { start: line + k.len() + 1, end: value_end })
             }
         }
         line = end + 1
     }
-    return ConfigRange { start: 0, end: 0 }
+    return None
 }
 
-/// Reads a decimal number at `*pos`, moving past it.
 fn parse_decimal(r: ConfigRange, pos: &mut usize) -> usize {
     let mut v: usize = 0
     while *pos < r.end && config_text[*pos] >= '0' && config_text[*pos] <= '9' {
@@ -73,18 +60,20 @@ fn parse_decimal(r: ConfigRange, pos: &mut usize) -> usize {
     return v
 }
 
-/// The `video=` setting: WIDTHxHEIGHT, or 0 x 0 for the largest mode.
 fn config_video() -> VideoSize {
-    let r = config_find("video")
+    let largest = VideoSize { width: 0, height: 0 }
+    let Some(r) = config_find("video") else {
+        return largest
+    }
     let mut pos = r.start
     let w = parse_decimal(r, &mut pos)
     if pos >= r.end || config_text[pos] != 'x' {
-        return VideoSize { width: 0, height: 0 }
+        return largest
     }
     pos += 1
     let h = parse_decimal(r, &mut pos)
     if pos != r.end {
-        return VideoSize { width: 0, height: 0 }
+        return largest
     }
     return VideoSize { width: w, height: h }
 }

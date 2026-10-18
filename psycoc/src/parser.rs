@@ -920,6 +920,21 @@ impl Parser {
 
     fn parse_let(&mut self) -> ParserResult<Stmt> {
         let span = self.advance().span;
+        let is_pattern = matches!(self.peek().kind, TokenKind::Ident(_))
+            && matches!(self.peek_at(1), TokenKind::LParen | TokenKind::ColonColon);
+        if is_pattern {
+            let pat = self.parse_or_pattern()?;
+            self.expect(TokenKind::Eq, "'=' after the pattern")?;
+            let value = self.parse_expr()?;
+            self.expect(TokenKind::Else, "'else' after 'let PATTERN = VALUE'")?;
+            let else_block = self.parse_block()?;
+            return Ok(Stmt::LetElse {
+                pat,
+                value,
+                else_block,
+                span,
+            });
+        }
         let mutable = self.eat(&TokenKind::Mut);
         let (name, _) = self.expect_ident()?;
         let expr_type = if self.eat(&TokenKind::Colon) {

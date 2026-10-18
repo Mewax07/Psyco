@@ -1,0 +1,87 @@
+struct Pair {
+    a: u64,
+    b: u64,
+}
+
+fn mix(x: u64, y: u64) -> u64 {
+    return x *% 31 +% y
+}
+
+fn sum_slice(s: &[u64]) -> u64 {
+    let mut t: u64 = 0
+    for i in 0..s.len() {
+        t += s[i]
+    }
+    return t
+}
+
+fn swap(p: Pair) -> Pair {
+    return Pair { a: p.b, b: p.a }
+}
+
+fn pressure(n: u64) -> u64 {
+    let a = n + 1
+    let b = n + 2
+    let c = n + 3
+    let d = n + 4
+    let e = n + 5
+    let f = n + 6
+    let g = n + 7
+    let h = n + 8
+    let i = n + 9
+    let j = n + 10
+    let k = n + 11
+    let l = n + 12
+    let m = mix(a, b)
+    let o = mix(m, c)
+    return a + b + c + d + e + f + g + h + i + j + k + l + m + o
+}
+
+fn bytes_total(b: &[u8]) -> u64 {
+    let mut t: u64 = 0
+    let mut i: usize = 0
+    while i < b.len() {
+        t += b[i] as u64
+        i += 1
+    }
+    return t
+}
+
+fn main() {
+    let arr = [3u64, 5, 7, 11, 13]
+    print(sum_slice(&arr), sum_slice(&arr[1..4]))
+    print(pressure(10))
+    let p = swap(Pair { a: 1, b: 2 })
+    print(p.a, p.b)
+    let mut buf = [0u8; 300]
+    for i in 0..300usize {
+        buf[i] = (i % 256) as u8
+    }
+    print(bytes_total(&buf), bytes_total(&buf[290..300]))
+    let mut x: u8 = 0
+    for i in 0..200u8 {
+        x = i / 2 + 3
+    }
+    print(x)
+    let mut acc: u64 = 1
+    for i in 1..20u64 {
+        acc = mix(acc, i)
+    }
+    print(acc)
+    let mut idx: usize = 0
+    let small = [9u8, 8, 7, 6]
+    let mut s: u64 = 0
+    while idx < 4 {
+        s += small[idx] as u64 * 2
+        idx += 1
+    }
+    print(s)
+}
+
+//> 39 23
+//> 11507
+//> 2 1
+//> 33586 385
+//> 102
+//> 15457488158969203305
+//> 60

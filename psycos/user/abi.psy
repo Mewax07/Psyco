@@ -1,0 +1,27 @@
+/// Wiki Doc sources:
+///   - https://wiki.osdev.org/System_Calls
+
+import "psy/sys.psy" as sys
+import "psy/abi.psy" as abi
+
+const unknown_call: u64 = 0x1FFF
+const bad_address: u64 = 0xFFFF800000001000
+const exit_code: i64 = 9
+
+fn main() {
+    print("abi version:", sys::version())
+    print("pid ok:", sys::getpid() > 0)
+    let mut name = [0u8; 16]
+    let n = sys::task_name(&mut name)
+    print("name:", &name[..n as usize])
+    sys::write_str("written by sys::write\n")
+    let t0 = sys::uptime_ms()
+    sys::sleep_ms(30)
+    print("slept:", sys::uptime_ms() - t0 >= 30)
+    sys::yield_now()
+    print("unknown call:", sys::call(unknown_call, 0, 0, 0, 0, 0, 0))
+    print("bad pointer:", sys::call(abi::sys_write, bad_address, 4, 0, 0, 0, 0))
+    print("bad sleep:", sys::sleep_ms(100000000))
+    sys::exit_with(exit_code)
+    print("not reached")
+}

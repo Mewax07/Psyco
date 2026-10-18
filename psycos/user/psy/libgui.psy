@@ -1,0 +1,234 @@
+/// Wiki Doc sources:
+///   - https://wiki.osdev.org/Message_Passing
+///   - https://wiki.osdev.org/Drawing_In_a_Linear_Framebuffer
+
+import "sys.psy" as sys
+import "gfx.psy" as gfx
+import "wm.psy" as wm
+
+const pending_max: usize = 16
+const lookup_tries: u64 = 200
+
+struct Window {
+    id: u64,
+    surface: u64,
+    canvas: gfx::Canvas,
+}
+
+struct Event {
+    kind: u64,
+    window: u64,
+    a: u64,
+    b: u64,
+    c: u64,
+}
+
+static mut server: u64 = 0
+static mut events: u64 = 0
+static mut server_pid: u64 = 0
+static mut pending: [Event; 16]
+static mut pending_head: usize = 0
+static mut pending_count: usize = 0
+
+fn connect() -> bool {
+    for i in 0..lookup_tries {
+        let id = sys::lookup("window")
+        if id >= 0 {
+            server = id as u64
+            let p = sys::port_create()
+            if p < 0 {
+                return false
+            }
+            events = p as u64
+            return true
+        }
+        sys::sleep_ms(10)
+    }
+    return false
+}
+
+fn message(kind: u64) -> sys::Message {
+    return sys::Message { sender: 0, kind: kind, data: [0u64; 6] }
+}
+
+fn from_server(m: &sys::Message) -> bool {
+    return server_pid == 0 || m.sender == server_pid
+}
+
+fn send(m: &sys::Message) {
+    sys::send(server, m)
+}
+
+fn to_event(m: &sys::Message) -> Event {
+    return Event { kind: m.kind, window: m.data[0], a: m.data[1], b: m.data[2], c: m.data[3] }
+}
+
+fn stash(e: Event) {
+    if pending_count == pending_max {
+        return
+    }
+    pending[(pending_head + pending_count) % pending_max] = e
+    pending_count += 1
+}
+
+fn await_kind(kind: u64, m: &mut sys::Message) {
+    loop {
+        sys::recv(events, m)
+        if m.kind == kind && from_server(m) {
+            server_pid = m.sender
+            return
+        }
+        if from_server(m) {
+            stash(to_event(m))
+        }
+    }
+}
+
+fn new_surface(win: &mut Window, w: u64, h: u64) -> bool {
+    let s = sys::surface_create(w, h)
+    if s < 0 {
+        return false
+    }
+    let base = sys::surface_map(s as u64)
+    if base < 0 {
+        sys::surface_destroy(s as u64)
+        return false
+    }
+    win.surface = s as u64
+    win.canvas = gfx::canvas(base as u64, w as i64, h as i64, w as i64)
+    sys::surface_share(win.surface, server)
+    return true
+}
+
+fn open(w: u64, h: u64, x: u64, y: u64, title: Str) -> Option<Window> {
+    let mut win = Window { id: 0, surface: 0, canvas: gfx::canvas(0, 0, 0, 0) }
+    if !new_surface(&mut win, w, h) {
+        return None
+    }
+    let mut m = message(wm::create)
+    m.data[0] = win.surface
+    m.data[1] = events
+    m.data[2] = x
+    m.data[3] = y
+    send(&m)
+    await_kind(wm::created, &mut m)
+    win.id = m.data[0]
+    set_title(&win, title)
+    return Some(win)
+}
+
+fn set_title(win: &Window, title: Str) {
+    let b = title.as_bytes()
+    let mut n = b.len()
+    if n > wm::title_max {
+        n = wm::title_max
+    }
+    let mut m = message(wm::set_title)
+    m.data[0] = win.id
+    m.data[1] = n as u64
+    for k in 0..n {
+        m.data[2 + k / 8] = m.data[2 + k / 8] | ((b[k] as u64) << ((k % 8) * 8))
+    }
+    send(&m)
+}
+
+fn title_word(title: Str) -> u64 {
+    let b = title.as_bytes()
+    let mut w: u64 = 0
+    for k in 0..8usize {
+        if k < b.len() {
+            w = w | ((b[k] as u64) << (k * 8))
+        }
+    }
+    return w
+}
+
+fn present(win: &Window, r: gfx::Rect) {
+    let mut m = message(wm::present)
+    m.data[0] = win.id
+    m.data[1] = r.x as u64
+    m.data[2] = r.y as u64
+    m.data[3] = r.w as u64
+    m.data[4] = r.h as u64
+    send(&m)
+}
+
+fn present_all(win: &Window) {
+    present(win, gfx::bounds(&win.canvas))
+}
+
+fn request(kind: u64, win: &Window, a: u64, b: u64) {
+    let mut m = message(kind)
+    m.data[0] = win.id
+    m.data[1] = a
+    m.data[2] = b
+    send(&m)
+}
+
+fn move_to(win: &Window, x: u64, y: u64) {
+    request(wm::move_to, win, x, y)
+}
+
+fn raise(win: &Window) {
+    request(wm::raise, win, 0, 0)
+}
+
+fn request_size(win: &Window, w: u64, h: u64) {
+    request(wm::resize, win, w, h)
+}
+
+fn request_close(win: &Window) {
+    request(wm::ask_close, win, 0, 0)
+}
+
+fn reshape(win: &mut Window, w: u64, h: u64) -> bool {
+    let old = win.surface
+    if !new_surface(win, w, h) {
+        return false
+    }
+    request(wm::attach, win, win.surface, 0)
+    sys::surface_unmap(old)
+    sys::surface_destroy(old)
+    return true
+}
+
+fn close(win: &mut Window) {
+    request(wm::destroy, win, 0, 0)
+    sys::surface_unmap(win.surface)
+    sys::surface_destroy(win.surface)
+    win.id = 0
+}
+
+fn wait(e: &mut Event) {
+    if pending_count > 0 {
+        *e = pending[pending_head]
+        pending_head = (pending_head + 1) % pending_max
+        pending_count -= 1
+        return
+    }
+    let mut m = message(0)
+    loop {
+        sys::recv(events, &mut m)
+        if from_server(&m) {
+            *e = to_event(&m)
+            return
+        }
+    }
+}
+
+fn probe(x: u64, y: u64, e: &mut Event) {
+    let mut m = message(wm::probe)
+    m.data[0] = x
+    m.data[1] = y
+    m.data[2] = events
+    send(&m)
+    await_kind(wm::probe_reply, &mut m)
+    *e = Event { kind: m.kind, window: m.data[1], a: m.data[0], b: m.data[3], c: m.data[4] }
+    if m.data[2] != m.data[0] {
+        e.a = 0xFFFFFFFF
+    }
+}
+
+fn crash_server() {
+    send(&message(wm::crash))
+}

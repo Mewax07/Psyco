@@ -1,27 +1,28 @@
-/// An optional value. `Option<&T>` is one pointer (null = None).
 enum Option<T> {
-	None,
-	Some(T),
+    None,
+    Some(T),
+}
+
+enum Result<T, E> {
+    Ok(T),
+    Err(E),
 }
 
 impl<T> Option<T> {
-    /// True if there is a value.
-	fn is_some(self) -> bool {
-	    if let Some(_) = self {
-			return true
-		}
-		return false
-	}
+    fn is_some(self) -> bool {
+        if let Some(_) = self {
+            return true
+        }
+        return false
+    }
 
-	/// True if there is no value.
-	fn is_none(self) -> bool {
+    fn is_none(self) -> bool {
         if let Some(_) = self {
             return false
         }
         return true
     }
 
-    /// The value; panics on None.
     fn unwrap(self) -> T {
         match self {
             Some(v) => return v,
@@ -29,15 +30,6 @@ impl<T> Option<T> {
         }
     }
 
-    /// The value, or `fallback` on None.
-    fn unwrap_or(self, fallback: T) -> T {
-        match self {
-            Some(v) => return v,
-            None => return fallback,
-        }
-    }
-
-    /// The value; panics with `msg` on None.
     fn expect(self, msg: Str) -> T {
         match self {
             Some(v) => return v,
@@ -45,7 +37,13 @@ impl<T> Option<T> {
         }
     }
 
-    /// `f(value)`, or None.
+    fn unwrap_or(self, fallback: T) -> T {
+        match self {
+            Some(v) => return v,
+            None => return fallback,
+        }
+    }
+
     fn map<U>(self, f: fn(T) -> U) -> Option<U> {
         match self {
             Some(v) => return Some(f(v)),
@@ -53,7 +51,6 @@ impl<T> Option<T> {
         }
     }
 
-    /// Ok(value), or Err(err) on None.
     fn ok_or<E>(self, err: E) -> Result<T, E> {
         match self {
             Some(v) => return Ok(v),
@@ -62,14 +59,7 @@ impl<T> Option<T> {
     }
 }
 
-/// The result of an operation that can fail.
-enum Result<E, T> {
-	Ok(T),
-	Err(E),
-}
-
 impl<T, E> Result<T, E> {
-    /// True on Ok.
     fn is_ok(self) -> bool {
         if let Ok(_) = self {
             return true
@@ -77,15 +67,6 @@ impl<T, E> Result<T, E> {
         return false
     }
 
-    /// Some(value) on Ok, None on Err.
-    fn ok(self) -> Option<T> {
-        match self {
-            Ok(v) => return Some(v),
-            Err(_) => return None,
-        }
-    }
-
-    /// True on Err.
     fn is_err(self) -> bool {
         if let Ok(_) = self {
             return false
@@ -93,15 +74,6 @@ impl<T, E> Result<T, E> {
         return true
     }
 
-    /// Some(error) on Err, None on Ok.
-    fn err(self) -> Option<E> {
-        match self {
-            Ok(_) => return None,
-            Err(e) => return Some(e),
-        }
-    }
-
-    /// The Ok value; panics on Err.
     fn unwrap(self) -> T {
         match self {
             Ok(v) => return v,
@@ -109,7 +81,13 @@ impl<T, E> Result<T, E> {
         }
     }
 
-    /// The Err value; panics on Ok.
+    fn expect(self, msg: Str) -> T {
+        match self {
+            Ok(v) => return v,
+            Err(_) => panic(msg),
+        }
+    }
+
     fn unwrap_err(self) -> E {
         match self {
             Ok(_) => panic("called unwrap_err() on Ok"),
@@ -117,7 +95,6 @@ impl<T, E> Result<T, E> {
         }
     }
 
-    /// The Ok value, or `fallback` on Err.
     fn unwrap_or(self, fallback: T) -> T {
         match self {
             Ok(v) => return v,
@@ -125,19 +102,24 @@ impl<T, E> Result<T, E> {
         }
     }
 
-    /// Ok(f(value)), or the same Err.
+    fn ok(self) -> Option<T> {
+        match self {
+            Ok(v) => return Some(v),
+            Err(_) => return None,
+        }
+    }
+
+    fn err(self) -> Option<E> {
+        match self {
+            Ok(_) => return None,
+            Err(e) => return Some(e),
+        }
+    }
+
     fn map<U>(self, f: fn(T) -> U) -> Result<U, E> {
         match self {
             Ok(v) => return Ok(f(v)),
             Err(e) => return Err(e),
-        }
-    }
-
-    /// The Ok value; panics with `msg` on Err.
-    fn expect(self, msg: Str) -> T {
-        match self {
-            Ok(v) => return v,
-            Err(_) => panic(msg),
         }
     }
 }

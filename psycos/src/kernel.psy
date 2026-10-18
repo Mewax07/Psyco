@@ -2,19 +2,11 @@
 ///   - https://wiki.osdev.org/UEFI
 ///   - https://wiki.osdev.org/Interrupts
 ///   - https://wiki.osdev.org/X86_Interrupts#From_the_CPU's_perspective
-///
-/// Kernel entry point and shell.
-/// Boot (firmware tables, low addresses): efi_init -> config_load ->
-/// fb_init_mode (video= of psyos.cfg, else the largest mode) -> con_init ->
-/// exit_boot_services -> cli -> cpu_init -> pmm_init -> paging_init ->
-/// enter_higher_half(kmain).
-/// kmain (our tables, higher half, kernel stack): cpu_init again ->
-/// reclaim boot services memory -> heap_init -> irq_init -> sched_init ->
-/// process_init -> blk_init -> fat_mount -> kbd_init -> sti -> shell.
 
 import "efi.psy"
 import "fb.psy"
 import "config.psy"
+import "bytes.psy"
 import "console.psy"
 import "keyboard.psy"
 import "stack.psy"
@@ -30,6 +22,7 @@ import "sched.psy"
 import "programs.psy"
 import "virtio_blk.psy"
 import "fat32.psy"
+import "clock.psy"
 
 const line_max: usize = 76
 const bytes_per_kib: u64 = 1024
@@ -53,7 +46,6 @@ static mut line_len: usize = 0
 static mut has_fb: bool = false
 static mut reclaimed_pages: u64 = 0
 
-/// Logo and welcome text.
 fn banner() {
     set_color(cyan)
     puts(" ____                  ___  ____  \n")
@@ -66,42 +58,20 @@ fn banner() {
     puts("Type 'help' for the list of commands.\n\n")
 }
 
-/// Shell prompt.
 fn prompt() {
     set_color(green)
     puts("psycos> ")
     set_color(white)
 }
 
-/// True if the typed line is exactly `cmd`.
 fn line_is(cmd: Str) -> bool {
-    if line_len != cmd.len() {
-        return false
-    }
-    let bytes = cmd.as_bytes()
-    for i in 0..line_len {
-        if line[i] != bytes[i] {
-            return false
-        }
-    }
-    return true
+    return bytes_equal(&line[..line_len], cmd.as_bytes())
 }
 
-/// True if the typed line starts with `prefix`.
 fn line_starts_with(prefix: Str) -> bool {
-    if line_len < prefix.len() {
-        return false
-    }
-    let bytes = prefix.as_bytes()
-    for i in 0..bytes.len() {
-        if line[i] != bytes[i] {
-            return false
-        }
-    }
-    return true
+    return bytes_start_with(&line[..line_len], prefix.as_bytes())
 }
 
-/// Prints a number on at least two digits.
 fn put2(n: u64) {
     if n < 10 {
         putc('0')
@@ -109,7 +79,6 @@ fn put2(n: u64) {
     put_u64(n)
 }
 
-/// `help`: list of commands.
 fn cmd_help() {
     set_color(yellow)
     puts("Commands:\n")
@@ -141,7 +110,6 @@ fn cmd_help() {
     puts("  shutdown   power off the machine\n")
 }
 
-/// `time`: date and time from the firmware clock.
 fn cmd_time() {
     let t = now()
     put_u64(t.year as u64)
@@ -158,7 +126,6 @@ fn cmd_time() {
     putc('\n')
 }
 
-/// `ver`: version, firmware, screen and CPU state.
 fn cmd_ver() {
     puts("PsycOS 0.1, written in psy\nFirmware: ")
     let mut vendor = [0u8; 64]
@@ -238,7 +205,6 @@ fn cmd_ver() {
     }
 }
 
-/// `mem`: physical allocator and kernel stack use.
 fn cmd_mem() {
     let free = get_pmm_free_pages()
     let total = get_pmm_total_pages()
@@ -270,6 +236,11 @@ fn cmd_mem() {
     puts(" KiB mapped at 0x")
     put_hex(heap_base)
     putc('\n')
+    puts("Surfaces: ")
+    put_u64(surfaces_in_use() as u64)
+    puts(", ports: ")
+    put_u64(ports_in_use() as u64)
+    putc('\n')
     puts("Kernel stack: ")
     put_u64(kstack_used() as u64)
     puts(" bytes used of ")
@@ -279,7 +250,6 @@ fn cmd_mem() {
     putc('\n')
 }
 
-/// `fb`: framebuffer info, color bars and a gray ramp.
 fn cmd_fb() {
     if !has_fb {
         puts("no linear framebuffer\n")
@@ -320,7 +290,6 @@ fn cmd_fb() {
     }
 }
 
-/// `uptime`: time since the timer started.
 fn cmd_uptime() {
     let ms = uptime_ms()
     let s = ms / 1000
@@ -338,7 +307,6 @@ fn cmd_uptime() {
     puts(" Hz)\n")
 }
 
-/// Prints `s` padded with spaces to `width` columns.
 fn put_padded(s: Str, width: usize) {
     puts(s)
     for i in s.len()..width {
@@ -346,7 +314,6 @@ fn put_padded(s: Str, width: usize) {
     }
 }
 
-/// Prints a number padded with spaces to `width` columns.
 fn put_u64_padded(n: u64, width: usize) {
     let mut digits: usize = 1
     let mut v = n
@@ -360,7 +327,6 @@ fn put_u64_padded(n: u64, width: usize) {
     }
 }
 
-/// `ps`: list of tasks.
 fn cmd_ps() {
     set_color(yellow)
     puts("SLOT  ID    RING  STATE     SWITCHES  TICKS     NAME\n")
@@ -394,7 +360,6 @@ fn cmd_ps() {
     putc('\n')
 }
 
-/// Demo task: animates a colored square, one position per task slot.
 fn spinner_main() {
     let x = get_fb_width() - (get_current() + 1) * spinner_gap
     let colors = [0xFF5555u32, 0xFFFF55u32, 0x55FF55u32, 0x55FFFFu32, 0x5555FFu32, 0xFF55FFu32]
@@ -408,7 +373,6 @@ fn spinner_main() {
     }
 }
 
-/// `spin`: starts one more spinner task.
 fn cmd_spin() {
     if !has_fb {
         puts("no framebuffer\n")
@@ -424,7 +388,6 @@ fn cmd_spin() {
     putc('\n')
 }
 
-/// Decimal number typed after `start` in the line (-1 if none).
 fn line_number(start: usize) -> i64 {
     let mut n: i64 = 0
     let mut digits = 0
@@ -442,7 +405,6 @@ fn line_number(start: usize) -> i64 {
     return n
 }
 
-/// Short name of a PCI class (0xCCSS).
 fn pci_class_name(class: u32) -> Str {
     match class >> 8 {
         0x0100 => return "SCSI / virtio storage",
@@ -460,7 +422,6 @@ fn pci_class_name(class: u32) -> Str {
     }
 }
 
-/// `lspci`: every PCI function on every bus.
 fn cmd_lspci() {
     set_color(yellow)
     puts("BUS:DEV.FN  VENDOR:DEVICE  CLASS\n")
@@ -492,7 +453,6 @@ fn cmd_lspci() {
     }
 }
 
-/// `progs`: the embedded user programs.
 fn cmd_progs() {
     set_color(yellow)
     puts("User programs (ring 3, psycoc Linux executables):\n")
@@ -505,7 +465,6 @@ fn cmd_progs() {
     }
 }
 
-/// Copies the word typed after `start` into `buf`; returns its length.
 fn line_word(start: usize, buf: &mut [u8]) -> usize {
     let mut n: usize = 0
     let mut i = start
@@ -517,27 +476,15 @@ fn line_word(start: usize, buf: &mut [u8]) -> usize {
     return n
 }
 
-/// Index of the program whose name is in `name[..len]`, or -1.
-fn find_program(name: &[u8], len: usize) -> i64 {
+fn find_program(name: &[u8]) -> Option<usize> {
     for i in 0..program_count {
-        let candidate = program_name(i).as_bytes()
-        if candidate.len() == len {
-            let mut same = true
-            for j in 0..len {
-                if candidate[j] != name[j] {
-                    same = false
-                }
-            }
-            if same {
-                return i as i64
-            }
+        if bytes_equal(program_name(i).as_bytes(), name) {
+            return Some(i)
         }
     }
-    return -1
+    return None
 }
 
-/// Starts a program "/path" on the disk, else /bin/NAME on the disk,
-/// else the embedded program NAME. Returns the task slot or -1.
 fn start_program(name: &[u8], len: usize) -> i64 {
     if len == 0 {
         return -1
@@ -559,15 +506,12 @@ fn start_program(name: &[u8], len: usize) -> i64 {
             return slot
         }
     }
-    let index = find_program(name, len)
-    if index < 0 {
+    let Some(i) = find_program(&name[..len]) else {
         return -1
     }
-    let i = index as usize
     return process_spawn(program_name(i), program_elf(i))
 }
 
-/// `run NAME` / `start NAME`: starts a user program, waits if `wait`.
 fn cmd_run(start: usize, wait: bool) {
     let mut name = [0u8; 64]
     let len = line_word(start, &mut name)
@@ -591,7 +535,6 @@ fn cmd_run(start: usize, wait: bool) {
     set_color(white)
 }
 
-/// Index of the first non-space character at or after `start`.
 fn skip_spaces(start: usize) -> usize {
     let mut i = start
     while i < line_len && line[i] == ' ' {
@@ -600,7 +543,6 @@ fn skip_spaces(start: usize) -> usize {
     return i
 }
 
-/// True if the disk is mounted; otherwise says so.
 fn need_disk() -> bool {
     if get_fat_mounted() {
         return true
@@ -609,7 +551,6 @@ fn need_disk() -> bool {
     return false
 }
 
-/// Print `n` right-aligned on `width` columns.
 fn put_u64_right(n: u64, width: usize) {
     let mut digits: usize = 1
     let mut v = n
@@ -623,7 +564,6 @@ fn put_u64_right(n: u64, width: usize) {
     put_u64(n)
 }
 
-/// `ls [DIR]`: entries of a directory.
 fn cmd_ls(start: usize) {
     if !need_disk() {
         return
@@ -634,8 +574,7 @@ fn cmd_ls(start: usize) {
         path[0] = '/'
         len = 1
     }
-    let d = fat_lookup(&path[..len])
-    if !d.found {
+    let Some(d) = fat_lookup(&path[..len]) else {
         puts("not found\n")
         return
     }
@@ -649,7 +588,7 @@ fn cmd_ls(start: usize) {
         return
     }
     let mut it = dir_open(d.cluster)
-    let mut e = no_entry()
+    let mut e = blank_entry()
     let mut files: u64 = 0
     let mut bytes: u64 = 0
     while dir_next(&mut it, &mut e) {
@@ -679,15 +618,17 @@ fn cmd_ls(start: usize) {
     set_color(white)
 }
 
-/// `cat FILE`: prints a file (control characters shown as '.').
 fn cmd_cat(start: usize) {
     if !need_disk() {
         return
     }
     let mut path = [0u8; 64]
     let len = line_word(skip_spaces(start), &mut path)
-    let e = fat_lookup(&path[..len])
-    if !e.found || is_dir(&e) {
+    let Some(e) = fat_lookup(&path[..len]) else {
+        puts("no such file\n")
+        return
+    }
+    if is_dir(&e) {
         puts("no such file\n")
         return
     }
@@ -715,7 +656,6 @@ fn cmd_cat(start: usize) {
     }
 }
 
-/// `write FILE TEXT`: creates or replaces a file with one line of text.
 fn cmd_write(start: usize) {
     if !need_disk() {
         return
@@ -742,7 +682,6 @@ fn cmd_write(start: usize) {
     }
 }
 
-/// `mkdir DIR` / `rm PATH`: changes the directory tree.
 fn cmd_tree(start: usize, make: bool) {
     if !need_disk() {
         return
@@ -764,7 +703,6 @@ fn cmd_tree(start: usize, make: bool) {
     }
 }
 
-/// `df`: space on the disk.
 fn cmd_df() {
     if !need_disk() {
         return
@@ -781,7 +719,6 @@ fn cmd_df() {
     puts("-byte clusters\n")
 }
 
-/// `kill N`: stops a task.
 fn cmd_kill() {
     let n = line_number(5)
     if n < 0 || n >= max_tasks as i64 {
@@ -802,7 +739,6 @@ fn cmd_kill() {
     puts("killed\n")
 }
 
-/// `crash X`: triggers an exception on purpose.
 fn cmd_crash() {
     if line_is("crash pf") {
         puts("reading 0xFFFFC00000000000...\n")
@@ -824,7 +760,6 @@ fn cmd_crash() {
     }
 }
 
-/// Runs the typed command.
 fn run_command() {
     if line_len == 0 {
         return
@@ -859,7 +794,7 @@ fn run_command() {
     } else if line_is("lspci") {
         cmd_lspci()
     } else if line_is("ls") || line_starts_with("ls ") {
-            cmd_ls(2)
+        cmd_ls(2)
     } else if line_starts_with("cat ") {
         cmd_cat(4)
     } else if line_starts_with("write ") {
@@ -896,7 +831,6 @@ fn run_command() {
     }
 }
 
-/// Reads one line with echo and backspace.
 fn read_line() {
     line_len = 0
     loop {
@@ -922,15 +856,12 @@ fn read_line() {
     }
 }
 
-/// GDT, TSS and exception handlers (run again after moving to the
-/// higher half, so every address the CPU keeps is a high one).
 fn cpu_init() {
     sse_init()
     gdt_init()
     exceptions_init()
 }
 
-/// UEFI entry point: takes over the machine, then jumps to the higher half.
 fn main() {
     efi_init()
     config_load()
@@ -938,7 +869,6 @@ fn main() {
     has_fb = fb_init_mode(video.width, video.height)
     con_init(has_fb)
 
-    // From here on, no more firmware boot services.
     if !exit_boot_services() {
         panic("ExitBootServices failed")
     }
@@ -949,15 +879,12 @@ fn main() {
     enter_higher_half(kmain)
 }
 
-/// Runs in the higher half, on the kernel stack: finishes the setup and
-/// starts the shell.
 fn kmain() {
     rebase_kernel_statics()
     if (program_name(0) as *const u8 as u64) < kernel_virt_base {
         panic("statics still point to the low half")
     }
     cpu_init()
-    // Firmware page tables, GDT, IDT and stack are no longer used.
     reclaimed_pages = pmm_reclaim_boot_services()
     heap_init()
     irq_init()
@@ -967,7 +894,9 @@ fn kmain() {
         fat_mount()
     }
     kbd_init()
+    input_init()
     sti()
+    clock_init()
     print("PsycOS: boot ok")
     banner()
     loop {

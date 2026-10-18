@@ -1,0 +1,27 @@
+/// Wiki Doc sources:
+///   - https://wiki.osdev.org/CMOS#The_Real-Time_Clock
+///   - https://uefi.org/specs/UEFI/2.10/08_Services_Runtime_Services.html#time-services
+
+import "efi.psy"
+import "timer.psy"
+
+const seconds_per_day: u64 = 86400
+
+static mut boot_date: u64 = 0
+static mut boot_seconds: u64 = 0
+static mut boot_ms: u64 = 0
+
+fn clock_init() {
+    let t = now()
+    boot_date = ((t.year as u64) << 16) | ((t.month as u64) << 8) | t.day as u64
+    boot_seconds = t.hour as u64 * 3600 + t.minute as u64 * 60 + t.second as u64
+    boot_ms = uptime_ms()
+}
+
+fn clock_seconds() -> u64 {
+    return (boot_seconds + (uptime_ms() - boot_ms) / 1000) % seconds_per_day
+}
+
+fn clock_now() -> u64 {
+    return (boot_date << 32) | clock_seconds()
+}

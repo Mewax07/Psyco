@@ -1,20 +1,11 @@
 /// Wiki Doc sources:
 ///   - https://wiki.osdev.org/Kernel_Multitasking
-///
-/// CPU context of a task: everything is on its own stack. A suspended task
-/// keeps, from its saved rsp upwards:
-///   r15, r14, r13, r12, rbx, rbp, resume address
-/// The context_switch intrinsic pushes exactly that and pops the other one.
-/// The other registers need no saving: psy code keeps values across a call
-/// only in rbx, rbp and r12-r15 (callee-saved, like System V).
 
 #![trusted]
 
 const context_words: u64 = 8
 const stack_align: u64 = 16
 
-/// Prepares a new stack so that switching to it calls `start()`.
-/// Returns the rsp to give to context_switch_to.
 fn context_new(stack_top: u64, start: fn()) -> u64 {
     let top = stack_top & ~(stack_align - 1)
     let p = top as *mut u64
@@ -26,13 +17,10 @@ fn context_new(stack_top: u64, start: fn()) -> u64 {
     return top - context_words * 8
 }
 
-/// Saves the current context in `*save` and resumes the one at `next`.
-/// Returns when someone switches back to us.
 fn context_switch_to(save: *mut u64, next: u64) {
     context_switch(save, next)
 }
 
-/// Loads another address space (page table root) if it differs.
 fn switch_address_space(cr3: u64) {
     if read_cr3() != cr3 {
         write_cr3(cr3)

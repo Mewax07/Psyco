@@ -1727,6 +1727,12 @@ impl TypeChecker {
                 else_block,
                 ..
             } => self.check_if_let(pat, value, then_block, else_block),
+            Stmt::LetElse {
+                pat,
+                value,
+                else_block,
+                span,
+            } => self.check_let_else(pat, value, else_block, *span),
             Stmt::WhileLet {
                 pat, value, body, ..
             } => self.check_while_let(pat, value, body),
@@ -3687,7 +3693,11 @@ fn builtin_sig(name: &str) -> Option<(Vec<Type>, Type, bool)> {
         "load_cs" | "load_ds" | "ltr" => (vec![u(U16)], Type::Unit, true),
         "memcpy" => (vec![raw_mut_u8, raw_u8, u(Usize)], Type::Unit, true),
         "memset" => (vec![raw_mut_u8, u(U8), u(Usize)], Type::Unit, true),
-        "memset32" => (vec![Type::raw(u(U32), true), u(U32), u(Usize)], Type::Unit, true),
+        "memset32" => (
+            vec![Type::raw(u(U32), true), u(U32), u(Usize)],
+            Type::Unit,
+            true,
+        ),
         "efi_image_handle" | "efi_system_table" => (vec![], Type::raw(Type::U8, true), false),
         "switch_stack" => (
             vec![
@@ -3707,6 +3717,7 @@ fn builtin_sig(name: &str) -> Option<(Vec<Type>, Type, bool)> {
         "set_syscall_stack" => (vec![u(U64)], Type::Unit, true),
         "rebase_statics" => (vec![u(U64)], Type::Unit, true),
         "syscall" => (vec![u(U64), u(U64), u(U64), u(U64)], u(I64), false),
+        "syscall6" => (vec![u(U64); 7], u(I64), false),
         "iret_to" => (
             vec![u(U64), u(U64), u(U64), u(U64), u(U64)],
             Type::Unit,

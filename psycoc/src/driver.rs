@@ -9,10 +9,7 @@ use crate::*;
 const STD: &[(&str, &str)] = &[
     ("std/prelude.psy", include_str!("../std/prelude.psy")),
     ("std/alloc.psy", include_str!("../std/alloc.psy")),
-    (
-        "std/alloc_linux.psy",
-        include_str!("../std/alloc_linux.psy"),
-    ),
+    ("std/alloc_linux.psy", include_str!("../std/alloc_linux.psy")),
 ];
 
 pub struct Sources {
@@ -36,23 +33,9 @@ pub fn load(path: &str) -> Result<(Program, Sources), String> {
     let mut sources = Sources { paths: Vec::new() };
     let mut program = Program::default();
     let mut seen = HashSet::new();
-    load_file(
-        Path::new(path),
-        None,
-        None,
-        &mut sources,
-        &mut program,
-        &mut seen,
-    )?;
+    load_file(Path::new(path), None, None, &mut sources, &mut program, &mut seen)?;
     for f in STD.iter() {
-        load_file(
-            Path::new(f.0),
-            None,
-            None,
-            &mut sources,
-            &mut program,
-            &mut seen,
-        )?;
+        load_file(Path::new(f.0), None, None, &mut sources, &mut program, &mut seen)?;
     }
     Ok((program, sources))
 }
@@ -96,6 +79,11 @@ pub fn compile_file_stats(path: &str, target: Target) -> Result<(Vec<u8>, usize)
 
 pub fn compile_program_stats(program: Program, sources: &Sources, target: Target) -> Result<(Vec<u8>, usize), String> {
     compile_program_with(program, sources, target, Options::default())
+}
+
+pub fn compile_file_with(path: &str, target: Target, opts: Options) -> Result<(Vec<u8>, usize), String> {
+    let (program, sources) = load(path)?;
+    compile_program_with(program, &sources, target, opts)
 }
 
 pub fn compile_program_with(
@@ -174,14 +162,7 @@ fn load_file(
         let snapshot = Sources {
             paths: sources.paths.clone(),
         };
-        load_file(
-            &target,
-            alias,
-            Some((span, &snapshot)),
-            sources,
-            program,
-            seen,
-        )?;
+        load_file(&target, alias, Some((span, &snapshot)), sources, program, seen)?;
     }
     Ok(())
 }

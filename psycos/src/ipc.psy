@@ -1,0 +1,230 @@
+/// Wiki Doc sources:
+///   - https://wiki.osdev.org/Message_Passing
+///   - https://wiki.osdev.org/IPC_Data_Copying_methods
+
+import "sched.psy"
+import "timer.psy"
+import "bytes.psy"
+import "usermode.psy"
+import "../user/psy/abi.psy" as abi
+
+const max_ports: usize = 32
+const port_queue_size: usize = 16
+const port_message_size: usize = 64
+const port_name_max: usize = 16
+const port_index_bits: u64 = 8
+
+struct Port {
+    used: bool,
+    generation: u64,
+    owner: u64,
+    owner_slot: usize,
+    name: [u8; 16],
+    name_len: usize,
+    head: usize,
+    count: usize,
+    queue: [[u8; 64]; 16],
+    receiver_waiting: bool,
+}
+
+static mut ports: [Port; 32]
+#[getter]
+static mut messages_sent: u64 = 0
+
+fn port_index(id: u64) -> Option<usize> {
+    let i = (id & ((1u64 << port_index_bits) - 1)) as usize
+    if i >= max_ports || !ports[i].used || ports[i].generation != id >> port_index_bits {
+        return None
+    }
+    if task_slot_of(ports[i].owner) < 0 {
+        ports[i].used = false
+        return None
+    }
+    return Some(i)
+}
+
+fn port_id(i: usize) -> u64 {
+    return (ports[i].generation << port_index_bits) | i as u64
+}
+
+fn ports_in_use() -> usize {
+    let mut n: usize = 0
+    for i in 0..max_ports {
+        if ports[i].used && task_slot_of(ports[i].owner) >= 0 {
+            n += 1
+        }
+    }
+    return n
+}
+
+fn port_create() -> i64 {
+    for i in 0..max_ports {
+        if ports[i].used && task_slot_of(ports[i].owner) < 0 {
+            ports[i].used = false
+        }
+        if !ports[i].used {
+            ports[i].used = true
+            ports[i].generation += 1
+            ports[i].owner = current_task_id()
+            ports[i].owner_slot = get_current()
+            ports[i].name_len = 0
+            ports[i].head = 0
+            ports[i].count = 0
+            ports[i].receiver_waiting = false
+            return port_id(i) as i64
+        }
+    }
+    return -abi::err_nomem
+}
+
+fn port_destroy(id: u64) -> i64 {
+    let Some(p) = port_index(id) else {
+        return -abi::err_badf
+    }
+    if ports[p].owner != current_task_id() {
+        return -abi::err_perm
+    }
+    ports[p].used = false
+    return 0
+}
+
+fn port_send(id: u64, msg: u64) -> i64 {
+    let Some(p) = port_index(id) else {
+        return -abi::err_badf
+    }
+    if ports[p].count == port_queue_size {
+        return -abi::err_again
+    }
+    let slot = (ports[p].head + ports[p].count) % port_queue_size
+    if !copy_from_user(&mut ports[p].queue[slot], msg) {
+        return -abi::err_fault
+    }
+    let sender = current_task_id()
+    for b in 0..8usize {
+        ports[p].queue[slot][b] = (sender >> (8 * b as u64)) as u8
+    }
+    ports[p].count += 1
+    messages_sent += 1
+    if ports[p].receiver_waiting {
+        ports[p].receiver_waiting = false
+        task_wake(ports[p].owner_slot)
+    }
+    return 0
+}
+
+fn port_owner(p: usize) -> u64 {
+    return ports[p].owner
+}
+
+fn port_send_kernel(p: usize, words: &[u64; 8]) -> i64 {
+    if ports[p].count == port_queue_size {
+        return -abi::err_again
+    }
+    let slot = (ports[p].head + ports[p].count) % port_queue_size
+    for w in 0..8usize {
+        for b in 0..8usize {
+            ports[p].queue[slot][w * 8 + b] = (words[w] >> (8 * b as u64)) as u8
+        }
+    }
+    ports[p].count += 1
+    messages_sent += 1
+    if ports[p].receiver_waiting {
+        ports[p].receiver_waiting = false
+        task_wake(ports[p].owner_slot)
+    }
+    return 0
+}
+
+fn port_recv(id: u64, msg: u64, wait: bool) -> i64 {
+    return port_recv_until(id, msg, wait, 0)
+}
+
+fn port_recv_timeout(id: u64, msg: u64, ms: u64) -> i64 {
+    return port_recv_until(id, msg, true, get_ticks() + ms_to_ticks(ms))
+}
+
+fn port_recv_until(id: u64, msg: u64, wait: bool, deadline: u64) -> i64 {
+    loop {
+        let Some(p) = port_index(id) else {
+            return -abi::err_badf
+        }
+        if ports[p].owner != current_task_id() {
+            return -abi::err_perm
+        }
+        if !user_range_ok(read_cr3(), msg, port_message_size as u64, true) {
+            return -abi::err_fault
+        }
+        if ports[p].count > 0 {
+            let head = ports[p].head
+            copy_to_user(msg, &ports[p].queue[head])
+            ports[p].head = (head + 1) % port_queue_size
+            ports[p].count -= 1
+            return 0
+        }
+        if !wait {
+            return -abi::err_again
+        }
+        if deadline != 0 && get_ticks() >= deadline {
+            return -abi::err_again
+        }
+        ports[p].receiver_waiting = true
+        if deadline == 0 {
+            task_block()
+        } else {
+            task_block_until(deadline)
+        }
+    }
+    return 0
+}
+
+fn name_is(p: usize, name: &[u8]) -> bool {
+    return bytes_equal(&ports[p].name[..ports[p].name_len], name)
+}
+
+fn read_name(name: u64, len: u64, buf: &mut [u8; 16]) -> i64 {
+    if len == 0 || len > port_name_max as u64 {
+        return -abi::err_inval
+    }
+    if !copy_from_user(&mut buf[..len as usize], name) {
+        return -abi::err_fault
+    }
+    return len as i64
+}
+
+fn port_publish(id: u64, name: u64, len: u64) -> i64 {
+    let mut buf = [0u8; 16]
+    let n = read_name(name, len, &mut buf)
+    if n < 0 {
+        return n
+    }
+    let Some(p) = port_index(id) else {
+        return -abi::err_badf
+    }
+    if ports[p].owner != current_task_id() {
+        return -abi::err_perm
+    }
+    for q in 0..max_ports {
+        if q != p && port_index(port_id(q)).is_some() && name_is(q, &buf[..n as usize]) {
+            return -abi::err_busy
+        }
+    }
+    for k in 0..n as usize {
+        ports[p].name[k] = buf[k]
+    }
+    ports[p].name_len = n as usize
+    return 0
+}
+
+fn port_lookup(name: u64, len: u64) -> i64 {
+    let mut buf = [0u8; 16]
+    let n = read_name(name, len, &mut buf)
+    if n < 0 {
+        return n
+    }
+    for q in 0..max_ports {
+        if port_index(port_id(q)).is_some() && name_is(q, &buf[..n as usize]) {
+            return port_id(q) as i64
+        }
+    }
+    return -abi::err_noent
+}

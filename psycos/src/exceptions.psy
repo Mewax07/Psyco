@@ -3,9 +3,6 @@
 ///   - https://wiki.osdev.org/Exceptions#Page_Fault
 ///   - https://wiki.osdev.org/Exceptions#Selector_Error_Code
 ///   - https://wiki.osdev.org/Exceptions#Double_Fault
-///
-/// CPU exceptions (vectors 0 to 21) and the panic screen.
-/// Normal code: only idt.psy and gdt.psy are trusted.
 
 import "idt.psy"
 import "console.psy"
@@ -38,7 +35,6 @@ static mut stack_guard_check: fn(u64) -> bool
 #[setter]
 static mut user_fault_hook: fn(u64, u64, u64)
 
-/// Short name of an exception vector.
 fn exception_name(v: u64) -> Str {
     match v {
         0 => return "#DE divide error",
@@ -65,7 +61,6 @@ fn exception_name(v: u64) -> Str {
     }
 }
 
-/// Installs every exception handler and loads the IDT.
 fn exceptions_init() {
     idt_set_gate(0, exc_de as u64, 0)
     idt_set_gate(1, exc_db as u64, 0)
@@ -90,121 +85,101 @@ fn exceptions_init() {
     idt_load()
 }
 
-/// #DE divide error.
 #[interrupt]
 fn exc_de(frame: &Frame) {
     fatal(0, frame, 0, false)
 }
 
-/// #DB debug.
 #[interrupt]
 fn exc_db(frame: &Frame) {
     fatal(1, frame, 0, false)
 }
 
-/// NMI.
 #[interrupt]
 fn exc_nmi(frame: &Frame) {
     fatal(2, frame, 0, false)
 }
 
-/// #OF overflow.
 #[interrupt]
 fn exc_of(frame: &Frame) {
     fatal(4, frame, 0, false)
 }
 
-/// #BR bound range exceeded.
 #[interrupt]
 fn exc_br(frame: &Frame) {
     fatal(5, frame, 0, false)
 }
 
-/// #UD invalid opcode.
 #[interrupt]
 fn exc_ud(frame: &Frame) {
     fatal(6, frame, 0, false)
 }
 
-/// #NM device not available.
 #[interrupt]
 fn exc_nm(frame: &Frame) {
     fatal(7, frame, 0, false)
 }
 
-/// #DF double fault (runs on IST1).
 #[interrupt]
 fn exc_df(frame: &Frame, code: u64) {
     fatal(8, frame, code, true)
 }
 
-/// #TS invalid TSS.
 #[interrupt]
 fn exc_ts(frame: &Frame, code: u64) {
     fatal(10, frame, code, true)
 }
 
-/// #NP segment not present.
 #[interrupt]
 fn exc_np(frame: &Frame, code: u64) {
     fatal(11, frame, code, true)
 }
 
-/// #SS stack-segment fault.
 #[interrupt]
 fn exc_ss(frame: &Frame, code: u64) {
     fatal(12, frame, code, true)
 }
 
-/// #GP general protection fault.
 #[interrupt]
 fn exc_gp(frame: &Frame, code: u64) {
     fatal(13, frame, code, true)
 }
 
-/// #PF page fault.
 #[interrupt]
 fn exc_pf(frame: &Frame, code: u64) {
     fatal(14, frame, code, true)
 }
 
-/// #MF x87 floating-point error.
 #[interrupt]
 fn exc_mf(frame: &Frame) {
     fatal(16, frame, 0, false)
 }
 
-/// #AC alignment check.
 #[interrupt]
 fn exc_ac(frame: &Frame, code: u64) {
     fatal(17, frame, code, true)
 }
 
-/// #MC machine check.
 #[interrupt]
 fn exc_mc(frame: &Frame) {
     fatal(18, frame, 0, false)
 }
 
-/// #XM SIMD floating-point error.
 #[interrupt]
 fn exc_xm(frame: &Frame) {
     fatal(19, frame, 0, false)
 }
 
-/// #VE virtualization exception.
 #[interrupt]
 fn exc_ve(frame: &Frame) {
     fatal(20, frame, 0, false)
 }
 
-/// #CP control protection.
 #[interrupt]
 fn exc_cp(frame: &Frame, code: u64) {
     fatal(21, frame, code, true)
 }
 
-/// #BP (int3): counts it and resumes right after the instruction.
 #[interrupt]
 fn exc_bp(frame: &Frame) {
     breakpoints += 1
@@ -213,13 +188,11 @@ fn exc_bp(frame: &Frame) {
     putc('\n')
 }
 
-/// Approximate current rsp (address of a local).
 fn stack_pointer() -> u64 {
     let marker: u64 = 0
     return &marker as *const u64 as u64
 }
 
-/// Prints "NAME=0x0123456789ABCDEF  ".
 fn put_reg(name: Str, v: u64) {
     puts(name)
     puts("=0x")
@@ -227,7 +200,6 @@ fn put_reg(name: Str, v: u64) {
     puts("  ")
 }
 
-/// Explains an error code in words.
 fn put_error_code(vector: u64, code: u64) {
     if vector == vector_page_fault {
         if code & pf_present != 0 {
@@ -261,7 +233,6 @@ fn put_error_code(vector: u64, code: u64) {
         puts("control-flow violation")
         return
     }
-    // Selector error code (#TS, #NP, #SS, #GP).
     if code == 0 {
         puts("no selector")
         return
@@ -282,8 +253,6 @@ fn put_error_code(vector: u64, code: u64) {
     }
 }
 
-/// Panic screen: exception, error code, registers, then halt.
-/// A fault in user mode only kills the process.
 fn fatal(vector: u64, frame: &Frame, code: u64, has_code: bool) {
     cli()
     if frame.cs & 3 == 3 && user_fault_hook as u64 != 0 {

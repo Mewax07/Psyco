@@ -1,0 +1,103 @@
+/// Wiki Doc sources:
+///   - https://wiki.osdev.org/System_Calls
+
+import "sched.psy"
+import "timer.psy"
+import "usermode.psy"
+import "console.psy"
+import "umem.psy"
+import "ipc.psy"
+import "surface.psy"
+import "input.psy"
+import "display.psy"
+import "clock.psy"
+import "../user/psy/abi.psy" as abi
+
+const write_chunk_size: usize = 128
+const max_sleep: u64 = 3600000
+
+fn psy_dispatch(n: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u64) -> i64 {
+    match n {
+        abi::sys_version => return abi::version as i64,
+        abi::sys_getpid => return current_task_id() as i64,
+        abi::sys_yield => {
+            yield_now()
+            return 0
+        }
+        abi::sys_sleep_ms => return psy_sleep(a1),
+        abi::sys_uptime_ms => return uptime_ms() as i64,
+        abi::sys_exit => {
+            task_exit_code(a1 as i64)
+            return 0
+        }
+        abi::sys_write => return console_write(a1, a2),
+        abi::sys_task_name => return psy_task_name(a1, a2),
+        abi::sys_map => return sys_mmap(a1, prot_write, map_private | map_anonymous),
+        abi::sys_unmap => return sys_munmap(a1, a2),
+        abi::sys_mem_pages => return umem_pages(get_current()) as i64,
+        abi::sys_port_create => return port_create(),
+        abi::sys_port_destroy => return port_destroy(a1),
+        abi::sys_port_send => return port_send(a1, a2),
+        abi::sys_port_recv => return port_recv(a1, a2, true),
+        abi::sys_port_try_recv => return port_recv(a1, a2, false),
+        abi::sys_port_publish => return port_publish(a1, a2, a3),
+        abi::sys_port_lookup => return port_lookup(a1, a2),
+        abi::sys_surface_create => return surface_create(a1, a2),
+        abi::sys_surface_map => return surface_map(a1),
+        abi::sys_surface_unmap => return surface_unmap(a1),
+        abi::sys_surface_share => return surface_share(a1, a2),
+        abi::sys_surface_destroy => return surface_destroy(a1),
+        abi::sys_surface_info => return surface_info(a1),
+        abi::sys_input_claim => return input_claim(a1),
+        abi::sys_input_release => return input_release(),
+        abi::sys_task_alive => return task_alive(a1) as i64,
+        abi::sys_time => return clock_now() as i64,
+        abi::sys_port_recv_timeout => return port_recv_timeout(a1, a2, a3),
+        abi::sys_display_claim => return display_claim(),
+        abi::sys_display_info => return display_info(a1),
+        _ => return -abi::err_nosys,
+    }
+}
+
+fn psy_sleep(ms: u64) -> i64 {
+    if ms > max_sleep {
+        return -abi::err_inval
+    }
+    task_sleep(ms)
+    return 0
+}
+
+fn console_write(buf: u64, len: u64) -> i64 {
+    if !user_range_ok(read_cr3(), buf, len, false) {
+        return -abi::err_fault
+    }
+    let mut part = [0u8; 128]
+    let mut done: u64 = 0
+    while done < len {
+        let mut n = len - done
+        if n > write_chunk_size as u64 {
+            n = write_chunk_size as u64
+        }
+        if !copy_from_user(&mut part[..n as usize], buf + done) {
+            return -abi::err_fault
+        }
+        for i in 0..n as usize {
+            putc(part[i])
+        }
+        done += n
+    }
+    return len as i64
+}
+
+fn psy_task_name(buf: u64, len: u64) -> i64 {
+    let mut name = [0u8; 16]
+    let n = task_name(get_current(), &mut name)
+    let mut count = n as u64
+    if count > len {
+        count = len
+    }
+    if !copy_to_user(buf, &name[..count as usize]) {
+        return -abi::err_fault
+    }
+    return count as i64
+}

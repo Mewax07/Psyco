@@ -1,0 +1,58 @@
+/// Wiki Doc sources:
+///   - https://wiki.osdev.org/System_Calls
+///   - https://man7.org/linux/man-pages/man2/syscall.2.html
+
+// Constants
+
+const version: u64 = 1
+const first_call: u64 = 0x1000
+
+const sys_version: u64 = 0x1000
+const sys_getpid: u64 = 0x1001
+const sys_yield: u64 = 0x1002
+const sys_sleep_ms: u64 = 0x1003
+const sys_uptime_ms: u64 = 0x1004
+const sys_exit: u64 = 0x1005
+const sys_write: u64 = 0x1006
+const sys_task_name: u64 = 0x1007
+const sys_task_alive: u64 = 0x1008
+const sys_time: u64 = 0x1009
+
+const sys_map: u64 = 0x1010
+const sys_unmap: u64 = 0x1011
+const sys_mem_pages: u64 = 0x1012
+
+const sys_port_create: u64 = 0x1020
+const sys_port_destroy: u64 = 0x1021
+const sys_port_send: u64 = 0x1022
+const sys_port_recv: u64 = 0x1023
+const sys_port_try_recv: u64 = 0x1024
+const sys_port_publish: u64 = 0x1025
+const sys_port_lookup: u64 = 0x1026
+const sys_port_recv_timeout: u64 = 0x1027
+
+const sys_surface_create: u64 = 0x1030
+const sys_surface_map: u64 = 0x1031
+const sys_surface_unmap: u64 = 0x1032
+const sys_surface_share: u64 = 0x1033
+const sys_surface_destroy: u64 = 0x1034
+const sys_surface_info: u64 = 0x1035
+
+const sys_input_claim: u64 = 0x1040
+const sys_input_release: u64 = 0x1041
+
+const sys_display_claim: u64 = 0x1050
+const sys_display_info: u64 = 0x1051
+
+const msg_surface: u64 = 0xF001
+const msg_key: u64 = 0xF002
+
+const err_perm: i64 = 1
+const err_noent: i64 = 2
+const err_badf: i64 = 9
+const err_again: i64 = 11
+const err_nomem: i64 = 12
+const err_fault: i64 = 14
+const err_busy: i64 = 16
+const err_inval: i64 = 22
+const err_nosys: i64 = 38

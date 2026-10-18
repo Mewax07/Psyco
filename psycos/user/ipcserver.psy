@@ -1,0 +1,26 @@
+/// Wiki Doc sources:
+///   - https://wiki.osdev.org/Message_Passing
+
+import "psy/sys.psy" as sys
+
+const requests: u64 = 3
+
+fn main() {
+    let port = sys::port_create()
+    if port < 0 || sys::publish(port as u64, "echo") != 0 {
+        print("echo server: cannot publish")
+        exit(1)
+    }
+    let mut m = sys::Message { sender: 0, kind: 0, data: [0u64; 6] }
+    for i in 0..requests {
+        if sys::recv(port as u64, &mut m) != 0 {
+            exit(2)
+        }
+        let reply_port = m.data[0]
+        let mut r = sys::Message { sender: 0, kind: m.kind + 1, data: [0u64; 6] }
+        r.data[0] = m.sender
+        r.data[1] = m.data[1] * 2
+        r.data[2] = sys::getpid()
+        sys::send(reply_port, &r)
+    }
+}

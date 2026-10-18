@@ -130,6 +130,16 @@ impl Subst<'_> {
                     self.block(b);
                 }
             }
+            Stmt::LetElse {
+                pat,
+                value,
+                else_block,
+                ..
+            } => {
+                self.pattern(pat);
+                self.expr(value);
+                self.block(else_block);
+            }
             Stmt::WhileLet {
                 pat, value, body, ..
             } => {

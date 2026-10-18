@@ -1,6 +1,14 @@
 use std::collections::HashMap;
 
-use crate::{emit::Emitter, inline::{Unit, inline_program, live_units}, ir::Func, lower::Lower, opt::optimize, regalloc::{allocate, allocate_none}, *};
+use crate::{
+    emit::Emitter,
+    inline::{Unit, inline_program, live_units},
+    ir::Func,
+    lower::Lower,
+    opt::optimize,
+    regalloc::{allocate, allocate_none},
+    *,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Target {
@@ -171,7 +179,9 @@ impl<'a> Codegen<'a> {
             let RwLabel::Data(base) = label else {
                 unreachable!()
             };
-            let relocs = self.info.statics[self.info.static_index(&name).unwrap()].relocs.clone();
+            let relocs = self.info.statics[self.info.static_index(&name).unwrap()]
+                .relocs
+                .clone();
             for (off, r) in relocs {
                 let target = match r {
                     Reloc::Func(f) => AddrTarget::Code(self.functions[&f]),

@@ -1,8 +1,6 @@
 /// Wiki Doc sources:
 ///   - https://wiki.osdev.org/Programmable_Interval_Timer
 ///   - https://wiki.osdev.org/8259_PIC#Spurious_IRQs
-///
-/// Hardware interrupts (IRQ 0 to 15) and the system timer (normal code).
 
 import "idt.psy"
 import "pic.psy"
@@ -24,9 +22,9 @@ static mut other_irqs: u64 = 0
 
 #[setter]
 static mut tick_hook: fn()
+#[setter]
+static mut poll_hook: fn()
 
-/// Installs the 16 IRQ vectors and starts the timer. Interrupts stay off:
-/// the caller does sti() once everything is ready.
 fn irq_init() {
     pic_init()
     for v in irq_first_vector..irq_last_vector + 1 {
@@ -41,19 +39,20 @@ fn irq_init() {
     pic_unmask(timer_irq)
 }
 
-/// IRQ 0: one timer tick. The EOI goes first, because the hook may switch
-/// to another task and only come back much later.
 #[interrupt]
 fn irq_timer(frame: &Frame) {
     ticks += 1
     pic_eoi(timer_irq)
+    if poll_hook as u64 != 0 {
+        let poll = poll_hook
+        poll()
+    }
     if tick_hook as u64 != 0 {
         let hook = tick_hook
         hook()
     }
 }
 
-/// IRQ 7: real or spurious.
 #[interrupt]
 fn irq_spurious7(frame: &Frame) {
     if pic_spurious(7) {
@@ -64,7 +63,6 @@ fn irq_spurious7(frame: &Frame) {
     }
 }
 
-/// IRQ 15: real or spurious.
 #[interrupt]
 fn irq_spurious15(frame: &Frame) {
     if pic_spurious(15) {
@@ -75,19 +73,16 @@ fn irq_spurious15(frame: &Frame) {
     }
 }
 
-/// IRQ without a driver (normally masked): acknowledged on both PICs.
 #[interrupt]
 fn irq_other(frame: &Frame) {
     other_irqs += 1
     pic_eoi(8)
 }
 
-/// Milliseconds since the timer started.
 fn uptime_ms() -> u64 {
     return ticks * 1000 / timer_hz
 }
 
-/// Sleeps (hlt) for at least `ms` milliseconds. Needs interrupts on.
 fn sleep_ms(ms: u64) {
     let target = ticks + (ms * timer_hz + 999) / 1000
     while ticks < target {

@@ -1,26 +1,22 @@
 /// Wiki Doc sources:
 ///   - https://wiki.osdev.org/Memory_Allocation
 ///   - https://doc.rust-lang.org/std/vec/struct.Vec.html
-///
-/// Heap types: Box<T>, Vec<T>, String.
 
 #![trusted]
 
 mod std_heap {
-    /// New zeroed heap memory; panics if the heap is full.
-	fn new(size: usize) -> *mut u8 {
-	    let mut n = size
-		if n == 0 {
-		    n = 1
-		}
-		let p = psy_alloc(n)
-		if p.is_none() {
-		    panic("out of memory")
-		}
-		return p
-	}
+    fn new(size: usize) -> *mut u8 {
+        let mut n = size
+        if n == 0 {
+            n = 1
+        }
+        let p = psy_alloc(n)
+        if p.is_null() {
+            panic("out of memory")
+        }
+        return p
+    }
 
-	/// Panics unless `ptr` is still allocation `generation` with `bytes` bytes.
     fn check(ptr: *mut u8, generation: u64, bytes: usize) {
         if generation == 0 || psy_generation(ptr) != generation {
             panic("heap memory used after free")
@@ -30,7 +26,6 @@ mod std_heap {
         }
     }
 
-    /// Size of one element (at least 1 byte).
     fn elem_size(size: usize) -> usize {
         if size == 0 {
             return 1
@@ -39,7 +34,6 @@ mod std_heap {
     }
 }
 
-/// One value on the heap.
 #[move]
 struct Box<T> {
     ptr: *mut T,
@@ -47,26 +41,22 @@ struct Box<T> {
 }
 
 impl<T> Box<T> {
-    /// Moves `value` to the heap.
     fn new(value: T) -> Box<T> {
         let p = std_heap::new(sizeof(T)) as *mut T
         p.write(value)
         return Box { ptr: p, generation: psy_generation(p as *mut u8) }
     }
 
-    /// The value, borrowed.
     fn as_ref(&self) -> &T {
         std_heap::check(self.ptr as *mut u8, self.generation, sizeof(T))
         return &*self.ptr
     }
 
-    /// The value, borrowed mutably.
     fn as_mut(&mut self) -> &mut T {
         std_heap::check(self.ptr as *mut u8, self.generation, sizeof(T))
         return &mut *self.ptr
     }
 
-    /// Takes the value back and frees the memory.
     fn into_inner(self) -> T {
         std_heap::check(self.ptr as *mut u8, self.generation, sizeof(T))
         let v = self.ptr.read()
@@ -74,7 +64,6 @@ impl<T> Box<T> {
         return v
     }
 
-    /// Frees the memory.
     fn free(self) {
         std_heap::check(self.ptr as *mut u8, self.generation, sizeof(T))
         psy_free(self.ptr as *mut u8)
@@ -82,18 +71,15 @@ impl<T> Box<T> {
 }
 
 impl<T: Copy> Box<T> {
-    /// A copy of the value.
     fn get(&self) -> T {
         return *self.as_ref()
     }
 
-    /// Replaces the value.
     fn set(&mut self, value: T) {
         *self.as_mut() = value
     }
 }
 
-/// A growable array on the heap.
 #[move]
 struct Vec<T> {
     ptr: *mut T,
@@ -103,41 +89,34 @@ struct Vec<T> {
 }
 
 impl<T> Vec<T> {
-    /// Empty vector (no memory until the first push).
     fn new() -> Vec<T> {
         return Vec { ptr: 0 as *mut T, len: 0, cap: 0, generation: 0 }
     }
 
-    /// Empty vector with room for `n` elements.
     fn with_capacity(n: usize) -> Vec<T> {
         let mut v = Vec { ptr: 0 as *mut T, len: 0, cap: 0, generation: 0 }
         v.reserve(n)
         return v
     }
 
-    /// Number of elements.
     fn len(&self) -> usize {
         return self.len
     }
 
-    /// True if there is no element.
     fn is_empty(&self) -> bool {
         return self.len == 0
     }
 
-    /// Elements that fit before the next allocation.
     fn capacity(&self) -> usize {
         return self.cap
     }
 
-    /// Panics unless the first `n` elements are in the live buffer.
     fn check(&self, n: usize) {
         if n > 0 {
             std_heap::check(self.ptr as *mut u8, self.generation, n * std_heap::elem_size(sizeof(T)))
         }
     }
 
-    /// Makes room for `extra` more elements.
     fn reserve(&mut self, extra: usize) {
         let need = self.len + extra
         if need <= self.cap {
@@ -162,7 +141,6 @@ impl<T> Vec<T> {
         self.generation = psy_generation(p)
     }
 
-    /// Adds `value` at the end.
     fn push(&mut self, value: T) {
         self.reserve(1)
         self.check(self.len + 1)
@@ -170,7 +148,6 @@ impl<T> Vec<T> {
         self.len += 1
     }
 
-    /// Takes the last element.
     fn pop(&mut self) -> Option<T> {
         if self.len == 0 {
             return None
@@ -180,7 +157,6 @@ impl<T> Vec<T> {
         return Some(self.ptr.add(self.len).read())
     }
 
-    /// Element `i`, borrowed.
     fn at(&self, i: usize) -> &T {
         if i >= self.len {
             panic("index out of bounds")
@@ -189,7 +165,6 @@ impl<T> Vec<T> {
         return &*self.ptr.add(i)
     }
 
-    /// Element `i`, borrowed mutably.
     fn at_mut(&mut self, i: usize) -> &mut T {
         if i >= self.len {
             panic("index out of bounds")
@@ -198,7 +173,6 @@ impl<T> Vec<T> {
         return &mut *self.ptr.add(i)
     }
 
-    /// Inserts `value` at index `i`, shifting the rest.
     fn insert(&mut self, i: usize, value: T) {
         if i > self.len {
             panic("insert index out of bounds")
@@ -215,7 +189,6 @@ impl<T> Vec<T> {
         self.len += 1
     }
 
-    /// Takes element `i` out, shifting the rest.
     fn remove(&mut self, i: usize) -> T {
         if i >= self.len {
             panic("remove index out of bounds")
@@ -230,31 +203,26 @@ impl<T> Vec<T> {
         return v
     }
 
-    /// Keeps the first `n` elements.
     fn truncate(&mut self, n: usize) {
         if n < self.len {
             self.len = n
         }
     }
 
-    /// Removes every element (the memory is kept).
     fn clear(&mut self) {
         self.len = 0
     }
 
-    /// The elements as a slice.
     fn as_slice(&self) -> &[T] {
         self.check(self.len)
         return slice_from_raw(self.ptr as *const T, self.len)
     }
 
-    /// The elements as a mutable slice.
     fn as_mut_slice(&mut self) -> &mut [T] {
         self.check(self.len)
         return slice_from_raw_mut(self.ptr, self.len)
     }
 
-    /// Gives the memory back.
     fn free(self) {
         if self.cap > 0 {
             self.check(1)
@@ -264,7 +232,6 @@ impl<T> Vec<T> {
 }
 
 impl<T: Copy> Vec<T> {
-    /// `n` zeroed elements.
     fn zeroed(n: usize) -> Vec<T> {
         let mut v = Vec { ptr: 0 as *mut T, len: 0, cap: 0, generation: 0 }
         v.reserve(n)
@@ -272,24 +239,20 @@ impl<T: Copy> Vec<T> {
         return v
     }
 
-    /// A vector holding a copy of `items`.
     fn from_slice(items: &[T]) -> Vec<T> {
         let mut v = Vec { ptr: 0 as *mut T, len: 0, cap: 0, generation: 0 }
         v.extend_from_slice(items)
         return v
     }
 
-    /// A copy of element `i`.
     fn get(&self, i: usize) -> T {
         return *self.at(i)
     }
 
-    /// Replaces element `i`.
     fn set(&mut self, i: usize, value: T) {
         *self.at_mut(i) = value
     }
 
-    /// Adds a copy of `items` at the end.
     fn extend_from_slice(&mut self, items: &[T]) {
         self.reserve(items.len())
         self.check(self.len + items.len())
@@ -300,7 +263,6 @@ impl<T: Copy> Vec<T> {
         self.len += items.len()
     }
 
-    /// Copies `items` over the elements from index `at`.
     fn copy_from(&mut self, at: usize, items: &[T]) {
         if at > self.len || items.len() > self.len - at {
             panic("copy out of bounds")
@@ -311,7 +273,6 @@ impl<T: Copy> Vec<T> {
         }
     }
 
-    /// Sets every element to `value`.
     fn fill(&mut self, value: T) {
         for i in 0..self.len {
             self.set(i, value)
@@ -319,56 +280,46 @@ impl<T: Copy> Vec<T> {
     }
 }
 
-/// Text on the heap (bytes, usually ASCII or UTF-8).
 #[move]
 struct String {
     bytes: Vec<u8>,
 }
 
 impl String {
-    /// Empty string.
     fn new() -> String {
         return String { bytes: Vec::new() }
     }
 
-    /// A copy of `s`.
     fn from(s: Str) -> String {
         let mut out = String::new()
         out.push_str(s)
         return out
     }
 
-    /// Number of bytes.
     fn len(&self) -> usize {
         return self.bytes.len()
     }
 
-    /// True if there is no byte.
     fn is_empty(&self) -> bool {
         return self.bytes.len() == 0
     }
 
-    /// Byte `i`.
     fn byte(&self, i: usize) -> u8 {
         return self.bytes.get(i)
     }
 
-    /// Adds one byte.
     fn push(&mut self, c: u8) {
         self.bytes.push(c)
     }
 
-    /// Adds the bytes of `s`.
     fn push_str(&mut self, s: Str) {
         self.bytes.extend_from_slice(s.as_bytes())
     }
 
-    /// Adds `b`.
     fn push_bytes(&mut self, b: &[u8]) {
         self.bytes.extend_from_slice(b)
     }
 
-    /// Adds `n` in decimal.
     fn push_u64(&mut self, n: u64) {
         let mut digits = [0u8; 20]
         let mut count: usize = 0
@@ -387,12 +338,10 @@ impl String {
         }
     }
 
-    /// The bytes (`print(s.as_bytes())` prints the text).
     fn as_bytes(&self) -> &[u8] {
         return self.bytes.as_slice()
     }
 
-    /// True if the text is `s`.
     fn eq_str(&self, s: Str) -> bool {
         let b = s.as_bytes()
         if b.len() != self.bytes.len() {
@@ -406,12 +355,10 @@ impl String {
         return true
     }
 
-    /// Removes every byte.
     fn clear(&mut self) {
         self.bytes.clear()
     }
 
-    /// Gives the memory back.
     fn free(self) {
         self.bytes.free()
     }

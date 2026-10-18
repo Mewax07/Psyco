@@ -1,14 +1,15 @@
 /// Wiki Doc sources:
-///   - https://wiki.osdev.org/Scheduling_Algorithms
-///
-/// User program: loops forever without any system call. Only the timer can
-/// take the CPU back; `kill` stops it.
+///   - https://man7.org/linux/man-pages/man2/sched_yield.2.html
 
-/// Burns CPU time.
+const report_every: u64 = 500000000
+
 fn main() {
-    print("spinning in ring 3 (use ps and kill)")
     let mut n: u64 = 0
+    print("spinning forever (stop it with kill)")
     loop {
         n = n +% 1
+        if n % report_every == 0 {
+            print("still spinning")
+        }
     }
 }

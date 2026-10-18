@@ -1,0 +1,62 @@
+/// Wiki Doc sources:
+///   - https://man7.org/linux/man-pages/man2/brk.2.html
+///   - https://man7.org/linux/man-pages/man2/mmap.2.html
+
+#![trusted]
+
+import "psy/sys.psy" as sys
+
+const nr_mmap: u64 = 9
+const nr_munmap: u64 = 11
+const prot_rw: u64 = 3
+const map_private_anonymous: u64 = 0x22
+const no_fd: u64 = 0xFFFFFFFFFFFFFFFF
+const map_bytes: u64 = 65536
+const count: u64 = 100000
+
+fn pattern_ok(addr: u64, len: u64) -> bool {
+    let p = addr as *mut u8
+    for i in 0..len as usize {
+        p.add(i).write((i % 251) as u8)
+    }
+    for i in 0..len as usize {
+        if p.add(i).read() != (i % 251) as u8 {
+            return false
+        }
+    }
+    return true
+}
+
+fn main() {
+    let mut v: Vec<u64> = Vec::new()
+    for i in 0..count {
+        v.push(i * 3)
+    }
+    let mut sum: u64 = 0
+    for i in 0..v.len() {
+        sum += v.get(i)
+    }
+    print("vec:", v.len(), sum)
+    let mut s = String::new()
+    s.push_str("heap ")
+    s.push_str("string")
+    print("string:", s.as_bytes())
+    let heap_pages = sys::mem_pages()
+    print("heap pages:", heap_pages > 100)
+
+    let a = syscall6(nr_mmap, 0, map_bytes, prot_rw, map_private_anonymous, no_fd, 0)
+    print("mmap:", a > 0, a as u64 % 4096 == 0)
+    print("zeroed:", (a as u64 as *const u64).read() == 0)
+    print("pattern:", pattern_ok(a as u64, map_bytes))
+    print("pages after mmap:", sys::mem_pages() - heap_pages)
+    print("munmap:", syscall6(nr_munmap, a as u64, map_bytes, 0, 0, 0, 0))
+    print("pages after munmap:", sys::mem_pages() - heap_pages)
+    print("bad munmap:", syscall6(nr_munmap, a as u64 + 1, 10, 0, 0, 0, 0))
+    print("file mapping refused:", syscall6(nr_mmap, 0, 4096, prot_rw, 0x02, 3, 0))
+
+    let b = sys::map(10000)
+    print("map:", b > 0, pattern_ok(b as u64, 10000), sys::mem_pages() - heap_pages)
+    print("unmap:", sys::unmap(b as u64, 10000), sys::mem_pages() - heap_pages)
+    v.free()
+    s.free()
+}

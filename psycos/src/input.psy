@@ -1,0 +1,87 @@
+/// Wiki Doc sources:
+///   - https://wiki.osdev.org/Keyboard
+///   - https://wiki.osdev.org/Message_Passing
+
+import "ipc.psy"
+import "display.psy"
+import "keyboard.psy"
+import "timer.psy"
+import "serial.psy"
+import "../user/psy/abi.psy" as abi
+
+static mut input_on: bool = false
+static mut input_port: u64 = 0
+static mut input_owner: u64 = 0
+#[getter]
+static mut keys_routed: u64 = 0
+#[getter]
+static mut keys_dropped: u64 = 0
+
+fn input_init() {
+    set_key_routing(route_key, input_active)
+    set_poll_hook(poll_serial_input)
+}
+
+fn input_active() -> bool {
+    if input_on && task_slot_of(input_owner) < 0 {
+        input_on = false
+    }
+    return input_on
+}
+
+fn route_key(c: u8) -> bool {
+    if !input_active() {
+        return false
+    }
+    let Some(p) = port_index(input_port) else {
+        input_on = false
+        return false
+    }
+    let mut words = [0u64; 8]
+    words[1] = abi::msg_key
+    words[2] = c as u64
+    if port_send_kernel(p, &words) < 0 {
+        keys_dropped += 1
+    } else {
+        keys_routed += 1
+    }
+    return true
+}
+
+fn poll_serial_input() {
+    display_poll()
+    if !input_active() {
+        return
+    }
+    loop {
+        let s = serial_poll()
+        if s < 0 {
+            break
+        }
+        route_key(serial_key(s as u8))
+    }
+}
+
+fn input_claim(port: u64) -> i64 {
+    let Some(p) = port_index(port) else {
+        return -abi::err_badf
+    }
+    if port_owner(p) != current_task_id() {
+        return -abi::err_perm
+    }
+    if input_active() {
+        return -abi::err_busy
+    }
+    input_port = port
+    input_owner = current_task_id()
+    input_on = true
+    return 0
+}
+
+fn input_release() -> i64 {
+    if !input_active() || input_owner != current_task_id() {
+        return -abi::err_perm
+    }
+    input_on = false
+    return 0
+}

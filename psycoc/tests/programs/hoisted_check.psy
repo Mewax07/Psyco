@@ -1,0 +1,24 @@
+static mut index: usize = 7
+static mut rounds: u64 = 0
+
+fn total(a: &[u64; 4]) -> u64 {
+    let mut s: u64 = 0
+    for i in 0..rounds {
+        s += a[index] + i
+    }
+    return s
+}
+
+fn main() {
+    let a = [10u64, 20, 30, 40]
+    print(total(&a))
+    rounds = 3
+    index = 2
+    print(total(&a))
+    index = 4
+    print(total(&a))
+}
+
+// exit: 101
+//> 0
+//> 93

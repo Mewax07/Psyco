@@ -2,20 +2,6 @@
 ///   - https://wiki.osdev.org/Global_Descriptor_Table
 ///   - https://wiki.osdev.org/GDT_Tutorial
 ///   - https://wiki.osdev.org/Task_State_Segment
-///
-/// Kernel GDT and TSS.
-///
-///   0x00  null descriptor
-///   0x08  kernel code, 64 bits (DPL 0)
-///   0x10  kernel data (DPL 0)
-///   0x18  TSS (16-byte descriptor: also uses entry 0x20)
-///   0x28  null: 32-bit user code slot expected by sysret (unused)
-///   0x30  user data (DPL 3)
-///   0x38  user code, 64 bits (DPL 3)
-///
-/// With STAR[63:48] = 0x28, sysret will load SS = 0x30 and CS = 0x38.
-/// In 64-bit mode the TSS only gives the stacks used on interrupts:
-/// rsp0 (coming from ring 3) and IST1, a spare stack for double faults.
 
 #![trusted]
 
@@ -24,11 +10,9 @@ const kernel_ds: u16 = 0x10
 const tss_selector: u16 = 0x18
 const user_base_selector: u64 = 0x28
 
-// Ring 3 selectors (RPL 3).
 const user_ds: u64 = 0x33
 const user_cs: u64 = 0x3B
 
-// Present, DPL 0, base 0, limit 4 GiB.
 const gdt_kernel_code: u64 = 0x00AF9A000000FFFF
 const gdt_kernel_data: u64 = 0x00CF92000000FFFF
 const gdt_user_data: u64 = 0x00CFF2000000FFFF
@@ -71,9 +55,6 @@ static mut df_stack: [u8; 16384]
 #[getter]
 static mut gdt_ready: bool = false
 
-/// Builds and loads the GDT and the TSS (only once). Can run again (after moving to
-/// the higher half): the TSS descriptor is rewritten as "available", so
-/// ltr does not fault on a busy TSS.
 fn gdt_init() {
     gdt[0] = 0
     gdt[1] = gdt_kernel_code
@@ -100,42 +81,34 @@ fn gdt_init() {
     gdt_ready = true
 }
 
-/// Stack used when an interrupt comes from ring 3 (phase 4).
 fn tss_set_rsp0(top: u64) {
     tss.rsp0 = top
 }
 
-/// Lowest address of the double fault stack.
 fn df_stack_bottom() -> u64 {
     return df_stack.as_ptr() as u64
 }
 
-/// Top of the double fault stack (IST1).
 fn df_stack_top() -> u64 {
     return df_stack.as_ptr() as u64 + df_stack_size as u64
 }
 
-/// Address of the GDT as loaded in the CPU.
 fn gdt_address() -> u64 {
     return gdtr.base
 }
 
-/// Raw GDT entry, for tests and diagnostics.
 fn gdt_entry(i: usize) -> u64 {
     return gdt[i]
 }
 
-/// IST1 value stored in the TSS.
 fn tss_ist1() -> u64 {
     return tss.ist1
 }
 
-/// Address of the TSS.
 fn tss_address() -> u64 {
     return &mut tss as *mut Tss as u64
 }
 
-/// Size of the TSS in bytes (104).
 fn tss_size() -> usize {
     return sizeof(Tss)
 }

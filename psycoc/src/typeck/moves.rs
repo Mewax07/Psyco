@@ -400,6 +400,19 @@ impl Mv<'_> {
                 }
                 self.state = union(after_then, self.state.take());
             }
+
+            Stmt::LetElse {
+                pat,
+                value,
+                else_block,
+                ..
+            } => {
+                self.scrutinee(value, &[pat]);
+                let before = self.state.clone();
+                self.block(else_block);
+                self.state = before;
+                self.bind(pat);
+            }
             Stmt::WhileLet {
                 pat, value, body, ..
             } => {

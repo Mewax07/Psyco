@@ -1,6 +1,14 @@
-use std::{collections::{HashMap, HashSet}, mem::take};
+use std::{
+    collections::{HashMap, HashSet},
+    mem::take,
+};
 
-use crate::{Cond, inline::loop_blocks, ir::{Arith, BinK, Block, BlockId, Func, Inst, Op, Term, VReg}, regalloc::layout};
+use crate::{
+    Cond,
+    inline::loop_blocks,
+    ir::{Arith, BinK, Block, BlockId, Func, Inst, Op, Term, VReg},
+    regalloc::layout,
+};
 
 type Facts = Vec<(Op, Op)>;
 
@@ -15,7 +23,9 @@ fn upper(facts: &Facts, a: Op, depth: u32) -> Option<u128> {
                 }
                 let bound = match b {
                     Op::I(c) => Some(c as u64 as u128),
-                    Op::V(_) if depth > 0 => upper(facts, b, depth - 1).map(|u| u.saturating_sub(1)),
+                    Op::V(_) if depth > 0 => {
+                        upper(facts, b, depth - 1).map(|u| u.saturating_sub(1))
+                    }
                     _ => None,
                 };
                 if let Some(u) = bound {
@@ -111,7 +121,9 @@ fn transfer(facts: &mut Facts, i: &Inst) {
             b: Op::I(k),
             ty,
             ..
-        } if !ty.signed && ty.size == 8 && (2..64).contains(&k) => gen_.push((Op::V(d), Op::I(1i64 << (64 - k)))),
+        } if !ty.signed && ty.size == 8 && (2..64).contains(&k) => {
+            gen_.push((Op::V(d), Op::I(1i64 << (64 - k))))
+        }
         Inst::Ext { ty, .. } | Inst::Load { ty, .. } if !ty.signed && ty.size < 8 => {
             gen_.push((Op::V(d), Op::I(1i64 << (8 * ty.size))))
         }
@@ -126,8 +138,12 @@ fn transfer(facts: &mut Facts, i: &Inst) {
 
 fn simplify(facts: &Facts, i: &Inst) -> Option<Inst> {
     match *i {
-        Inst::Check { a, b, cc: Cond::AE, .. } if less(facts, a, b) => None,
-        Inst::Check { a, b, cc: Cond::A, .. } if less_eq(facts, a, b) => None,
+        Inst::Check {
+            a, b, cc: Cond::AE, ..
+        } if less(facts, a, b) => None,
+        Inst::Check {
+            a, b, cc: Cond::A, ..
+        } if less_eq(facts, a, b) => None,
         Inst::Bin {
             dst,
             op,
@@ -142,7 +158,11 @@ fn simplify(facts: &Facts, i: &Inst) -> Option<Inst> {
                 _ => match (upper(facts, a, 2), upper(facts, b, 2)) {
                     (Some(ua), Some(ub)) if ua > 0 && ub > 0 => {
                         let (x, y) = (ua - 1, ub - 1);
-                        let max = if op == BinK::Add { x + y } else { x.saturating_mul(y) };
+                        let max = if op == BinK::Add {
+                            x + y
+                        } else {
+                            x.saturating_mul(y)
+                        };
                         max < limit
                     }
                     _ => false,
@@ -312,7 +332,8 @@ pub fn hoist_checks(f: &mut Func) -> bool {
                     if let Some(d) = i.def() {
                         *defs.entry(d).or_default() += 1;
                     }
-                    writes_memory |= !i.is_pure() && !matches!(i, Inst::Check { .. } | Inst::Bin { .. } | Inst::Neg { .. });
+                    writes_memory |= !i.is_pure()
+                        && !matches!(i, Inst::Check { .. } | Inst::Bin { .. } | Inst::Neg { .. });
                 }
             }
         }
@@ -332,7 +353,9 @@ pub fn hoist_checks(f: &mut Func) -> bool {
                 Inst::Load { .. } => ops_invariant && !writes_memory,
                 _ => ops_invariant && i.is_pure(),
             };
-            let def_ok = i.def().is_none_or(|d| defs.get(&d) == Some(&1) && !header_uses.contains(&Op::V(d)));
+            let def_ok = i
+                .def()
+                .is_none_or(|d| defs.get(&d) == Some(&1) && !header_uses.contains(&Op::V(d)));
             if movable && def_ok {
                 let i = f.blocks[body].insts.remove(k);
                 if let Some(d) = i.def() {

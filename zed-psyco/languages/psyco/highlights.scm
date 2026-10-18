@@ -10,15 +10,25 @@
 ((identifier) @type
   (#match? @type "^[A-Z][a-z0-9]+[A-Za-z0-9]*$"))
 
+; Variants of the prelude enums, used without `Option::` / `Result::`.
+((identifier) @constant
+  (#any-of? @constant "Some" "None" "Ok" "Err"))
+
 ; ---- types --------------------------------------------------------------
 
 (type_identifier) @type
 (primitive_type) @type.builtin
+
+; Modules: `mod name`, `import "f.psy" as name`, `name::item`.
+(path_identifier) @type
+(mod_item name: (identifier) @type)
+(import_item alias: (identifier) @type)
 (unit_type) @type.builtin
 
 ; ---- definitions --------------------------------------------------------
 
 (function_item name: (identifier) @function)
+(function_signature_item name: (identifier) @function)
 
 (parameter pattern: (identifier) @variable.parameter)
 (self) @variable.special
@@ -34,6 +44,10 @@
 
 (enum_variant name: (identifier) @constant)
 
+; Patterns: `Some(x)`, `Event::Move(x, _)`, `mut n`.
+(tuple_struct_pattern type: (identifier) @constant)
+(mut_pattern (identifier) @variable)
+
 ; ---- uses ---------------------------------------------------------------
 
 ; `Enum::Variant` / `Type::method`
@@ -45,6 +59,9 @@
 
 (call_expression
   function: (scoped_identifier name: (identifier) @function))
+
+(generic_function function: (identifier) @function)
+(generic_function function: (scoped_identifier name: (identifier) @function))
 
 (call_expression
   function: (field_expression field: (field_identifier) @function.method))
@@ -61,13 +78,27 @@
     "rdmsr" "wrmsr" "invlpg" "load_cs" "load_ds" "ltr"
     "memcpy" "memset" "efi_image_handle" "efi_system_table"
     "switch_stack" "context_switch" "lgdt" "lidt"
-    "set_syscall_stack" "syscall" "iret_to" "include_bytes" "include_program"))
+    "set_syscall_stack" "syscall" "syscall6" "iret_to" "include_bytes" "include_program"
+    "memset32" "slice_from_raw" "slice_from_raw_mut" "rebase_statics"))
 
 ; Methods built into arrays, slices, strings and raw pointers.
 (call_expression
   function: (field_expression field: (field_identifier) @function.builtin)
   (#any-of? @function.builtin
-    "len" "as_ptr" "as_mut_ptr" "is_null" "add" "sub" "offset" "read" "write"))
+    "len" "as_ptr" "as_mut_ptr" "as_bytes" "is_null" "add" "sub" "offset" "read" "write"))
+
+; ---- variants and modules in paths (last, so they win) -------------------
+
+; `Some(x)`, `Event::Key(c)`: building a variant, not calling a function.
+((identifier) @constant
+  (#any-of? @constant "Some" "None" "Ok" "Err"))
+(call_expression
+  function: (scoped_identifier name: (identifier) @constant)
+  (#match? @constant "^[A-Z]"))
+(tuple_struct_pattern type: (identifier) @constant)
+
+; `sys::fill::words`: `fill` is a module (or a type), not a value.
+(scoped_identifier path: (scoped_identifier name: (identifier) @type))
 
 ; ---- attributes ---------------------------------------------------------
 
@@ -104,6 +135,9 @@
   "extern"
   "let"
   "import"
+  "mod"
+  "trait"
+  "mut"
 ] @keyword
 
 [
@@ -134,7 +168,7 @@
   "==" "!=" "<" "<=" ">" ">="
   "&&" "||"
   "=" "+=" "-=" "*=" "/=" "%=" "&=" "|=" "^=" "<<=" ">>="
-  ".." "->" "=>"
+  ".." "->" "=>" "?"
 ] @operator
 
 ["(" ")" "[" "]" "{" "}"] @punctuation.bracket

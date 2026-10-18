@@ -1,0 +1,12 @@
+fn main() {
+    let limit: u64 = 3
+    for i in 0..10u64 {
+        print(limit - i)
+    }
+}
+
+// exit: 101
+//> 3
+//> 2
+//> 1
+//> 0

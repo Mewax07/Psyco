@@ -28,8 +28,14 @@ pub struct Ty {
 }
 
 impl Ty {
-    pub const U64: Ty = Ty { size: 8, signed: false };
-    pub const U8: Ty = Ty { size: 1, signed: false };
+    pub const U64: Ty = Ty {
+        size: 8,
+        signed: false,
+    };
+    pub const U8: Ty = Ty {
+        size: 1,
+        signed: false,
+    };
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -75,7 +81,10 @@ pub enum BinK {
 
 impl BinK {
     pub fn commutative(self) -> bool {
-        matches!(self, BinK::Add | BinK::Mul | BinK::And | BinK::Or | BinK::Xor)
+        matches!(
+            self,
+            BinK::Add | BinK::Mul | BinK::And | BinK::Or | BinK::Xor
+        )
     }
 }
 
@@ -136,36 +145,121 @@ pub enum Intr {
 
 #[derive(Debug, Clone)]
 pub enum Inst {
-    Mov { dst: VReg, src: Op },
-    Bin { dst: VReg, op: BinK, a: Op, b: Op, ty: Ty, mode: Arith },
-    Neg { dst: VReg, a: Op, ty: Ty },
-    BitNot { dst: VReg, a: Op, ty: Ty },
-    Ext { dst: VReg, a: Op, ty: Ty },
-    Set { dst: VReg, cc: Cond, a: Op, b: Op },
-    Load { dst: VReg, mem: Mem, ty: Ty },
-    Store { mem: Mem, src: Op, size: u8 },
-    Addr { dst: VReg, mem: Mem },
-    SymAddr { dst: VReg, sym: Sym },
-    Call { dst: Option<VReg>, target: CallT, args: Vec<Op> },
-    EfiCall { dst: Option<VReg>, callee: Op, args: Vec<Op>, ret: Option<Ty> },
-    CallRt { routine: Label, arg: Option<Op> },
-    PrintBytes { slice: Op },
-    Copy { dst: Mem, src: Mem, size: u64 },
-    Zero { dst: Mem, size: u64 },
-    Fill { dst: Mem, value: Op, count: u64, size: u8 },
-    Check { a: Op, b: Op, cc: Cond, trap: Label },
-    Intr { kind: Intr, dst: Option<VReg>, args: Vec<Op> },
+    Mov {
+        dst: VReg,
+        src: Op,
+    },
+    Bin {
+        dst: VReg,
+        op: BinK,
+        a: Op,
+        b: Op,
+        ty: Ty,
+        mode: Arith,
+    },
+    Neg {
+        dst: VReg,
+        a: Op,
+        ty: Ty,
+    },
+    BitNot {
+        dst: VReg,
+        a: Op,
+        ty: Ty,
+    },
+    Ext {
+        dst: VReg,
+        a: Op,
+        ty: Ty,
+    },
+    Set {
+        dst: VReg,
+        cc: Cond,
+        a: Op,
+        b: Op,
+    },
+    Load {
+        dst: VReg,
+        mem: Mem,
+        ty: Ty,
+    },
+    Store {
+        mem: Mem,
+        src: Op,
+        size: u8,
+    },
+    Addr {
+        dst: VReg,
+        mem: Mem,
+    },
+    SymAddr {
+        dst: VReg,
+        sym: Sym,
+    },
+    Call {
+        dst: Option<VReg>,
+        target: CallT,
+        args: Vec<Op>,
+    },
+    EfiCall {
+        dst: Option<VReg>,
+        callee: Op,
+        args: Vec<Op>,
+        ret: Option<Ty>,
+    },
+    CallRt {
+        routine: Label,
+        arg: Option<Op>,
+    },
+    PrintBytes {
+        slice: Op,
+    },
+    Copy {
+        dst: Mem,
+        src: Mem,
+        size: u64,
+    },
+    Zero {
+        dst: Mem,
+        size: u64,
+    },
+    Fill {
+        dst: Mem,
+        value: Op,
+        count: u64,
+        size: u8,
+    },
+    Check {
+        a: Op,
+        b: Op,
+        cc: Cond,
+        trap: Label,
+    },
+    Intr {
+        kind: Intr,
+        dst: Option<VReg>,
+        args: Vec<Op>,
+    },
 }
 
 #[derive(Debug, Clone)]
 pub enum Term {
     Jmp(BlockId),
-    Br { cc: Cond, a: Op, b: Op, t: BlockId, f: BlockId },
+    Br {
+        cc: Cond,
+        a: Op,
+        b: Op,
+        t: BlockId,
+        f: BlockId,
+    },
     Ret(Option<Op>),
     Panic(Op),
     Exit(Op),
     IretTo(Vec<Op>),
-    SwitchStack { stack: Op, f: Op },
+    SwitchStack {
+        stack: Op,
+        f: Op,
+    },
     Unreachable,
 }
 
@@ -236,7 +330,9 @@ impl Inst {
             | Inst::Load { dst, .. }
             | Inst::Addr { dst, .. }
             | Inst::SymAddr { dst, .. } => Some(dst),
-            Inst::Call { dst, .. } | Inst::EfiCall { dst, .. } | Inst::Intr { dst, .. } => dst.as_mut(),
+            Inst::Call { dst, .. } | Inst::EfiCall { dst, .. } | Inst::Intr { dst, .. } => {
+                dst.as_mut()
+            }
             _ => None,
         }
     }
@@ -245,7 +341,9 @@ impl Inst {
         let mem = |m: &Mem| m.ops();
         match self {
             Inst::Mov { src, .. } => vec![*src],
-            Inst::Bin { a, b, .. } | Inst::Set { a, b, .. } | Inst::Check { a, b, .. } => vec![*a, *b],
+            Inst::Bin { a, b, .. } | Inst::Set { a, b, .. } | Inst::Check { a, b, .. } => {
+                vec![*a, *b]
+            }
             Inst::Neg { a, .. } | Inst::BitNot { a, .. } | Inst::Ext { a, .. } => vec![*a],
             Inst::Load { mem: m, .. } | Inst::Addr { mem: m, .. } => mem(m),
             Inst::Store { mem: m, src, .. } => {
@@ -294,7 +392,9 @@ impl Inst {
         }
         match self {
             Inst::Mov { src, .. } => vec![src],
-            Inst::Bin { a, b, .. } | Inst::Set { a, b, .. } | Inst::Check { a, b, .. } => vec![a, b],
+            Inst::Bin { a, b, .. } | Inst::Set { a, b, .. } | Inst::Check { a, b, .. } => {
+                vec![a, b]
+            }
             Inst::Neg { a, .. } | Inst::BitNot { a, .. } | Inst::Ext { a, .. } => vec![a],
             Inst::Load { mem: m, .. } | Inst::Addr { mem: m, .. } => mem(m),
             Inst::Store { mem: m, src, .. } => {
@@ -397,26 +497,53 @@ impl fmt::Display for Mem {
 
 impl fmt::Display for Ty {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}{}", if self.signed { "i" } else { "u" }, self.size * 8)
+        write!(
+            f,
+            "{}{}",
+            if self.signed { "i" } else { "u" },
+            self.size * 8
+        )
     }
 }
 
 impl fmt::Display for Func {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        writeln!(f, "fn {} ({} vregs, {} slots)", self.name, self.nvregs, self.slots.len())?;
+        writeln!(
+            f,
+            "fn {} ({} vregs, {} slots)",
+            self.name,
+            self.nvregs,
+            self.slots.len()
+        )?;
         for (i, b) in self.blocks.iter().enumerate() {
             writeln!(f, "b{i}:")?;
             for inst in &b.insts {
                 let d = |v: &VReg| format!("%{v} = ");
-                let ops = |v: &[Op]| v.iter().map(|o| o.to_string()).collect::<Vec<_>>().join(", ");
+                let ops = |v: &[Op]| {
+                    v.iter()
+                        .map(|o| o.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
                 let line = match inst {
                     Inst::Mov { dst, src } => format!("{}{src}", d(dst)),
-                    Inst::Bin { dst, op, a, b, ty, mode } => {
-                        format!("{}{op:?}.{ty}{} {a}, {b}", d(dst), match mode {
-                            Arith::Checked => "!",
-                            Arith::Wrap => "%",
-                            Arith::Plain => "",
-                        })
+                    Inst::Bin {
+                        dst,
+                        op,
+                        a,
+                        b,
+                        ty,
+                        mode,
+                    } => {
+                        format!(
+                            "{}{op:?}.{ty}{} {a}, {b}",
+                            d(dst),
+                            match mode {
+                                Arith::Checked => "!",
+                                Arith::Wrap => "%",
+                                Arith::Plain => "",
+                            }
+                        )
                     }
                     Inst::Neg { dst, a, ty } => format!("{}neg.{ty} {a}", d(dst)),
                     Inst::BitNot { dst, a, ty } => format!("{}not.{ty} {a}", d(dst)),
@@ -431,16 +558,26 @@ impl fmt::Display for Func {
                         dst.map_or(String::new(), |v| d(&v)),
                         ops(args)
                     ),
-                    Inst::EfiCall { dst, callee, args, .. } => format!(
+                    Inst::EfiCall {
+                        dst, callee, args, ..
+                    } => format!(
                         "{}efi_call {callee}({})",
                         dst.map_or(String::new(), |v| d(&v)),
                         ops(args)
                     ),
-                    Inst::CallRt { routine, arg } => format!("rt {routine:?}({})", arg.map_or(String::new(), |a| a.to_string())),
+                    Inst::CallRt { routine, arg } => format!(
+                        "rt {routine:?}({})",
+                        arg.map_or(String::new(), |a| a.to_string())
+                    ),
                     Inst::PrintBytes { slice } => format!("print_bytes {slice}"),
                     Inst::Copy { dst, src, size } => format!("copy {dst}, {src}, {size}"),
                     Inst::Zero { dst, size } => format!("zero {dst}, {size}"),
-                    Inst::Fill { dst, value, count, size } => format!("fill.{} {dst}, {value} x{count}", size * 8),
+                    Inst::Fill {
+                        dst,
+                        value,
+                        count,
+                        size,
+                    } => format!("fill.{} {dst}, {value} x{count}", size * 8),
                     Inst::Check { a, b, cc, .. } => format!("check !({a} {cc:?} {b})"),
                     Inst::Intr { kind, dst, args } => format!(
                         "{}{kind:?}({})",

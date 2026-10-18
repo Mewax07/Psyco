@@ -1,0 +1,28 @@
+// disk: fat32 +programs
+// esp: psyos.cfg video=800x600
+// match: ordered
+// input: start /bin/windowserver
+// input: run /bin/wmcompose
+// input: mem
+// input: shutdown
+
+import "../../../psycos/src/kernel.psy"
+
+//> PsycOS: boot ok
+//> psycos> start /bin/windowserver
+//> started in slot
+//> windows: 1 2
+//> probe 10 10 : 2113632 window 0 on screen true
+//> probe 60 50 : 12595248 window 1 on screen true
+//> probe 200 120 : 3166400 window 2 on screen true
+//> probe 200 120 : 12595248 window 1 on screen true
+//> probe 200 120 : 3166400 window 2 on screen true
+//> probe 60 50 : 2113632 window 0 on screen true
+//> probe 200 120 : 2113632 window 0 on screen true
+//> probe 410 310 : 3166400 window 2 on screen true
+//> [display] window server gone: text console back
+//> server alive: false
+//> exit code 0
+//> psycos> mem
+//> Surfaces: 0, ports: 0
+// exit: 0

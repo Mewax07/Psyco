@@ -1,17 +1,14 @@
 /// Wiki Doc sources:
 ///   - https://wiki.osdev.org/System_Calls
 ///   - https://wiki.osdev.org/Getting_to_Ring_3
-///
-/// Processes: a program in its own address space, running in ring 3, and
-/// the system calls it can make (normal code).
-/// Numbers and conventions are Linux x86-64, so programs compiled by
-/// psycoc for Linux run unchanged: print -> write(1, ...), exit -> exit.
 
 import "sched.psy"
 import "usermode.psy"
 import "console.psy"
 import "fat32.psy"
 import "heap.psy"
+import "psycalls.psy"
+import "umem.psy"
 
 const sys_write: u64 = 1
 const sys_nanosleep: u64 = 35
@@ -19,17 +16,13 @@ const sys_sched_yield: u64 = 24
 const sys_getpid: u64 = 39
 const sys_exit: u64 = 60
 const sys_exit_group: u64 = 231
+const nr_mmap: u64 = 9
+const nr_munmap: u64 = 11
+const nr_brk: u64 = 12
 
 const fd_stdout: u64 = 1
 const fd_stderr: u64 = 2
 
-// Linux error numbers (returned negated).
-const ebadf: i64 = 9
-const efault: i64 = 14
-const einval: i64 = 22
-const enosys: i64 = 38
-
-const write_chunk: usize = 128
 const max_program_size: u64 = 0x400000
 const read_chunk: u64 = 32768
 const nanos_per_ms: u64 = 1000000
@@ -40,67 +33,45 @@ static mut chunk: [u8; 32768]
 #[getter]
 static mut syscall_count: u64 = 0
 
-/// Entry point of every `syscall` instruction (interrupts are off).
 #[syscall]
 fn syscall_entry(regs: &mut SyscallRegs) {
     syscall_count += 1
-    let result = dispatch(regs.rax, regs.rdi, regs.rsi, regs.rdx)
-    regs.rax = result as u64
+    if regs.rax >= abi::first_call {
+        regs.rax = psy_dispatch(regs.rax, regs.rdi, regs.rsi, regs.rdx, regs.r10, regs.r8, regs.r9) as u64
+    } else {
+        regs.rax = dispatch(regs.rax, regs.rdi, regs.rsi, regs.rdx, regs.r10) as u64
+    }
 }
 
-
-/// Runs system call `n`; returns the result (negative errno on error).
-fn dispatch(n: u64, a1: u64, a2: u64, a3: u64) -> i64 {
-    if n == sys_write {
-        return sys_write_impl(a1, a2, a3)
+fn dispatch(n: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> i64 {
+    match n {
+        sys_write => {
+            if a1 != fd_stdout && a1 != fd_stderr {
+                return -abi::err_badf
+            }
+            return console_write(a2, a3)
+        }
+        sys_getpid => return current_task_id() as i64,
+        sys_sched_yield => {
+            yield_now()
+            return 0
+        }
+        sys_nanosleep => return sys_nanosleep_impl(a1),
+        nr_brk => return sys_brk(a1),
+        nr_mmap => return sys_mmap(a2, a3, a4),
+        nr_munmap => return sys_munmap(a1, a2),
+        sys_exit | sys_exit_group => {
+            task_exit_code(a1 as i64)
+            return 0
+        }
+        _ => return -abi::err_nosys,
     }
-    if n == sys_getpid {
-        return current_task_id() as i64
-    }
-    if n == sys_sched_yield {
-        yield_now()
-        return 0
-    }
-    if n == sys_nanosleep {
-        return sys_nanosleep_impl(a1)
-    }
-    if n == sys_exit || n == sys_exit_group {
-        task_exit_code(a1 as i64)
-    }
-    return -enosys
 }
 
-/// write(fd, buf, len): stdout and stderr go to the console.
-fn sys_write_impl(fd: u64, buf: u64, len: u64) -> i64 {
-    if fd != fd_stdout && fd != fd_stderr {
-        return -ebadf
-    }
-    if !user_range_ok(read_cr3(), buf, len, false) {
-        return -efault
-    }
-    let mut chunk = [0u8; 128]
-    let mut done: u64 = 0
-    while done < len {
-        let mut n = len - done
-        if n > write_chunk as u64 {
-            n = write_chunk as u64
-        }
-        if !copy_from_user(&mut chunk[..n as usize], buf + done) {
-            return -efault
-        }
-        for i in 0..n as usize {
-            putc(chunk[i])
-        }
-        done += n
-    }
-    return len as i64
-}
-
-/// nanosleep(req, rem): sleeps for req->tv_sec seconds + req->tv_nsec ns.
 fn sys_nanosleep_impl(req: u64) -> i64 {
     let mut raw = [0u8; 16]
     if !copy_from_user(&mut raw, req) {
-        return -efault
+        return -abi::err_fault
     }
     let mut sec: u64 = 0
     let mut nsec: u64 = 0
@@ -109,15 +80,12 @@ fn sys_nanosleep_impl(req: u64) -> i64 {
         nsec |= (raw[8 + i] as u64) << (8 * i as u64)
     }
     if nsec >= 1000000000 || sec > max_sleep_ms / 1000 {
-        return -einval
+        return -abi::err_inval
     }
     task_sleep(sec * 1000 + nsec / nanos_per_ms)
     return 0
 }
 
-/// Points the syscall instruction at syscall_entry. Must run in the higher
-/// half, after gdt_init and exceptions_init ran there too: process address
-/// spaces have no identity map, so the CPU tables need high addresses.
 fn process_init() {
     if gdt_address() < kernel_virt_base || idt_address() < kernel_virt_base {
         panic("process_init: GDT/IDT must be reloaded in the higher half first")
@@ -125,29 +93,28 @@ fn process_init() {
     syscall_init(syscall_entry as u64)
 }
 
-/// Loads an executable in a new address space and starts it in ring 3.
-/// Returns the task slot, or -1 (bad file or no memory / slot).
 fn process_spawn(name: Str, elf: Str) -> i64 {
     let root = as_create()
     let program = load_program(root, elf)
     return process_start(name, root, program)
 }
 
-/// Starts a loaded program (frees the address space if it cannot).
-fn process_start(name: Str, root: u64, program: LoadedProgram) -> i64 {
-    if !program.ok {
+fn process_start(name: Str, root: u64, loaded: Option<LoadedProgram>) -> i64 {
+    let Some(program) = loaded else {
         as_destroy(root)
         return -1
     }
     let slot = spawn_user(name, root, program.entry, program.stack_top)
     if slot < 0 {
         as_destroy(root)
+    } else {
+        umem_init(slot as usize, program.image_end)
+        surface_init(slot as usize)
     }
     return slot
 }
 
-/// Reads a whole file into a heap buffer of its size; returns the bytes read.
-fn fat_read_buf(e: &DirEntry, buf: &mut ByteBuf) -> u64 {
+fn fat_read_buf(e: &DirEntry, buf: &mut Vec<u8>) -> u64 {
     let mut done: u64 = 0
     while done < e.size {
         let mut n = e.size - done
@@ -164,22 +131,21 @@ fn fat_read_buf(e: &DirEntry, buf: &mut ByteBuf) -> u64 {
     return done
 }
 
-/// Loads the executable at `path` on the disk and starts it in ring 3.
-/// The task is named after the file. Returns the slot, or -1 (no such
-/// file, too big, not an executable, no memory).
 fn process_spawn_file(path: &[u8]) -> i64 {
-    let e = fat_lookup(path)
-    if !e.found || is_dir(&e) || e.size == 0 || e.size > max_program_size {
+    let Some(e) = fat_lookup(path) else {
         return -1
     }
-    let mut file = byte_buf(e.size as usize)
+    if is_dir(&e) || e.size == 0 || e.size > max_program_size {
+        return -1
+    }
+    let mut file: Vec<u8> = Vec::zeroed(e.size as usize)
     let got = fat_read_buf(&e, &mut file)
     if got != e.size {
         file.free()
         return -1
     }
     let image = ElfImage {
-        data: file.ptr,
+        data: file.as_slice().as_ptr(),
         size: e.size,
     }
     let root = as_create()
@@ -193,8 +159,6 @@ fn process_spawn_file(path: &[u8]) -> i64 {
     return slot
 }
 
-/// Starts a program and waits for it; returns its exit code (-1 if it
-/// could not start).
 fn process_run(name: Str, elf: Str) -> i64 {
     let slot = process_spawn(name, elf)
     if slot < 0 {

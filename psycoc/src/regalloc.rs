@@ -1,4 +1,3 @@
-
 use crate::ir::*;
 use crate::*;
 
@@ -16,9 +15,11 @@ pub const POOL: [Reg; 11] = [
     Reg::R15,
 ];
 
-pub const CALLER_SAVED: u16 = bit(Reg::Rsi) | bit(Reg::Rdi) | bit(Reg::R8) | bit(Reg::R9) | bit(Reg::R10) | bit(Reg::R11);
+pub const CALLER_SAVED: u16 =
+    bit(Reg::Rsi) | bit(Reg::Rdi) | bit(Reg::R8) | bit(Reg::R9) | bit(Reg::R10) | bit(Reg::R11);
 
-pub const CALLEE_SAVED: u16 = bit(Reg::Rbx) | bit(Reg::R12) | bit(Reg::R13) | bit(Reg::R14) | bit(Reg::R15);
+pub const CALLEE_SAVED: u16 =
+    bit(Reg::Rbx) | bit(Reg::R12) | bit(Reg::R13) | bit(Reg::R14) | bit(Reg::R15);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Loc {
@@ -136,7 +137,9 @@ impl Bits {
 
     fn iter(&self) -> impl Iterator<Item = u32> + '_ {
         self.0.iter().enumerate().flat_map(|(w, &x)| {
-            (0..64).filter(move |b| x >> b & 1 != 0).map(move |b| (w * 64 + b) as u32)
+            (0..64)
+                .filter(move |b| x >> b & 1 != 0)
+                .map(move |b| (w * 64 + b) as u32)
         })
     }
 }
@@ -192,7 +195,10 @@ pub fn liveness(f: &Func, order: &[BlockId]) -> (Vec<Bits_>, Vec<Bits_>) {
             live_out[b] = out;
         }
     }
-    (live_in.into_iter().map(Bits_).collect(), live_out.into_iter().map(Bits_).collect())
+    (
+        live_in.into_iter().map(Bits_).collect(),
+        live_out.into_iter().map(Bits_).collect(),
+    )
 }
 
 pub struct Bits_(Bits);
@@ -320,8 +326,16 @@ pub fn allocate(f: &Func, order: &[BlockId]) -> Alloc {
             }
         }
     }
-    let saved = POOL.iter().copied().filter(|r| saved_mask & bit(*r) != 0).collect();
-    Alloc { loc, nspills, saved }
+    let saved = POOL
+        .iter()
+        .copied()
+        .filter(|r| saved_mask & bit(*r) != 0)
+        .collect();
+    Alloc {
+        loc,
+        nspills,
+        saved,
+    }
 }
 
 pub fn allocate_none(f: &Func) -> Alloc {
@@ -334,6 +348,10 @@ pub fn allocate_none(f: &Func) -> Alloc {
     Alloc {
         loc: (0..f.nvregs).map(Loc::Spill).collect(),
         nspills: f.nvregs,
-        saved: POOL.iter().copied().filter(|r| saved_mask & bit(*r) != 0).collect(),
+        saved: POOL
+            .iter()
+            .copied()
+            .filter(|r| saved_mask & bit(*r) != 0)
+            .collect(),
     }
 }

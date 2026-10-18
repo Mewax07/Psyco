@@ -36,7 +36,9 @@ fn copyable(f: &Func) -> bool {
     f.blocks.iter().all(|b| {
         b.insts.iter().all(|i| {
             mems(i).iter().all(|m| match m {
-                Mem::Param(_) => matches!(i, Inst::Load { mem: Mem::Param(_), ty, .. } if *ty == Ty::U64),
+                Mem::Param(_) => {
+                    matches!(i, Inst::Load { mem: Mem::Param(_), ty, .. } if *ty == Ty::U64)
+                }
                 _ => true,
             })
         })
@@ -52,7 +54,9 @@ fn calls(f: &Func) -> Vec<Label> {
                     target: CallT::Label(l),
                     ..
                 } => v.push(*l),
-                Inst::SymAddr { sym: Sym::Code(l), .. } => v.push(*l),
+                Inst::SymAddr {
+                    sym: Sym::Code(l), ..
+                } => v.push(*l),
                 _ => {}
             }
         }
@@ -189,7 +193,11 @@ fn inline_at(f: &mut Func, b: BlockId, k: usize, callee: &Func) {
 }
 
 pub fn inline_program(units: &mut [Unit], optimize: &dyn Fn(&mut Func)) {
-    let by_label: HashMap<Label, usize> = units.iter().enumerate().map(|(i, u)| (u.label, i)).collect();
+    let by_label: HashMap<Label, usize> = units
+        .iter()
+        .enumerate()
+        .map(|(i, u)| (u.label, i))
+        .collect();
 
     let mut sites: HashMap<Label, usize> = HashMap::new();
     for u in units.iter() {
@@ -198,7 +206,10 @@ pub fn inline_program(units: &mut [Unit], optimize: &dyn Fn(&mut Func)) {
         }
         for b in &u.func.blocks {
             for i in &b.insts {
-                if let Inst::SymAddr { sym: Sym::Code(l), .. } = i {
+                if let Inst::SymAddr {
+                    sym: Sym::Code(l), ..
+                } = i
+                {
                     *sites.entry(*l).or_default() += 1000;
                 }
             }
@@ -207,7 +218,12 @@ pub fn inline_program(units: &mut [Unit], optimize: &dyn Fn(&mut Func)) {
 
     let graph: Vec<Vec<usize>> = units
         .iter()
-        .map(|u| calls(&u.func).iter().filter_map(|l| by_label.get(l).copied()).collect())
+        .map(|u| {
+            calls(&u.func)
+                .iter()
+                .filter_map(|l| by_label.get(l).copied())
+                .collect()
+        })
         .collect();
     let mut order = Vec::new();
     let mut state = vec![0u8; units.len()];
@@ -286,9 +302,16 @@ pub fn inline_program(units: &mut [Unit], optimize: &dyn Fn(&mut Func)) {
 }
 
 pub fn live_units(units: &[Unit], roots: &[Label]) -> HashSet<usize> {
-    let by_label: HashMap<Label, usize> = units.iter().enumerate().map(|(i, u)| (u.label, i)).collect();
+    let by_label: HashMap<Label, usize> = units
+        .iter()
+        .enumerate()
+        .map(|(i, u)| (u.label, i))
+        .collect();
     let mut live = HashSet::new();
-    let mut work: Vec<usize> = roots.iter().filter_map(|l| by_label.get(l).copied()).collect();
+    let mut work: Vec<usize> = roots
+        .iter()
+        .filter_map(|l| by_label.get(l).copied())
+        .collect();
     while let Some(u) = work.pop() {
         if !live.insert(u) {
             continue;

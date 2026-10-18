@@ -519,6 +519,17 @@ impl<'a> Bck<'a> {
                     self.block(b);
                 }
             }
+            Stmt::LetElse {
+                pat,
+                value,
+                else_block,
+                ..
+            } => {
+                let carried = self.expr(value);
+                self.block(else_block);
+                self.bind_pattern(pat, &carried);
+                self.stmt_end(&carried);
+            }
             Stmt::WhileLet {
                 pat, value, body, ..
             } => {

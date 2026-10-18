@@ -487,4 +487,96 @@ mod tests {
             assert_eq!(c.swap(), s);
         }
     }
+
+    #[test]
+    fn indexed_addressing_and_memory_operands() {
+        use psycoc::Addr;
+        use Reg::*;
+        assert_eq!(encode(|a| a.store_imm_at(Addr::base(Rax, 0), 5, 1)), hex("c6 00 05"));
+        assert_eq!(encode(|a| a.store_imm_at(Addr::base(Rbp, -8), -2, 2)), hex("66 c7 45 f8 fe ff"));
+        assert_eq!(encode(|a| a.store_imm_at(Addr::base(R12, 16), 0x12345678, 4)), hex("41 c7 44 24 10 78 56 34 12"));
+        assert_eq!(encode(|a| a.store_imm_at(Addr::base(Rsp, 200), -1, 8)), hex("48 c7 84 24 c8 00 00 00 ff ff ff ff"));
+        assert_eq!(encode(|a| a.store_imm_at(Addr::indexed(R13, R9, 3, 0), 7, 8)), hex("4b c7 44 cd 00 07 00 00 00"));
+        assert_eq!(encode(|a| a.lea_at(Rax, Addr::indexed(Rsi, Rdi, 0, 0))), hex("48 8d 04 3e"));
+        assert_eq!(encode(|a| a.lea_at(R11, Addr::indexed(R13, R14, 2, 40))), hex("4f 8d 5c b5 28"));
+        assert_eq!(encode(|a| a.lea_at(Rdx, Addr::indexed(Rbp, Rax, 1, -300))), hex("48 8d 94 45 d4 fe ff ff"));
+        assert_eq!(encode(|a| a.load_sized_at(Rax, Addr::indexed(Rbx, Rcx, 0, 0), 1, false)), hex("0f b6 04 0b"));
+        assert_eq!(encode(|a| a.load_sized_at(R8, Addr::indexed(R12, R15, 2, 8), 4, true)), hex("4f 63 44 bc 08"));
+        assert_eq!(encode(|a| a.load_sized_at(Rsi, Addr::indexed(Rax, R10, 3, 0), 8, false)), hex("4a 8b 34 d0"));
+        assert_eq!(encode(|a| a.load_sized_at(Rdi, Addr::indexed(R9, Rdx, 1, 2), 2, true)), hex("49 0f bf 7c 51 02"));
+        assert_eq!(encode(|a| a.store_sized_at(Addr::indexed(Rdi, Rsi, 0, 0), Rsi, 1)), hex("40 88 34 37"));
+        assert_eq!(encode(|a| a.store_sized_at(Addr::indexed(R8, Rax, 2, 4), R10, 4)), hex("45 89 54 80 04"));
+        assert_eq!(encode(|a| a.store_sized_at(Addr::indexed(Rax, R11, 1, 0), Rcx, 2)), hex("66 42 89 0c 58"));
+        assert_eq!(encode(|a| a.store_sized_at(Addr::indexed(R13, Rbx, 3, 0), R15, 8)), hex("4d 89 7c dd 00"));
+        assert_eq!(encode(|a| a.alu_rm(Alu::Add, Rax, Addr::base(Rbp, -16))), hex("48 03 45 f0"));
+        assert_eq!(encode(|a| a.alu_rm(Alu::Cmp, R9, Addr::base(Rbp, -200))), hex("4c 3b 8d 38 ff ff ff"));
+        assert_eq!(encode(|a| a.alu_rm(Alu::Sub, Rsi, Addr::base(R12, 0))), hex("49 2b 34 24"));
+        assert_eq!(encode(|a| a.alu_rm(Alu::Xor, R14, Addr::base(Rax, 8))), hex("4c 33 70 08"));
+        assert_eq!(encode(|a| a.cmp_mi(Addr::base(Rbp, -24), 100)), hex("48 83 7d e8 64"));
+        assert_eq!(encode(|a| a.cmp_mi(Addr::base(Rbp, -24), 1000)), hex("48 81 7d e8 e8 03 00 00"));
+        assert_eq!(encode(|a| a.imul_ri(Rsi, R8, 12)), hex("49 6b f0 0c"));
+    }
+
+    #[test]
+    fn jumps_are_relaxed_like_gnu_as() {
+        use Reg::*;
+        let mut a = Assembler::new();
+        let top = a.new_label();
+        let mid = a.new_label();
+        let end = a.new_label();
+        a.bind(top);
+        a.alu_ri(Alu::Add, Rax, 1);
+        a.alu_ri(Alu::Cmp, Rax, 10);
+        a.jcc(Cond::B, top);
+        a.jcc(Cond::E, mid);
+        a.jmp(end);
+        for _ in 0..30 {
+            a.mov_ri(Rcx, 0x12345678);
+        }
+        a.bind(mid);
+        a.jcc(Cond::NE, top);
+        a.jmp(top);
+        a.alu_ri(Alu::Sub, Rdx, 1);
+        a.bind(end);
+        a.ret();
+        a.relax();
+        a.link(0, 0, 0);
+        assert_eq!(a.code, hex("48 83 c0 01 48 83 f8 0a 72 f6 0f 84 9b 00 00 00 e9 a5 00 00 00 b9 78 56 34 12 b9 78 56 34 12 b9 78 56 34 12 b9 78 56 34 12 b9 78 56 34 12 b9 78 56 34 12 b9 78 56 34 12 b9 78 56 34 12 b9 78 56 34 12 b9 78 56 34 12 b9 78 56 34 12 b9 78 56 34 12 b9 78 56 34 12 b9 78 56 34 12 b9 78 56 34 12 b9 78 56 34 12 b9 78 56 34 12 b9 78 56 34 12 b9 78 56 34 12 b9 78 56 34 12 b9 78 56 34 12 b9 78 56 34 12 b9 78 56 34 12 b9 78 56 34 12 b9 78 56 34 12 b9 78 56 34 12 b9 78 56 34 12 b9 78 56 34 12 b9 78 56 34 12 b9 78 56 34 12 0f 85 4f ff ff ff e9 4a ff ff ff 48 83 ea 01 c3"));
+    }
+
+    #[test]
+    fn jump_to_the_next_instruction_is_removed() {
+        let mut a = Assembler::new();
+        let next = a.new_label();
+        let back = a.new_label();
+        a.bind(back);
+        a.jmp(next);
+        a.bind(next);
+        a.jcc(Cond::E, back);
+        a.ret();
+        a.relax();
+        a.link(0, 0, 0);
+        assert_eq!(a.code, hex("74 fe c3"));
+        assert_eq!(a.offset_of(next), 0);
+    }
+
+    #[test]
+    fn rep_strings_and_sse2() {
+        use psycoc::Addr;
+        use Reg::*;
+        assert_eq!(encode(|a| a.rep_stosw()), hex("66 f3 ab"));
+        assert_eq!(encode(|a| a.rep_stosd()), hex("f3 ab"));
+        assert_eq!(encode(|a| a.rep_stosq()), hex("f3 48 ab"));
+        assert_eq!(encode(|a| a.rep_movsq()), hex("f3 48 a5"));
+        assert_eq!(encode(|a| a.movd_xmm_r(0, Rax)), hex("66 0f 6e c0"));
+        assert_eq!(encode(|a| a.movd_xmm_r(9, R10)), hex("66 45 0f 6e ca"));
+        assert_eq!(encode(|a| a.pshufd(0, 0, 0)), hex("66 0f 70 c0 00"));
+        assert_eq!(encode(|a| a.pshufd(12, 3, 0x1b)), hex("66 44 0f 70 e3 1b"));
+        assert_eq!(encode(|a| a.movdqu_load(0, Addr::base(Rsi, 0))), hex("f3 0f 6f 06"));
+        assert_eq!(encode(|a| a.movdqu_load(3, Addr::base(Rsi, 48))), hex("f3 0f 6f 5e 30"));
+        assert_eq!(encode(|a| a.movdqu_load(11, Addr::base(R12, 16))), hex("f3 45 0f 6f 5c 24 10"));
+        assert_eq!(encode(|a| a.movdqu_store(Addr::base(Rdi, 0), 0)), hex("f3 0f 7f 07"));
+        assert_eq!(encode(|a| a.movdqu_store(Addr::base(Rsp, 32), 2)), hex("f3 0f 7f 54 24 20"));
+        assert_eq!(encode(|a| a.movdqu_store(Addr::indexed(R13, Rax, 2, -16), 15)), hex("f3 45 0f 7f 7c 85 f0"));
+    }
 }

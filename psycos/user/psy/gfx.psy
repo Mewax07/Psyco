@@ -1,0 +1,189 @@
+/// Wiki Doc sources:
+///   - https://wiki.osdev.org/Drawing_In_a_Linear_Framebuffer
+///   - https://wiki.osdev.org/VGA_Fonts
+
+#![trusted]
+
+import "../../src/font.psy"
+
+struct Canvas {
+    base: u64,
+    width: i64,
+    height: i64,
+    stride: i64,
+}
+
+struct Rect {
+	x: i64,
+	y: i64,
+	w: i64,
+	h: i64,
+}
+
+fn rect(x: i64, y: i64, w: i64, h: i64) -> Rect {
+    return Rect { x: x, y: y, w: w, h: h }
+}
+
+fn canvas(base: u64, width: i64, height: i64, stride: i64) -> Canvas {
+    return Canvas { base: base, width: width, height: height, stride: stride }
+}
+
+fn bounds(c: &Canvas) -> Rect {
+    return Rect { x: 0, y: 0, w: c.width, h: c.height }
+}
+
+fn min(a: i64, b: i64) -> i64 {
+    if a < b {
+        return a
+    }
+    return b
+}
+
+fn max(a: i64, b: i64) -> i64 {
+    if a > b {
+        return a
+    }
+    return b
+}
+
+fn intersect(a: Rect, b: Rect) -> Rect {
+    let x0 = max(a.x, b.x)
+    let y0 = max(a.y, b.y)
+    let x1 = min(a.x + a.w, b.x + b.w)
+    let y1 = min(a.y + a.h, b.y + b.h)
+    if x1 <= x0 || y1 <= y0 {
+        return Rect { x: x0, y: y0, w: 0, h: 0 }
+    }
+    return Rect { x: x0, y: y0, w: x1 - x0, h: y1 - y0 }
+}
+
+fn union(a: Rect, b: Rect) -> Rect {
+    if is_empty(a) {
+        return b
+    }
+    if is_empty(b) {
+        return a
+    }
+    let x0 = min(a.x, b.x)
+    let y0 = min(a.y, b.y)
+    let x1 = max(a.x + a.w, b.x + b.w)
+    let y1 = max(a.y + a.h, b.y + b.h)
+    return Rect { x: x0, y: y0, w: x1 - x0, h: y1 - y0 }
+}
+
+fn is_empty(r: Rect) -> bool {
+    return r.w <= 0 || r.h <= 0
+}
+
+fn contains(r: Rect, x: i64, y: i64) -> bool {
+    return x >= r.x && y >= r.y && x < r.x + r.w && y < r.y + r.h
+}
+
+fn row(c: &Canvas, x: i64, y: i64) -> *mut u32 {
+    return (c.base + ((y * c.stride + x) * 4) as u64) as *mut u32
+}
+
+fn pixel(c: &Canvas, x: i64, y: i64) -> u32 {
+    if !contains(bounds(c), x, y) {
+        return 0
+    }
+    return row(c, x, y).read()
+}
+
+fn put(c: &Canvas, x: i64, y: i64, color: u32) {
+    if contains(bounds(c), x, y) {
+        row(c, x, y).write(color)
+    }
+}
+
+fn fill(c: &Canvas, r: Rect, clip: Rect, color: u32) {
+    let a = intersect(intersect(r, clip), bounds(c))
+    if is_empty(a) {
+        return
+    }
+    for y in a.y..a.y + a.h {
+        memset32(row(c, a.x, y), color, a.w as usize)
+    }
+}
+
+fn disc(c: &Canvas, cx: i64, cy: i64, radius: i64, clip: Rect, color: u32) {
+    let mut half = radius
+    for dy in 0..radius + 1 {
+        while half > 0 && half * half + dy * dy > radius * radius {
+            half -= 1
+        }
+        fill(c, rect(cx - half, cy - dy, half * 2 + 1, 1), clip, color)
+        if dy > 0 {
+            fill(c, rect(cx - half, cy + dy, half * 2 + 1, 1), clip, color)
+        }
+    }
+}
+
+fn frame(c: &Canvas, r: Rect, clip: Rect, color: u32) {
+    fill(c, rect(r.x, r.y, r.w, 1), clip, color)
+    fill(c, rect(r.x, r.y + r.h - 1, r.w, 1), clip, color)
+    fill(c, rect(r.x, r.y, 1, r.h), clip, color)
+    fill(c, rect(r.x + r.w - 1, r.y, 1, r.h), clip, color)
+}
+
+fn blit(dst: &Canvas, dx: i64, dy: i64, src: &Canvas, clip: Rect) {
+    let placed = rect(dx, dy, src.width, src.height)
+    let a = intersect(intersect(placed, clip), bounds(dst))
+    if is_empty(a) {
+        return
+    }
+    for y in a.y..a.y + a.h {
+        memcpy(row(dst, a.x, y) as *mut u8, row(src, a.x - dx, y - dy) as *const u8, (a.w * 4) as usize)
+    }
+}
+
+fn copy(dst: &Canvas, src: &Canvas, r: Rect) {
+    let a = intersect(intersect(r, bounds(dst)), bounds(src))
+    if is_empty(a) {
+        return
+    }
+    for y in a.y..a.y + a.h {
+        memcpy(row(dst, a.x, y) as *mut u8, row(src, a.x, y) as *const u8, (a.w * 4) as usize)
+    }
+}
+
+fn glyph(c: &Canvas, x: i64, y: i64, ch: u8, fg: u32, bg: u32, clip: Rect) {
+    let mut code = ch as usize
+    if code >= 128 {
+        code = 63
+    }
+    let area = intersect(intersect(rect(x, y, font_w as i64, font_h as i64), clip), bounds(c))
+    if is_empty(area) {
+        return
+    }
+    for gy in area.y..area.y + area.h {
+        let bits = font[code * font_h + (gy - y) as usize]
+        let p = row(c, area.x, gy)
+        for gx in area.x..area.x + area.w {
+            let bit = 0x80u8 >> (gx - x) as u8
+            if bits & bit != 0 {
+                p.add((gx - area.x) as usize).write(fg)
+            } else {
+                p.add((gx - area.x) as usize).write(bg)
+            }
+        }
+    }
+}
+
+fn text(c: &Canvas, x: i64, y: i64, s: &[u8], fg: u32, bg: u32, clip: Rect) {
+    for i in 0..s.len() {
+        glyph(c, x + (i * font_w) as i64, y, s[i], fg, bg, clip)
+    }
+}
+
+fn text_width(s: &[u8]) -> i64 {
+    return (s.len() * font_w) as i64
+}
+
+fn char_w() -> i64 {
+    return font_w as i64
+}
+
+fn char_h() -> i64 {
+    return font_h as i64
+}

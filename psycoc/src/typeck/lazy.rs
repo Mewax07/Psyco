@@ -77,6 +77,11 @@ fn stmt(s: &Stmt, out: &mut HashSet<String>) {
                 block(b, out);
             }
         }
+
+        Stmt::LetElse { value, else_block, .. } => {
+            expr(value, out);
+            block(else_block, out);
+        }
         Stmt::WhileLet { value, body, .. } => {
             expr(value, out);
             block(body, out);

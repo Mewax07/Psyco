@@ -1,0 +1,24 @@
+/// Wiki Doc sources:
+///   - https://doc.rust-lang.org/std/primitive.slice.html
+
+const bytes_page: u64 = 4096
+
+fn bytes_equal(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false
+    }
+    for i in 0..a.len() {
+        if a[i] != b[i] {
+            return false
+        }
+    }
+    return true
+}
+
+fn bytes_start_with(a: &[u8], prefix: &[u8]) -> bool {
+    return a.len() >= prefix.len() && bytes_equal(&a[..prefix.len()], prefix)
+}
+
+fn pages_for(bytes: u64) -> u64 {
+    return (bytes + bytes_page - 1) / bytes_page
+}

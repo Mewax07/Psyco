@@ -1,17 +1,11 @@
 /// Wiki Doc sources:
 ///   - https://wiki.osdev.org/Drawing_In_a_Linear_Framebuffer
 ///   - https://wiki.osdev.org/VGA_Fonts
-///
-/// Text console drawn in the framebuffer (normal code, not trusted).
-/// Grid of font_w x font_h cells, underline cursor, line wrap and scrolling.
-/// Everything is also copied to the serial port, so the kernel can be
-/// followed from a terminal (and tested automatically).
 
 import "fb.psy"
 import "font.psy"
 import "serial.psy"
 
-// Palette (0xRRGGBB), close to the 16 VGA colors.
 const black: u32 = 0x000000
 const gray: u32 = 0xAAAAAA
 const dark_gray: u32 = 0x555555
@@ -41,7 +35,6 @@ static mut con_ready: bool = false
 #[setter]
 static mut con_mirror: bool = true
 
-/// Sets up the grid; without a framebuffer, only the serial copy works.
 fn con_init(has_fb: bool) {
     if has_fb {
         con_cols = get_fb_width() / font_w
@@ -51,7 +44,6 @@ fn con_init(has_fb: bool) {
     clear()
 }
 
-/// Clears the screen and moves the cursor home.
 fn clear() {
     con_x = 0
     con_y = 0
@@ -63,18 +55,15 @@ fn clear() {
     }
 }
 
-/// Sets the text color.
 fn set_color(fg: u32) {
     con_fg = fg
 }
 
-/// Sets the text and background colors.
 fn set_colors(fg: u32, bg: u32) {
     con_fg = fg
     con_bg = bg
 }
 
-/// Draws (or erases) the underline cursor.
 fn draw_cursor(color: u32) {
     if !con_ready {
         return
@@ -82,7 +71,6 @@ fn draw_cursor(color: u32) {
     fill_rect(con_x * font_w, con_y * font_h + font_h - cursor_height, font_w, cursor_height, color)
 }
 
-/// Draws one character in a cell.
 fn draw_glyph(c: u8, col: usize, row: usize) {
     let mut code = c as usize
     if code >= 128 {
@@ -102,7 +90,6 @@ fn draw_glyph(c: u8, col: usize, row: usize) {
     }
 }
 
-/// Goes to the next line, scrolling at the bottom.
 fn newline() {
     con_x = 0
     if con_y + 1 < con_rows {
@@ -112,7 +99,6 @@ fn newline() {
     }
 }
 
-/// Prints one character (\n, \r, \t and backspace included).
 fn putc(c: u8) {
     if con_mirror {
         serial_putc(c)
@@ -146,7 +132,6 @@ fn putc(c: u8) {
     fb_batch_end()
 }
 
-/// Prints a string.
 fn puts(s: Str) {
     fb_batch_begin()
     let bytes = s.as_bytes()
@@ -156,7 +141,6 @@ fn puts(s: Str) {
     fb_batch_end()
 }
 
-/// Prints an unsigned number in decimal.
 fn put_u64(n: u64) {
     let mut digits = [0u8; 20]
     let mut count: usize = 0
@@ -175,18 +159,15 @@ fn put_u64(n: u64) {
     }
 }
 
-/// Prints a signed number in decimal.
 fn put_i64(n: i64) {
     if n < 0 {
         putc('-')
-        // -(n + 1) + 1 avoids overflowing on i64::MIN.
         put_u64((-(n + 1)) as u64 + 1)
     } else {
         put_u64(n as u64)
     }
 }
 
-/// Prints a number in hex, without leading zeros.
 fn put_hex(n: u64) {
     let mut shift: u64 = 64
     let mut started = false
@@ -200,7 +181,6 @@ fn put_hex(n: u64) {
     }
 }
 
-/// Prints a number in hex on exactly `digits` digits.
 fn put_hex_width(n: u64, digits: u64) {
     let mut shift = digits * 4
     while shift > 0 {
@@ -209,7 +189,6 @@ fn put_hex_width(n: u64, digits: u64) {
     }
 }
 
-/// Prints one hex digit.
 fn put_hex_digit(d: u8) {
     if d < 10 {
         putc('0' + d)

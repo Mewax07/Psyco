@@ -1,0 +1,56 @@
+/// Wiki Doc sources:
+///   - https://wiki.osdev.org/Shared_Memory
+
+#![trusted]
+
+import "psy/sys.psy" as sys
+import "psy/abi.psy" as abi
+
+const width: u64 = 64
+const height: u64 = 32
+
+fn find(name: Str) -> u64 {
+    for i in 0..100u64 {
+        let id = sys::lookup(name)
+        if id >= 0 {
+            return id as u64
+        }
+        sys::sleep_ms(10)
+    }
+    exit(3)
+    return 0
+}
+
+fn main() {
+    let server = find("compositor")
+    let reply = sys::port_create() as u64
+    let id = sys::surface_create(width, height)
+    print("surface:", id > 0)
+    let base = sys::surface_map(id as u64)
+    print("mapped:", base > 0, sys::surface_map(id as u64) == base)
+    let p = base as *mut u32
+    for i in 0..(width * height) as usize {
+        p.add(i).write((i * 3) as u32)
+    }
+    print("share:", sys::surface_share(id as u64, server))
+    let other = sys::surface_create(width, 1)
+
+    let mut q = sys::Message { sender: 0, kind: 1, data: [0u64; 6] }
+    q.data[0] = other as u64
+    q.data[1] = reply
+    sys::send(server, &q)
+    let mut r = sys::Message { sender: 0, kind: 0, data: [0u64; 6] }
+    sys::recv(reply, &mut r)
+    print("compositor read:", r.data[0])
+    print("not shared with it:", r.data[1] as i64 == -abi::err_perm)
+    print("size seen:", r.data[2] & 0xFFFFFFFF, r.data[2] >> 32)
+    print("only the owner destroys:", r.data[3] as i64 == -abi::err_perm)
+    print("written by the compositor:", p.read() == 0xCAFE)
+
+    print("bad id:", sys::surface_map(0x7F0F) == -abi::err_badf, sys::surface_share(0x7F0F, server) == -abi::err_badf)
+    print("bad size:", sys::surface_create(0, 10) == -abi::err_inval, sys::surface_create(5000, 5000) == -abi::err_inval)
+    print("destroy:", sys::surface_destroy(id as u64))
+    p.add(1).write(7)
+    print("still mapped:", p.add(1).read())
+    print("unmap:", sys::surface_unmap(id as u64), sys::surface_destroy(other as u64))
+}

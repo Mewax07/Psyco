@@ -489,6 +489,12 @@ pub enum Stmt {
         body: Block,
         span: Span,
     },
+    LetElse {
+        pat: Pattern,
+        value: Expr,
+        else_block: Block,
+        span: Span,
+    },
     Block(Block),
 }
 

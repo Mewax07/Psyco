@@ -1,11 +1,8 @@
 /// Wiki Doc sources:
-///   - https://wiki.osdev.org/Getting_to_Ring_3
-///
-/// User program: says hello from ring 3. Compiled by psycoc as a Linux
-/// executable and embedded in the kernel (see programs.psy).
+///   - https://man7.org/linux/man-pages/man2/write.2.html
+///   - https://man7.org/linux/man-pages/man2/getpid.2.html
 
-/// Prints a greeting and the process id.
 fn main() {
-    print("hello from ring 3")
-    print("pid:", syscall(39, 0, 0, 0))
+    let pid = syscall(39, 0, 0, 0)
+    print("hello from ring 3, pid", pid)
 }

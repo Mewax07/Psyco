@@ -588,6 +588,17 @@ impl Server {
             }
             return Ok(markdown(text));
         }
+        // `as` of `import "file.psy" as m`, not a cast.
+        if word == "as"
+            && tok >= 2
+            && matches!(an.kind(tok - 1), psycoc::TokenKind::Str(_))
+            && *an.kind(tok - 2) == psycoc::TokenKind::Import
+        {
+            return Ok(markdown(
+                "`as` (import): makes the file a module. Its items are reached as `m::item` and do not clash with names of other files."
+                    .into(),
+            ));
+        }
         Ok(builtins::keyword_doc(&word).and_then(|doc| markdown(format!("`{word}`: {doc}"))))
     }
 
@@ -628,7 +639,14 @@ impl Server {
         let locations: Vec<Location> = world
             .resolve(0, tok)
             .into_iter()
-            .filter_map(|t| location(&world, t.unit, world.def(t).tok))
+            .filter_map(|t| match imported_unit(&world, t) {
+                // An `import ... as m` alias: the file itself.
+                Some(u) => Some(Location {
+                    uri: parse_uri(&world.units[u].uri)?,
+                    range: Range::default(),
+                }),
+                None => location(&world, t.unit, world.def(t).tok),
+            })
             .collect();
         Ok((!locations.is_empty()).then_some(GotoDefinitionResponse::Array(locations)))
     }
@@ -823,7 +841,7 @@ impl Server {
                     let item_snippet = matches!(
                         *label,
                         "fn" | "fn ->" | "main" | "struct" | "enum" | "impl" | "impl for" | "trait"
-                            | "mod" | "const" | "static" | "static mut" | "import"
+                            | "mod" | "const" | "static" | "static mut" | "import" | "import as"
                     );
                     let in_body_too = matches!(*label, "fn" | "fn ->");
                     if item_snippet != top_level && !in_body_too {
@@ -1053,6 +1071,18 @@ fn syscall_note(world: &World, tok: usize) -> Option<String> {
     Some(format!("Linux x86-64 system call {number}: `{call}`"))
 }
 
+/// The unit of the file an `import "..." as m` alias names.
+fn imported_unit(world: &World, target: Target) -> Option<usize> {
+    let d = world.def(target);
+    if d.kind != DefKind::Module || !d.detail.starts_with("import ") {
+        return None;
+    }
+    world
+        .units
+        .iter()
+        .position(|u| u.alias.as_deref() == Some(d.name.as_str()))
+}
+
 fn describe(world: &World, target: Target) -> String {
     let unit = &world.units[target.unit];
     let d = world.def(target);
@@ -1084,6 +1114,7 @@ fn describe(world: &World, target: Target) -> String {
             }
         }
         DefKind::TypeParam => format!("type parameter of `{owner}`"),
+        DefKind::Module if imported_unit(world, target).is_some() => "file imported as a module".into(),
         DefKind::Module => "module".into(),
         DefKind::Local if binding => "bound by a pattern".into(),
         DefKind::Param => "parameter".into(),
@@ -1111,7 +1142,12 @@ fn describe(world: &World, target: Target) -> String {
     if let Some(m) = d.module.as_ref().filter(|_| d.kind != DefKind::Module) {
         text.push_str(&format!("\n\nIn `mod {m}`"));
     }
-    if let Some(doc) = unit.an.doc_comment(d) {
+    if let Some(u) = imported_unit(world, target) {
+        // An alias: what the imported file says about itself.
+        if let Some(doc) = analysis::header_comment(&world.units[u].an.text) {
+            text.push_str(&format!("\n\n{doc}"));
+        }
+    } else if let Some(doc) = unit.an.doc_comment(d) {
         text.push_str(&format!("\n\n{doc}"));
     }
     if target.unit != 0 {

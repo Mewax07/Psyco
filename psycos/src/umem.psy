@@ -1,0 +1,112 @@
+/// Wiki Doc sources:
+///   - https://man7.org/linux/man-pages/man2/brk.2.html
+///   - https://man7.org/linux/man-pages/man2/mmap.2.html
+///   - https://wiki.osdev.org/Paging
+
+import "sched.psy"
+import "bytes.psy"
+import "paging.psy"
+import "pmm.psy"
+import "usermode.psy"
+import "../user/psy/abi.psy" as abi
+
+const mmap_base: u64 = 0x0000400000000000
+const mmap_limit: u64 = 0x0000600000000000
+const brk_max: u64 = 0x40000000
+
+const prot_write: u64 = 0x2
+const map_private: u64 = 0x02
+const map_fixed: u64 = 0x10
+const map_anonymous: u64 = 0x20
+
+static mut brk_start: [u64; 16]
+static mut brk_end: [u64; 16]
+static mut mmap_next: [u64; 16]
+static mut dyn_pages: [u64; 16]
+
+fn page_up(addr: u64) -> u64 {
+    return (addr + size_4k - 1) & ~(size_4k - 1)
+}
+
+fn umem_init(slot: usize, image_end: u64) {
+    brk_start[slot] = page_up(image_end)
+    brk_end[slot] = brk_start[slot]
+    mmap_next[slot] = mmap_base
+    dyn_pages[slot] = 0
+}
+
+fn umem_pages(slot: usize) -> u64 {
+    return dyn_pages[slot]
+}
+
+fn map_range(slot: usize, start: u64, end: u64, writable: bool) -> bool {
+    let root = read_cr3()
+    let mut va = start
+    while va < end {
+        if user_page(root, va, writable) == 0 {
+            unmap_range(slot, start, va)
+            return false
+        }
+        dyn_pages[slot] += 1
+        va += size_4k
+    }
+    return true
+}
+
+fn unmap_range(slot: usize, start: u64, end: u64) {
+    let root = read_cr3()
+    let mut va = start
+    while va < end {
+        let phys = translate_in(root, va)
+        if phys != not_mapped && unmap_page_in(root, va) {
+            pmm_free_page(phys & ~(size_4k - 1))
+            dyn_pages[slot] -= 1
+        }
+        va += size_4k
+    }
+}
+
+fn sys_brk(addr: u64) -> i64 {
+    let slot = get_current()
+    let cur = brk_end[slot]
+    if addr < brk_start[slot] || addr > brk_start[slot] + brk_max {
+        return cur as i64
+    }
+    let old_top = page_up(cur)
+    let new_top = page_up(addr)
+    if new_top > old_top {
+        if !map_range(slot, old_top, new_top, true) {
+            return cur as i64
+        }
+    } else if new_top < old_top {
+        unmap_range(slot, new_top, old_top)
+    }
+    brk_end[slot] = addr
+    return addr as i64
+}
+
+fn sys_mmap(len: u64, prot: u64, flags: u64) -> i64 {
+    let slot = get_current()
+    if len == 0 || flags & map_anonymous == 0 || flags & map_private == 0 || flags & map_fixed != 0 {
+        return -abi::err_inval
+    }
+    let size = page_up(len)
+    let start = mmap_next[slot]
+    if size > mmap_limit - start {
+        return -abi::err_nomem
+    }
+    if !map_range(slot, start, start + size, prot & prot_write != 0) {
+        return -abi::err_nomem
+    }
+    mmap_next[slot] = start + size
+    return start as i64
+}
+
+fn sys_munmap(addr: u64, len: u64) -> i64 {
+    let slot = get_current()
+    if addr & (size_4k - 1) != 0 || len == 0 || addr < mmap_base || addr >= mmap_next[slot] || page_up(len) > mmap_next[slot] - addr {
+        return -abi::err_inval
+    }
+    unmap_range(slot, addr, addr + page_up(len))
+    return 0
+}

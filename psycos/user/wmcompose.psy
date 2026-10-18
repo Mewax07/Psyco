@@ -1,0 +1,84 @@
+/// Wiki Doc sources:
+///   - https://wiki.osdev.org/Message_Passing
+
+import "psy/sys.psy" as sys
+import "psy/gfx.psy" as gfx
+import "psy/wm.psy" as wm
+
+const red: u32 = 0xC03030
+const blue: u32 = 0x3050C0
+
+static mut server: u64 = 0
+static mut events: u64 = 0
+
+fn find_server() -> u64 {
+    for i in 0..200u64 {
+        let id = sys::lookup("window")
+        if id >= 0 {
+            return id as u64
+        }
+        sys::sleep_ms(10)
+    }
+    exit(3)
+    return 0
+}
+
+fn send(kind: u64, a: u64, b: u64, c: u64, d: u64, e: u64) {
+    let mut m = sys::Message { sender: 0, kind: kind, data: [0u64; 6] }
+    m.data[0] = a
+    m.data[1] = b
+    m.data[2] = c
+    m.data[3] = d
+    m.data[4] = e
+    sys::send(server, &m)
+}
+
+fn await_kind(kind: u64, r: &mut sys::Message) {
+    loop {
+        sys::recv(events, r)
+        if r.kind == kind {
+            return
+        }
+    }
+}
+
+fn open(w: u64, h: u64, x: u64, y: u64, color: u32) -> u64 {
+    let s = sys::surface_create(w, h) as u64
+    let base = sys::surface_map(s) as u64
+    let c = gfx::canvas(base, w as i64, h as i64, w as i64)
+    gfx::fill(&c, gfx::bounds(&c), gfx::bounds(&c), color)
+    sys::surface_share(s, server)
+    send(wm::create, s, events, x, y, 0)
+    let mut r = sys::Message { sender: 0, kind: 0, data: [0u64; 6] }
+    await_kind(wm::created, &mut r)
+    return r.data[0]
+}
+
+fn probe(x: u64, y: u64) {
+    send(wm::probe, x, y, events, 0, 0)
+    let mut r = sys::Message { sender: 0, kind: 0, data: [0u64; 6] }
+    await_kind(wm::probe_reply, &mut r)
+    print("probe", x, y, ":", r.data[0], "window", r.data[1], "on screen", r.data[2] == r.data[0])
+}
+
+fn main() {
+    server = find_server()
+    events = sys::port_create() as u64
+    let a = open(200, 150, 50, 40, red)
+    let b = open(120, 100, 150, 100, blue)
+    print("windows:", a, b)
+    probe(10, 10)
+    probe(60, 50)
+    probe(200, 120)
+    send(wm::raise, a, 0, 0, 0, 0)
+    probe(200, 120)
+    send(wm::destroy, a, 0, 0, 0, 0)
+    probe(200, 120)
+    probe(60, 50)
+    send(wm::move_to, b, 400, 300, 0, 0)
+    probe(200, 120)
+    probe(410, 310)
+    send(wm::crash, 0, 0, 0, 0, 0)
+    sys::sleep_ms(100)
+    print("server alive:", sys::lookup("window") >= 0)
+}

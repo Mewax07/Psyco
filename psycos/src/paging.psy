@@ -3,22 +3,11 @@
 ///   - https://wiki.osdev.org/Identity_Paging
 ///   - https://wiki.osdev.org/Higher_Half_Kernel
 ///   - https://wiki.osdev.org/X86_Page_Tables
-///
-/// The kernel's own 4-level page tables (x86-64 long mode).
-///
-///   0x0000000000000000  identity map of physical memory (2 MiB pages)
-///   0xFFFF800000000000  same physical memory again ("direct map"), shares
-///                       the identity tables; it will stay when the low half
-///                       goes to user programs (phase 4)
-///   0xFFFFFFFF80000000  the kernel image (4 KiB pages), where the kernel
-///                       runs after enter_higher_half()
-///
-/// Page tables are reached through the identity map, which is valid with
-/// both the firmware tables and ours.
 
 #![trusted]
 
 import "efi.psy"
+import "bytes.psy"
 import "fb.psy"
 import "pmm.psy"
 import "stack.psy"
@@ -31,6 +20,7 @@ const pte_writable: u64 = 0x2
 const pte_user: u64 = 0x4
 const pte_huge: u64 = 0x80
 const pte_global: u64 = 0x100
+const pte_shared: u64 = 0x200
 const pte_addr_mask: u64 = 0x000FFFFFFFFFF000
 
 const entries_per_table: u64 = 512
@@ -38,8 +28,6 @@ const size_4k: u64 = 0x1000
 const size_2m: u64 = 0x200000
 const size_1g: u64 = 0x40000000
 
-// The identity map covers at least 4 GiB (MMIO hole, framebuffer, APICs)
-// and at most 512 GiB (one PDPT).
 const identity_min: u64 = 0x100000000
 const identity_max: u64 = 0x8000000000
 
@@ -61,8 +49,6 @@ static mut table_pages: u64 = 0
 #[getter]
 static mut paging_ready: bool = false
 
-/// Pointer to a physical page: through the direct map once our tables are
-/// live (it exists in every address space), through the identity before.
 fn phys_ptr(phys: u64) -> *mut u64 {
     if paging_ready {
         return (direct_map_base + phys) as *mut u64
@@ -70,7 +56,6 @@ fn phys_ptr(phys: u64) -> *mut u64 {
     return phys as *mut u64
 }
 
-/// Allocates a zeroed page for a page table.
 fn new_table() -> u64 {
     let page = pmm_alloc_page()
     if page == 0 {
@@ -81,25 +66,19 @@ fn new_table() -> u64 {
     return page
 }
 
-/// Gives a page-table page back to the PMM.
 fn free_table(table: u64) {
     pmm_free_page(table)
     table_pages -= 1
 }
 
-/// Entry `index` of the table at physical address `table`.
 fn entry(table: u64, index: u64) -> *mut u64 {
     return phys_ptr(table).add(index as usize)
 }
 
-/// Index into the table of `level` (3 = PML4, 2 = PDPT, 1 = PD, 0 = PT).
 fn table_index(virt: u64, level: u64) -> u64 {
     return (virt >> (12 + 9 * level)) & (entries_per_table - 1)
 }
 
-/// Next-level table of an entry, created if missing (0 if it is a huge
-/// page). `user` also opens the entry to ring 3: the CPU checks the user
-/// bit at every level.
 fn next_table(table: u64, index: u64, create: bool, user: bool) -> u64 {
     let e = entry(table, index)
     let value = e.read()
@@ -124,16 +103,12 @@ fn next_table(table: u64, index: u64, create: bool, user: bool) -> u64 {
     return value & pte_addr_mask
 }
 
-/// Flushes one address from the TLB if `root` is the active address space.
 fn flush(root: u64, virt: u64) {
     if paging_ready && read_cr3() == root {
         invlpg(virt as usize)
     }
 }
 
-/// Maps one 4 KiB page `virt` -> `phys` in the address space `root`, with
-/// exactly `flags` (pte_writable, pte_user...; present is added).
-/// False if the address is already covered by a 2 MiB page.
 fn map_page_in(root: u64, virt: u64, phys: u64, flags: u64) -> bool {
     if virt % size_4k != 0 || phys % size_4k != 0 {
         panic("map_page: unaligned address")
@@ -153,12 +128,10 @@ fn map_page_in(root: u64, virt: u64, phys: u64, flags: u64) -> bool {
     return true
 }
 
-/// Maps one writable kernel page (plus extra `flags`).
 fn map_page(virt: u64, phys: u64, flags: u64) -> bool {
     return map_page_in(pml4_phys, virt, phys, flags | pte_writable)
 }
 
-/// Leaf entry of `virt` in `root` (null if any level is missing or huge).
 fn leaf_entry(root: u64, virt: u64) -> *mut u64 {
     let pdpt = next_table(root, table_index(virt, 3), false, false)
     if pdpt == 0 {
@@ -175,7 +148,6 @@ fn leaf_entry(root: u64, virt: u64) -> *mut u64 {
     return entry(pt, table_index(virt, 0))
 }
 
-/// Removes the 4 KiB mapping of `virt` in `root` (false if not mapped).
 fn unmap_page_in(root: u64, virt: u64) -> bool {
     let e = leaf_entry(root, virt)
     if e.is_null() || e.read() & pte_present == 0 {
@@ -186,12 +158,10 @@ fn unmap_page_in(root: u64, virt: u64) -> bool {
     return true
 }
 
-/// Removes a kernel 4 KiB mapping.
 fn unmap_page(virt: u64) -> bool {
     return unmap_page_in(pml4_phys, virt)
 }
 
-/// Physical address behind `virt` in `root`, or not_mapped.
 fn translate_in(root: u64, virt: u64) -> u64 {
     let mut table = root
     let mut level: u64 = 3
@@ -210,12 +180,10 @@ fn translate_in(root: u64, virt: u64) -> u64 {
     }
 }
 
-/// Physical address behind a kernel `virt`, or not_mapped.
 fn translate(virt: u64) -> u64 {
     return translate_in(pml4_phys, virt)
 }
 
-/// True if ring 3 may access `virt` in `root` (and write it if `write`).
 fn user_page_ok(root: u64, virt: u64, write: bool) -> bool {
     let mut table = root
     let mut level: u64 = 3
@@ -235,7 +203,6 @@ fn user_page_ok(root: u64, virt: u64, write: bool) -> bool {
     }
 }
 
-/// New address space: empty lower half, kernel half shared with ours.
 fn as_create() -> u64 {
     let root = new_table()
     for i in pml4_direct_map_slot as u64..entries_per_table {
@@ -244,8 +211,6 @@ fn as_create() -> u64 {
     return root
 }
 
-/// Frees an address space: every user page, its tables and the root.
-/// The kernel half is shared and stays. Never the active one.
 fn as_destroy(root: u64) {
     if root == pml4_phys || root == read_cr3() {
         panic("as_destroy: address space still in use")
@@ -267,7 +232,7 @@ fn as_destroy(root: u64) {
                 }
                 for l in 0..entries_per_table {
                     let value = entry(pt, l).read()
-                    if value & pte_present != 0 {
+                    if value & pte_present != 0 && value & pte_shared == 0 {
                         pmm_free_page(value & pte_addr_mask)
                     }
                 }
@@ -280,9 +245,6 @@ fn as_destroy(root: u64) {
     free_table(root)
 }
 
-/// End of the physical range to identity map: RAM, firmware areas and
-/// the framebuffer (not reserved ranges or MMIO windows), rounded up to
-/// 1 GiB, between 4 GiB and 512 GiB.
 fn physical_limit() -> u64 {
     let mut limit = identity_min
     for i in 0..memory_map_entries() {
@@ -307,16 +269,13 @@ fn physical_limit() -> u64 {
     return limit
 }
 
-/// Kernel address space root.
 fn kernel_root() -> u64 {
     return pml4_phys
 }
 
-/// Builds the kernel page tables and loads them into CR3.
 fn paging_init() {
     pml4_phys = new_table()
 
-    // Identity map with 2 MiB pages, one page directory per GiB.
     identity_limit = physical_limit()
     let pdpt = new_table()
     for gib in 0..identity_limit / size_1g {
@@ -330,8 +289,7 @@ fn paging_init() {
     entry(pml4_phys, pml4_identity_slot as u64).write(pdpt | pte_present | pte_writable)
     entry(pml4_phys, pml4_direct_map_slot as u64).write(pdpt | pte_present | pte_writable)
 
-    // The kernel image again, at the top of the address space.
-    let pages = (get_image_size() + size_4k - 1) / size_4k
+    let pages = pages_for(get_image_size())
     for p in 0..pages {
         let offset = p * size_4k
         map_page(kernel_virt_base + offset, get_image_base() + offset, 0)
@@ -350,7 +308,6 @@ fn paging_init() {
     }
 }
 
-/// Higher-half alias of an address inside the kernel image.
 fn kernel_high(addr: u64) -> u64 {
     let base = get_image_base()
     if addr >= kernel_virt_base {
@@ -362,19 +319,18 @@ fn kernel_high(addr: u64) -> u64 {
     return addr - base + kernel_virt_base
 }
 
-/// Moves the addresses stored in statics (function tables, strings) to the
-/// higher half, where the kernel runs from now on.
 fn rebase_kernel_statics() {
     rebase_statics(kernel_virt_base - get_image_base())
 }
 
-/// Direct-map alias of a physical address.
+fn zero_phys(phys: u64, bytes: u64) {
+    memset(phys_to_virt(phys) as *mut u8, 0, bytes as usize)
+}
+
 fn phys_to_virt(phys: u64) -> u64 {
     return direct_map_base + phys
 }
 
-/// Jumps to the higher-half alias of `entry`, on the kernel stack. The code
-/// only uses rip-relative addresses, so it runs unchanged up there.
 fn enter_higher_half(entry: fn()) {
     if !paging_ready {
         panic("enter_higher_half: paging is not set up")

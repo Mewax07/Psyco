@@ -1,0 +1,31 @@
+// disk: fat32 +programs
+// esp: psyos.cfg video=800x600
+// match: ordered
+// input: start /bin/windowserver
+// input: start /bin/guitest
+// input: b
+// input: \x1bm
+// input: b
+// input: \x1b2
+// input: b
+// input: x
+// input: mem
+// input: shutdown
+
+import "../../../psycos/src/kernel.psy"
+
+//> PsycOS: boot ok
+//> opened 1 2
+//> focus Second 1
+//> bar 3158064 7368816 5929648 clock true
+//> focus Second 0
+//> focus Hello 1
+//> bar 3158064 5929648 4737096 clock true
+//> focus Hello 0
+//> focus Second 1
+//> bar 3158064 7368816 5929648 clock true
+//> key 120 Second
+//> [display] window server gone: text console back
+//> server alive: false
+//> Surfaces: 0, ports: 0
+// exit: 0

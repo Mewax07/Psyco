@@ -1,12 +1,11 @@
 /// Wiki Doc sources:
 ///   - https://wiki.osdev.org/Security#Rings
-///
-/// User program: runs `cli`, a privileged instruction. In ring 3 the CPU
-/// raises #GP and the kernel kills the process.
+///   - https://wiki.osdev.org/Exceptions#General_Protection_Fault
 
-/// Tries to disable interrupts.
+#![trusted]
+
 fn main() {
     print("trying cli in ring 3...")
     cli()
-    print("interrupts are off?!")
+    print("cli did not fault")
 }

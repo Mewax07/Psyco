@@ -12,9 +12,9 @@ pub mod lower;
 pub mod opt;
 pub mod parser;
 pub mod pe;
-pub mod resolver;
 pub mod platform;
 pub mod regalloc;
+pub mod resolver;
 pub mod runtime;
 pub mod typeck;
 

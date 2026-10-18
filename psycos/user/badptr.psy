@@ -1,15 +1,11 @@
 /// Wiki Doc sources:
 ///   - https://man7.org/linux/man-pages/man2/write.2.html
-///
-/// User program: hands bad pointers to the kernel. The kernel checks every
-/// user buffer and answers -14 (EFAULT) instead of reading it.
 
 const sys_write: u64 = 1
 const stdout: u64 = 1
 const kernel_image: u64 = 0xFFFFFFFF80000000
 const unmapped: u64 = 0x10000000
 
-/// Three bad writes, one good one.
 fn main() {
     print("kernel pointer:", syscall(sys_write, stdout, kernel_image, 16))
     print("unmapped pointer:", syscall(sys_write, stdout, unmapped, 16))

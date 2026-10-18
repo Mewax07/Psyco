@@ -1,0 +1,247 @@
+/// Wiki Doc sources:
+///   - https://wiki.osdev.org/Shared_Memory
+///   - https://wiki.osdev.org/Paging
+
+import "sched.psy"
+import "bytes.psy"
+import "paging.psy"
+import "pmm.psy"
+import "ipc.psy"
+import "../user/psy/abi.psy" as abi
+
+const max_surfaces: usize = 16
+const max_users: usize = 4
+const max_surface_side: u64 = 4096
+const max_surface_pages: u64 = 4096
+const surface_index_bits: u64 = 8
+const surface_area: u64 = 0x0000500000000000
+const surface_area_end: u64 = 0x0000600000000000
+
+struct Surface {
+    used: bool,
+    generation: u64,
+    owner: u64,
+    dropped: bool,
+    width: u64,
+    height: u64,
+    phys: u64,
+    pages: u64,
+    users: [u64; 4],
+    mapped_at: [u64; 4],
+}
+
+static mut surfaces: [Surface; 16]
+static mut surface_next: [u64; 16]
+
+fn surface_init(slot: usize) {
+    surface_next[slot] = surface_area
+}
+
+fn collect(i: usize) {
+    if !surfaces[i].used {
+        return
+    }
+    if task_slot_of(surfaces[i].owner) < 0 {
+        surfaces[i].dropped = true
+    }
+    if !surfaces[i].dropped {
+        return
+    }
+    for u in 0..max_users {
+        if surfaces[i].mapped_at[u] != 0 && task_slot_of(surfaces[i].users[u]) >= 0 {
+            return
+        }
+    }
+    pmm_free_pages_at(surfaces[i].phys, surfaces[i].pages)
+    surfaces[i].used = false
+}
+
+fn surfaces_in_use() -> usize {
+    let mut n: usize = 0
+    for i in 0..max_surfaces {
+        collect(i)
+        if surfaces[i].used {
+            n += 1
+        }
+    }
+    return n
+}
+
+fn surface_index(id: u64) -> Option<usize> {
+    let i = (id & ((1u64 << surface_index_bits) - 1)) as usize
+    if i >= max_surfaces {
+        return None
+    }
+    collect(i)
+    if !surfaces[i].used || surfaces[i].generation != id >> surface_index_bits {
+        return None
+    }
+    return Some(i)
+}
+
+fn user_position(i: usize) -> Option<usize> {
+    let me = current_task_id()
+    for u in 0..max_users {
+        if surfaces[i].users[u] == me {
+            return Some(u)
+        }
+    }
+    return None
+}
+
+fn surface_create(width: u64, height: u64) -> i64 {
+    if width == 0 || height == 0 || width > max_surface_side || height > max_surface_side {
+        return -abi::err_inval
+    }
+    let pages = pages_for(width * height * 4)
+    if pages > max_surface_pages {
+        return -abi::err_inval
+    }
+    let mut free = max_surfaces
+    for i in 0..max_surfaces {
+        collect(i)
+        if !surfaces[i].used && free == max_surfaces {
+            free = i
+        }
+    }
+    if free == max_surfaces {
+        return -abi::err_nomem
+    }
+    let phys = pmm_alloc_pages(pages)
+    if phys == 0 {
+        return -abi::err_nomem
+    }
+    zero_phys(phys, pages * size_4k)
+    surfaces[free].used = true
+    surfaces[free].generation += 1
+    surfaces[free].owner = current_task_id()
+    surfaces[free].dropped = false
+    surfaces[free].width = width
+    surfaces[free].height = height
+    surfaces[free].phys = phys
+    surfaces[free].pages = pages
+    for u in 0..max_users {
+        surfaces[free].users[u] = 0
+        surfaces[free].mapped_at[u] = 0
+    }
+    surfaces[free].users[0] = current_task_id()
+    return ((surfaces[free].generation << surface_index_bits) | free as u64) as i64
+}
+
+fn surface_map(id: u64) -> i64 {
+    let Some(i) = surface_index(id) else {
+        return -abi::err_badf
+    }
+    let Some(u) = user_position(i) else {
+        return -abi::err_perm
+    }
+    if surfaces[i].mapped_at[u] != 0 {
+        return surfaces[i].mapped_at[u] as i64
+    }
+    if surfaces[i].dropped {
+        return -abi::err_badf
+    }
+    let slot = get_current()
+    let start = surface_next[slot]
+    let size = surfaces[i].pages * size_4k
+    if size > surface_area_end - start {
+        return -abi::err_nomem
+    }
+    let root = read_cr3()
+    for p in 0..surfaces[i].pages {
+        if !map_page_in(root, start + p * size_4k, surfaces[i].phys + p * size_4k, pte_user | pte_writable | pte_shared) {
+            for q in 0..p {
+                unmap_page_in(root, start + q * size_4k)
+            }
+            return -abi::err_nomem
+        }
+    }
+    surface_next[slot] = start + size
+    surfaces[i].mapped_at[u] = start
+    return start as i64
+}
+
+fn surface_unmap(id: u64) -> i64 {
+    let Some(i) = surface_index(id) else {
+        return -abi::err_badf
+    }
+    let Some(u) = user_position(i) else {
+        return -abi::err_inval
+    }
+    let start = surfaces[i].mapped_at[u]
+    if start == 0 {
+        return -abi::err_inval
+    }
+    let root = read_cr3()
+    for p in 0..surfaces[i].pages {
+        unmap_page_in(root, start + p * size_4k)
+    }
+    surfaces[i].mapped_at[u] = 0
+    collect(i)
+    return 0
+}
+
+fn surface_share(id: u64, port: u64) -> i64 {
+    let Some(i) = surface_index(id) else {
+        return -abi::err_badf
+    }
+    if surfaces[i].owner != current_task_id() {
+        return -abi::err_perm
+    }
+    if surfaces[i].dropped {
+        return -abi::err_badf
+    }
+    let Some(p) = port_index(port) else {
+        return -abi::err_badf
+    }
+    let target = port_owner(p)
+    let mut free = max_users
+    for u in 0..max_users {
+        if surfaces[i].users[u] == target {
+            free = u
+            break
+        }
+        if surfaces[i].users[u] == 0 && free == max_users {
+            free = u
+        }
+    }
+    if free == max_users {
+        return -abi::err_nomem
+    }
+    let mut words = [0u64; 8]
+    words[1] = abi::msg_surface
+    words[2] = id
+    words[3] = surfaces[i].width
+    words[4] = surfaces[i].height
+    let sent = port_send_kernel(p, &words)
+    if sent < 0 {
+        return sent
+    }
+    surfaces[i].users[free] = target
+    return 0
+}
+
+fn surface_destroy(id: u64) -> i64 {
+    let Some(i) = surface_index(id) else {
+        return -abi::err_badf
+    }
+    if surfaces[i].owner != current_task_id() {
+        return -abi::err_perm
+    }
+    if surfaces[i].dropped {
+        return -abi::err_badf
+    }
+    surfaces[i].dropped = true
+    collect(i)
+    return 0
+}
+
+fn surface_info(id: u64) -> i64 {
+    let Some(i) = surface_index(id) else {
+        return -abi::err_badf
+    }
+    if user_position(i).is_none() {
+        return -abi::err_perm
+    }
+    return (surfaces[i].width | (surfaces[i].height << 32)) as i64
+}

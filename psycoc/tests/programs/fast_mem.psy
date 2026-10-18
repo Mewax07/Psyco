@@ -1,0 +1,89 @@
+#![trusted]
+
+static mut a: [u8; 300]
+static mut b: [u8; 300]
+static mut px: [u32; 100]
+
+fn fill_pattern() {
+    for i in 0..300usize {
+        a[i] = (i *% 7 +% 3) as u8
+        b[i] = 0
+    }
+}
+
+fn copied(n: usize) -> u64 {
+    for i in 0..n {
+        if b[i] != a[i] {
+            return 0
+        }
+    }
+    for i in n..n + 8 {
+        if b[i] != 0 {
+            return 0
+        }
+    }
+    return 1
+}
+
+fn main() {
+    let mut ok: u64 = 0
+    let sizes = [0usize, 1, 7, 8, 9, 15, 16, 17, 63, 64, 65, 127, 128, 129, 200, 255]
+    for k in 0..sizes.len() {
+        fill_pattern()
+        memcpy(b.as_mut_ptr(), a.as_ptr(), sizes[k])
+        ok += copied(sizes[k])
+    }
+    print(ok)
+
+    let mut good: u64 = 0
+    for k in 0..sizes.len() {
+        for i in 0..300usize {
+            b[i] = 1
+        }
+        memset(b.as_mut_ptr().add(3), 0xAB, sizes[k])
+        let mut right = b[2] == 1 && b[3 + sizes[k]] == 1
+        for i in 3..3 + sizes[k] {
+            if b[i] != 0xAB {
+                right = false
+            }
+        }
+        if right {
+            good += 1
+        }
+    }
+    print(good)
+
+    let counts = [0usize, 1, 3, 4, 5, 15, 16, 17, 33, 64, 97]
+    let mut fills: u64 = 0
+    for k in 0..counts.len() {
+        for i in 0..100usize {
+            px[i] = 7
+        }
+        memset32(px.as_mut_ptr().add(1), 0xFF102030, counts[k])
+        let mut right = px[0] == 7 && px[1 + counts[k]] == 7
+        for i in 1..1 + counts[k] {
+            if px[i] != 0xFF102030 {
+                right = false
+            }
+        }
+        if right {
+            fills += 1
+        }
+    }
+    print(fills)
+
+    fill_pattern()
+    memcpy(a.as_mut_ptr(), a.as_ptr().add(10), 250)
+    let mut scrolled = true
+    for i in 0..250usize {
+        if a[i] != ((i + 10) *% 7 +% 3) as u8 {
+            scrolled = false
+        }
+    }
+    print(scrolled)
+}
+
+//> 16
+//> 16
+//> 11
+//> true

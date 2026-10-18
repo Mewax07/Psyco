@@ -19,7 +19,6 @@ struct Resolver {
     types: HashSet<String>,
     values: HashSet<String>,
     consts: HashSet<String>,
-    /// Context of the item being rewritten.
     module: String,
     type_params: Vec<String>,
     locals: Vec<HashSet<String>>,
@@ -352,6 +351,16 @@ impl Resolver {
                 if let Some(b) = else_block {
                     self.block(b);
                 }
+            }
+            Stmt::LetElse {
+                pat,
+                value,
+                else_block,
+                ..
+            } => {
+                self.expr(value);
+                self.block(else_block);
+                self.pattern(pat);
             }
             Stmt::WhileLet {
                 pat, value, body, ..

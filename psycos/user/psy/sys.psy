@@ -1,0 +1,163 @@
+/// Wiki Doc sources:
+///   - https://wiki.osdev.org/System_Calls
+
+import "abi.psy" as abi
+
+struct Message {
+    sender: u64,
+    kind: u64,
+    data: [u64; 6],
+}
+
+struct Clock {
+    year: u64,
+    month: u64,
+    day: u64,
+    hour: u64,
+    minute: u64,
+    second: u64,
+}
+
+struct DisplayInfo {
+    width: u64,
+    height: u64,
+    stride: u64,
+    rgb: u64,
+}
+
+fn call(n: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u64) -> i64 {
+    return syscall6(n, a1, a2, a3, a4, a5, a6)
+}
+
+fn version() -> u64 {
+    return call(abi::sys_version, 0, 0, 0, 0, 0, 0) as u64
+}
+
+fn getpid() -> u64 {
+    return call(abi::sys_getpid, 0, 0, 0, 0, 0, 0) as u64
+}
+
+fn yield_now() {
+    call(abi::sys_yield, 0, 0, 0, 0, 0, 0)
+}
+
+fn sleep_ms(ms: u64) -> i64 {
+    return call(abi::sys_sleep_ms, ms, 0, 0, 0, 0, 0)
+}
+
+fn uptime_ms() -> u64 {
+    return call(abi::sys_uptime_ms, 0, 0, 0, 0, 0, 0) as u64
+}
+
+fn exit_with(code: i64) {
+    call(abi::sys_exit, code as u64, 0, 0, 0, 0, 0)
+}
+
+fn write(bytes: &[u8]) -> i64 {
+    return call(abi::sys_write, bytes.as_ptr() as u64, bytes.len() as u64, 0, 0, 0, 0)
+}
+
+fn write_str(s: Str) -> i64 {
+    return write(s.as_bytes())
+}
+
+fn task_name(buf: &mut [u8]) -> i64 {
+    return call(abi::sys_task_name, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0, 0, 0)
+}
+
+fn map(len: u64) -> i64 {
+    return call(abi::sys_map, len, 0, 0, 0, 0, 0)
+}
+
+fn unmap(addr: u64, len: u64) -> i64 {
+    return call(abi::sys_unmap, addr, len, 0, 0, 0, 0)
+}
+
+fn mem_pages() -> u64 {
+    return call(abi::sys_mem_pages, 0, 0, 0, 0, 0, 0) as u64
+}
+
+fn port_create() -> i64 {
+    return call(abi::sys_port_create, 0, 0, 0, 0, 0, 0)
+}
+
+fn port_destroy(port: u64) -> i64 {
+    return call(abi::sys_port_destroy, port, 0, 0, 0, 0, 0)
+}
+
+fn send(port: u64, m: &Message) -> i64 {
+    return call(abi::sys_port_send, port, m as *const Message as u64, 0, 0, 0, 0)
+}
+
+fn recv(port: u64, m: &mut Message) -> i64 {
+    return call(abi::sys_port_recv, port, m as *mut Message as u64, 0, 0, 0, 0)
+}
+
+fn try_recv(port: u64, m: &mut Message) -> i64 {
+    return call(abi::sys_port_try_recv, port, m as *mut Message as u64, 0, 0, 0, 0)
+}
+
+fn publish(port: u64, name: Str) -> i64 {
+    let b = name.as_bytes()
+    return call(abi::sys_port_publish, port, b.as_ptr() as u64, b.len() as u64, 0, 0, 0)
+}
+
+fn lookup(name: Str) -> i64 {
+    let b = name.as_bytes()
+    return call(abi::sys_port_lookup, b.as_ptr() as u64, b.len() as u64, 0, 0, 0, 0)
+}
+
+fn surface_create(width: u64, height: u64) -> i64 {
+    return call(abi::sys_surface_create, width, height, 0, 0, 0, 0)
+}
+
+fn surface_map(id: u64) -> i64 {
+    return call(abi::sys_surface_map, id, 0, 0, 0, 0, 0)
+}
+
+fn surface_unmap(id: u64) -> i64 {
+    return call(abi::sys_surface_unmap, id, 0, 0, 0, 0, 0)
+}
+
+fn surface_share(id: u64, port: u64) -> i64 {
+    return call(abi::sys_surface_share, id, port, 0, 0, 0, 0)
+}
+
+fn surface_destroy(id: u64) -> i64 {
+    return call(abi::sys_surface_destroy, id, 0, 0, 0, 0, 0)
+}
+
+fn surface_info(id: u64) -> i64 {
+    return call(abi::sys_surface_info, id, 0, 0, 0, 0, 0)
+}
+
+fn input_claim(port: u64) -> i64 {
+    return call(abi::sys_input_claim, port, 0, 0, 0, 0, 0)
+}
+
+fn input_release() -> i64 {
+    return call(abi::sys_input_release, 0, 0, 0, 0, 0, 0)
+}
+
+fn task_alive(pid: u64) -> bool {
+    return call(abi::sys_task_alive, pid, 0, 0, 0, 0, 0) == 1
+}
+
+fn time() -> Clock {
+    let v = call(abi::sys_time, 0, 0, 0, 0, 0, 0) as u64
+    let s = v & 0xFFFFFFFF
+    let d = v >> 32
+    return Clock { year: d >> 16, month: (d >> 8) & 0xFF, day: d & 0xFF, hour: s / 3600, minute: s / 60 % 60, second: s % 60 }
+}
+
+fn recv_timeout(port: u64, m: &mut Message, ms: u64) -> i64 {
+    return call(abi::sys_port_recv_timeout, port, m as *mut Message as u64, ms, 0, 0, 0)
+}
+
+fn display_claim() -> i64 {
+    return call(abi::sys_display_claim, 0, 0, 0, 0, 0, 0)
+}
+
+fn display_info(info: &mut DisplayInfo) -> i64 {
+    return call(abi::sys_display_info, info as *mut DisplayInfo as u64, 0, 0, 0, 0, 0)
+}

@@ -1,0 +1,10 @@
+fn main() {
+    let msg = "six\n"
+    let n = syscall6(1, 1, msg.as_ptr() as u64, 4, 0, 0, 0)
+    print(n)
+    print(syscall6(39, 0, 0, 0, 0, 0, 0) == syscall(39, 0, 0, 0))
+}
+
+//> six
+//> 4
+//> true

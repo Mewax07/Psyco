@@ -4,17 +4,14 @@
 
 #![trusted]
 
-/// Allocates `size` zeroed bytes (16-byte aligned). Null if out of memory.
 fn psy_alloc(size: usize) -> *mut u8 {
     return linux_heap::alloc(size as u64)
 }
 
-/// Frees a block from psy_alloc.
 fn psy_free(ptr: *mut u8) {
     linux_heap::free(ptr)
 }
 
-/// Generation of the live block at `ptr` (0 if there is none).
 fn psy_generation(ptr: *mut u8) -> u64 {
     let block = linux_heap::block_of(ptr)
     if block == 0 {
@@ -23,7 +20,6 @@ fn psy_generation(ptr: *mut u8) -> u64 {
     return linux_heap::word(block, 2).read()
 }
 
-/// Usable bytes of the live block at `ptr` (0 if there is none).
 fn psy_capacity(ptr: *mut u8) -> usize {
     let block = linux_heap::block_of(ptr)
     if block == 0 || linux_heap::word(block, 2).read() == 0 {
@@ -46,12 +42,10 @@ mod linux_heap {
     static mut free_heads: [u64; 32]
     static mut next_generation: u64 = 1
 
-    /// Header word `i` of the block at `block`.
     fn word(block: u64, i: usize) -> *mut u64 {
         return (block as *mut u64).add(i)
     }
 
-    /// Smallest size class that holds `size` bytes.
     fn class_of(size: u64) -> u64 {
         let mut c = min_class
         while (1u64 << c) < size {
@@ -60,7 +54,6 @@ mod linux_heap {
         return c
     }
 
-    /// Moves the program break so that `bytes` more bytes fit.
     fn grow(bytes: u64) -> bool {
         if heap_start == 0 {
             let b = syscall(sys_brk, 0, 0, 0) as u64
@@ -80,7 +73,6 @@ mod linux_heap {
         return true
     }
 
-    /// psy_alloc body.
     fn alloc(size: u64) -> *mut u8 {
         if size > (1u64 << max_class) {
             return 0 as *mut u8
@@ -108,7 +100,6 @@ mod linux_heap {
         return (block + header) as *mut u8
     }
 
-    /// Header of the block whose payload is `ptr` (0 if it is not one).
     fn block_of(ptr: *mut u8) -> u64 {
         let addr = ptr as u64
         if heap_start == 0 || addr < heap_start + header || addr >= heap_top || addr % 16 != 0 {
@@ -121,7 +112,6 @@ mod linux_heap {
         return block
     }
 
-    /// psy_free body.
     fn free(ptr: *mut u8) {
         let block = block_of(ptr)
         if block == 0 {

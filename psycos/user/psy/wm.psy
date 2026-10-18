@@ -1,0 +1,27 @@
+/// Wiki Doc sources:
+///   - https://wiki.osdev.org/Message_Passing
+
+const create: u64 = 1
+const created: u64 = 2
+const present: u64 = 3
+const destroy: u64 = 4
+const move_to: u64 = 5
+const raise: u64 = 6
+const probe: u64 = 7
+const probe_reply: u64 = 8
+const crash: u64 = 9
+const set_title: u64 = 10
+const resize: u64 = 11
+const attach: u64 = 12
+const ask_close: u64 = 13
+const ev_key: u64 = 20
+const ev_focus: u64 = 21
+const ev_resize: u64 = 22
+const ev_close: u64 = 23
+const title_max: usize = 32
+const min_side: u64 = 16
+const title_h: i64 = 20
+const border: i64 = 1
+const taskbar_h: i64 = 24
+const key_esc: u64 = 27
+const key_tab: u64 = 9

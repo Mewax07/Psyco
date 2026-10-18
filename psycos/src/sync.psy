@@ -1,27 +1,21 @@
 /// Wiki Doc sources:
 ///   - https://wiki.osdev.org/Synchronization_Primitives
 ///   - https://wiki.osdev.org/CPU_Registers_x86-64#RFLAGS_Register
-///
-/// Critical sections for a single CPU: interrupts off, then back to the
-/// state they were in (so it also works inside interrupt handlers).
 
 const rflags_if: u64 = 0x200
 
-/// Disables interrupts; returns true if they were on.
 fn irq_save() -> bool {
     let was_on = read_rflags() & rflags_if != 0
     cli()
     return was_on
 }
 
-/// Turns interrupts back on if irq_save found them on.
 fn irq_restore(was_on: bool) {
     if was_on {
         sti()
     }
 }
 
-/// True if interrupts are currently enabled.
 fn irq_enabled() -> bool {
     return read_rflags() & rflags_if != 0
 }

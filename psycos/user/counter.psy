@@ -1,20 +1,16 @@
 /// Wiki Doc sources:
 ///   - https://man7.org/linux/man-pages/man2/nanosleep.2.html
-///
-/// User program: counts to 5 with a pause between numbers, exits with 7.
 
 const sys_nanosleep: u64 = 35
 const pause_ns: u64 = 50000000
 const steps: u64 = 5
 const exit_code: i32 = 7
 
-/// Sleeps `ns` nanoseconds (timespec { seconds, nanoseconds }).
 fn sleep_ns(ns: u64) {
     let ts = [0u64, ns]
     syscall(sys_nanosleep, ts.as_ptr() as u64, 0, 0)
 }
 
-/// Counts with pauses, then exits with a code of its own.
 fn main() {
     let pid = syscall(39, 0, 0, 0)
     for i in 1..steps + 1 {

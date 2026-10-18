@@ -1,0 +1,35 @@
+/// Wiki Doc sources:
+///   - https://wiki.osdev.org/Shared_Memory
+
+#![trusted]
+
+import "psy/sys.psy" as sys
+import "psy/abi.psy" as abi
+
+fn main() {
+    let port = sys::port_create() as u64
+    sys::publish(port, "compositor")
+    let mut m = sys::Message { sender: 0, kind: 0, data: [0u64; 6] }
+    sys::recv(port, &mut m)
+    if m.kind != abi::msg_surface || m.sender != 0 {
+        exit(1)
+    }
+    let id = m.data[0]
+    let pixels = m.data[1] * m.data[2]
+    let base = sys::surface_map(id) as u64
+    let p = base as *mut u32
+    let mut sum: u64 = 0
+    for i in 0..pixels as usize {
+        sum += p.add(i).read() as u64
+    }
+    p.write(0xCAFE)
+
+    sys::recv(port, &mut m)
+    let mut r = sys::Message { sender: 0, kind: 2, data: [0u64; 6] }
+    r.data[0] = sum
+    r.data[1] = sys::surface_map(m.data[0]) as u64
+    r.data[2] = sys::surface_info(id) as u64
+    r.data[3] = sys::surface_destroy(id) as u64
+    sys::send(m.data[1], &r)
+    sys::surface_unmap(id)
+}

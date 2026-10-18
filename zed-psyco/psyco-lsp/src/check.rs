@@ -447,6 +447,12 @@ fn walk_stmt(s: &mut Stmt, f: &mut impl FnMut(&mut Expr)) {
             walk_expr(value, f);
             walk_block(body, f);
         }
+        Stmt::LetElse {
+            value, else_block, ..
+        } => {
+            walk_expr(value, f);
+            walk_block(else_block, f);
+        }
         Stmt::Loop { body, .. } | Stmt::Block(body) => walk_block(body, f),
         Stmt::Break(_) | Stmt::Continue(_) => {}
     }
@@ -537,6 +543,12 @@ fn collect_stmt(s: &Stmt, p: &ProgramInfo, out: &mut LetTypes) {
         Stmt::WhileLet { pat, body, .. } => {
             collect_pattern(pat, p, out);
             collect_block(body, p, out);
+        }
+        Stmt::LetElse {
+            pat, else_block, ..
+        } => {
+            collect_pattern(pat, p, out);
+            collect_block(else_block, p, out);
         }
         Stmt::For {
             start, body, span, ..
