@@ -1,0 +1,310 @@
+/// Wiki Doc sources:
+///   - https://wiki.osdev.org/Virtio
+///   - https://docs.oasis-open.org/virtio/virtio/v1.2/virtio-v1.2.html#x1-1090004
+///   - https://docs.oasis-open.org/virtio/virtio/v1.2/virtio-v1.2.html#x1-3850008
+
+#![trusted]
+
+import "pci.psy"
+import "paging.psy"
+import "pmm.psy"
+
+const vendor: u32 = 0x1AF4
+const device_input: u32 = 0x1052
+const max_devices: u32 = 8
+
+const cap_vendor: u32 = 0x09
+const cfg_common: u32 = 1
+const cfg_notify: u32 = 2
+const cfg_device: u32 = 4
+
+const common_device_feature_select: u64 = 0
+const common_device_feature: u64 = 4
+const common_driver_feature_select: u64 = 8
+const common_driver_feature: u64 = 12
+const common_status: u64 = 20
+const common_queue_select: u64 = 22
+const common_queue_size: u64 = 24
+const common_queue_enable: u64 = 28
+const common_queue_notify_off: u64 = 30
+const common_queue_desc: u64 = 32
+const common_queue_driver: u64 = 40
+const common_queue_device: u64 = 48
+
+const status_acknowledge: u8 = 1
+const status_driver: u8 = 2
+const status_driver_ok: u8 = 4
+const status_features_ok: u8 = 8
+const status_failed: u8 = 128
+const feature_version_1: u32 = 1
+const reset_tries: u64 = 100000
+
+const config_select: u64 = 0
+const config_subsel: u64 = 1
+const config_size: u64 = 2
+const config_data: u64 = 8
+const select_ev_bits: u8 = 0x11
+const select_abs_info: u8 = 0x12
+
+const ev_syn: u16 = 0
+const ev_key: u16 = 1
+const ev_rel: u16 = 2
+const ev_abs: u16 = 3
+const abs_x: u16 = 0
+const abs_y: u16 = 1
+const rel_wheel: u16 = 8
+const btn_left: u16 = 0x110
+const btn_right: u16 = 0x111
+const btn_middle: u16 = 0x112
+
+const queue_max: u64 = 64
+const event_bytes: u64 = 8
+const avail_offset: u64 = 1024
+const desc_device_writes: u16 = 2
+const avail_no_interrupt: u16 = 1
+
+struct Event {
+    kind: u16,
+    code: u16,
+    value: u32,
+}
+
+struct Axis {
+    min: i64,
+    max: i64,
+}
+
+static mut common: u64 = 0
+static mut notify: u64 = 0
+static mut notify_base: u64 = 0
+static mut notify_multiplier: u64 = 0
+static mut device: u64 = 0
+static mut queue_n: u64 = 0
+static mut ring_phys: u64 = 0
+static mut used_phys: u64 = 0
+static mut events_phys: u64 = 0
+static mut last_used: u16 = 0
+static mut recycled: bool = false
+
+#[getter]
+static mut ready: bool = false
+#[getter]
+static mut events: u64 = 0
+#[getter]
+static mut axis_x: Axis
+#[getter]
+static mut axis_y: Axis
+
+fn reg8(off: u64) -> *mut u8 {
+    return (common + off) as *mut u8
+}
+
+fn reg16(off: u64) -> *mut u16 {
+    return (common + off) as *mut u16
+}
+
+fn reg32(off: u64) -> *mut u32 {
+    return (common + off) as *mut u32
+}
+
+fn reg64(off: u64, value: u64) {
+    reg32(off).write(value as u32)
+    reg32(off + 4).write((value >> 32) as u32)
+}
+
+fn set_status(bits: u8) {
+    reg8(common_status).write(reg8(common_status).read() | bits)
+}
+
+fn ring(off: u64) -> *mut u16 {
+    return phys_to_virt(ring_phys + off) as *mut u16
+}
+
+fn used(off: u64) -> u64 {
+    return phys_to_virt(used_phys + off)
+}
+
+fn map_cap(a: &PciAddr, cap: u32) {
+    let kind = pci_config_byte(a, cap + 3)
+    let Some(base) = pci_memory_bar(a, pci_config_byte(a, cap + 4)) else {
+        return
+    }
+    let phys = base + pci_config(a, cap + 8) as u64
+    let length = pci_config(a, cap + 12) as u64
+    if kind == cfg_common && common == 0 {
+        common = map_mmio(phys, length).unwrap_or(0)
+    } else if kind == cfg_notify && notify_base == 0 {
+        notify_base = map_mmio(phys, length).unwrap_or(0)
+        notify_multiplier = pci_config(a, cap + 16) as u64
+    } else if kind == cfg_device && device == 0 {
+        device = map_mmio(phys, length).unwrap_or(0)
+    }
+}
+
+fn find_caps(a: &PciAddr) -> bool {
+    common = 0
+    notify_base = 0
+    device = 0
+    let mut cap = pci_first_cap(a)
+    let mut guard: u32 = 0
+    while cap != 0 && guard < pci_max_caps {
+        if pci_config_byte(a, cap) == cap_vendor {
+            map_cap(a, cap)
+        }
+        cap = pci_next_cap(a, cap)
+        guard += 1
+    }
+    return common != 0 && notify_base != 0 && device != 0
+}
+
+fn reset() -> bool {
+    reg8(common_status).write(0)
+    for i in 0..reset_tries {
+        if reg8(common_status).read() == 0 {
+            return true
+        }
+        pause()
+    }
+    return false
+}
+
+fn read_config(select: u8, subsel: u8) -> u8 {
+    ((device + config_select) as *mut u8).write(select)
+    ((device + config_subsel) as *mut u8).write(subsel)
+    return ((device + config_size) as *mut u8).read()
+}
+
+fn read_axis(code: u16) -> Option<Axis> {
+    if read_config(select_abs_info, code as u8) < 8 {
+        return None
+    }
+    let min = ((device + config_data) as *mut u32).read() as i32 as i64
+    let max = ((device + config_data + 4) as *mut u32).read() as i32 as i64
+    return Some(Axis { min: min, max: max })
+}
+
+fn negotiate() -> bool {
+    if !reset() {
+        return false
+    }
+    set_status(status_acknowledge)
+    set_status(status_driver)
+    reg32(common_device_feature_select).write(1)
+    if reg32(common_device_feature).read() & feature_version_1 == 0 {
+        return false
+    }
+    reg32(common_driver_feature_select).write(1)
+    reg32(common_driver_feature).write(feature_version_1)
+    reg32(common_driver_feature_select).write(0)
+    reg32(common_driver_feature).write(0)
+    set_status(status_features_ok)
+    return reg8(common_status).read() & status_features_ok != 0
+}
+
+fn setup_queue() -> bool {
+    reg16(common_queue_select).write(0)
+    let mut n = reg16(common_queue_size).read() as u64
+    if n == 0 {
+        return false
+    }
+    if n > queue_max {
+        n = queue_max
+    }
+    reg16(common_queue_size).write(n as u16)
+    queue_n = n
+    if ring_phys == 0 {
+        ring_phys = pmm_alloc_page()
+        used_phys = pmm_alloc_page()
+        events_phys = pmm_alloc_page()
+    }
+    if ring_phys == 0 || used_phys == 0 || events_phys == 0 {
+        return false
+    }
+    zero_phys(ring_phys, size_4k)
+    zero_phys(used_phys, size_4k)
+    zero_phys(events_phys, size_4k)
+    for i in 0..n {
+        let d = phys_to_virt(ring_phys + i * 16) as *mut u8
+        (d as *mut u64).write(events_phys + i * event_bytes)
+        (d.add(8) as *mut u32).write(event_bytes as u32)
+        (d.add(12) as *mut u16).write(desc_device_writes)
+        ring(avail_offset + 4 + 2 * i).write(i as u16)
+    }
+    ring(avail_offset).write(avail_no_interrupt)
+    ring(avail_offset + 2).write(n as u16)
+    last_used = 0
+    reg64(common_queue_desc, ring_phys)
+    reg64(common_queue_driver, ring_phys + avail_offset)
+    reg64(common_queue_device, used_phys)
+    notify = notify_base + reg16(common_queue_notify_off).read() as u64 * notify_multiplier
+    reg16(common_queue_enable).write(1)
+    return true
+}
+
+fn start(a: &PciAddr) -> bool {
+    pci_enable(a)
+    if !find_caps(a) || !negotiate() {
+        return false
+    }
+    if read_config(select_ev_bits, ev_abs as u8) == 0 {
+        return false
+    }
+    let Some(x) = read_axis(abs_x) else {
+        return false
+    }
+    let Some(y) = read_axis(abs_y) else {
+        return false
+    }
+    if !setup_queue() {
+        return false
+    }
+    axis_x = x
+    axis_y = y
+    set_status(status_driver_ok)
+    (notify as *mut u16).write(0)
+    return true
+}
+
+fn init() -> bool {
+    for n in 0..max_devices {
+        let Some(a) = pci_find_nth(vendor, device_input, device_input, n) else {
+            return false
+        }
+        if start(&a) {
+            ready = true
+            return true
+        }
+        if common != 0 {
+            reg8(common_status).write(status_failed)
+        }
+    }
+    return false
+}
+
+fn next() -> Option<Event> {
+    if !ready {
+        return None
+    }
+    let head = (used(2) as *mut u16).read()
+    if head == last_used {
+        return None
+    }
+    let slot = last_used as u64 % queue_n
+    let id = (used(4 + slot * 8) as *mut u32).read() as u64 % queue_n
+    let e = phys_to_virt(events_phys + id * event_bytes) as *mut u8
+    let ev = Event { kind: (e as *mut u16).read(), code: (e.add(2) as *mut u16).read(), value: (e.add(4) as *mut u32).read() }
+    last_used = last_used +% 1
+    let idx = ring(avail_offset + 2).read()
+    ring(avail_offset + 4 + 2 * (idx as u64 % queue_n)).write(id as u16)
+    ring(avail_offset + 2).write(idx +% 1)
+    events += 1
+    recycled = true
+    return Some(ev)
+}
+
+fn kick() {
+    if recycled {
+        recycled = false
+        (notify as *mut u16).write(0)
+    }
+}

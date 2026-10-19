@@ -1,0 +1,115 @@
+/// Wiki Doc sources:
+///   - https://wiki.osdev.org/FAT
+
+import "sys.psy" as sys
+
+const default_wallpaper: u32 = 0x204060
+const default_accent: u32 = 0x5A7AB0
+const keyboard_us: u64 = 0
+const keyboard_fr: u64 = 1
+const prefs_max: usize = 512
+
+struct Prefs {
+    wallpaper: u32,
+    accent: u32,
+    keyboard: u64,
+}
+
+fn defaults() -> Prefs {
+    return Prefs { wallpaper: default_wallpaper, accent: default_accent, keyboard: keyboard_us }
+}
+
+fn starts(buf: &[u8], at: usize, end: usize, key: Str) -> bool {
+    let k = key.as_bytes()
+    if end - at < k.len() {
+        return false
+    }
+    for i in 0..k.len() {
+        if buf[at + i] != k[i] {
+            return false
+        }
+    }
+    return true
+}
+
+fn hex_digits(c: u8) -> Option<u32> {
+    if c >= '0' && c <= '9' {
+        return Some((c - '0') as u32)
+    }
+    if c >= 'a' && c <= 'f' {
+        return Some((c - 'a' + 10) as u32)
+    }
+    if c >= 'A' && c <= 'F' {
+        return Some((c - 'A' + 10) as u32)
+    }
+    return None
+}
+
+fn parse_hex(buf: &[u8], at: usize, end: usize) -> u32 {
+    let mut v: u32 = 0
+    for i in at..end {
+        let Some(d) = hex_digits(buf[i]) else {
+            break
+        }
+        v = (v << 4) | d
+    }
+    return v & 0xFFFFFF
+}
+
+fn load(p: &mut Prefs) -> bool {
+    let mut buf = [0u8; 512]
+    let n = sys::file_read("/settings.cfg", &mut buf)
+    if n <= 0 {
+        return false
+    }
+    let len = n as usize
+    let mut at: usize = 0
+    while at < len {
+        let mut end = at
+        while end < len && buf[end] != '\n' && buf[end] != '\r' {
+            end += 1
+        }
+        if starts(&buf, at, end, "wallpaper=") {
+            p.wallpaper = parse_hex(&buf, at + 10, end)
+        } else if starts(&buf, at, end, "accent=") {
+            p.accent = parse_hex(&buf, at + 7, end)
+        } else if starts(&buf, at, end, "keyboard=fr") {
+            p.keyboard = keyboard_fr
+        } else if starts(&buf, at, end, "keyboard=") {
+            p.keyboard = keyboard_us
+        }
+        at = end + 1
+    }
+    return true
+}
+
+fn put(buf: &mut [u8], n: &mut usize, s: Str) {
+    let b = s.as_bytes()
+    for i in 0..b.len() {
+        buf[*n] = b[i]
+        *n += 1
+    }
+}
+
+fn put_hex(buf: &mut [u8], n: &mut usize, v: u32) {
+    let digits = "0123456789ABCDEF".as_bytes()
+    for k in 0..6u32 {
+        buf[*n] = digits[((v >> ((5 - k) * 4)) & 0xF) as usize]
+        *n += 1
+    }
+}
+
+fn save(p: &Prefs) -> bool {
+    let mut buf = [0u8; 128]
+    let mut n: usize = 0
+    put(&mut buf, &mut n, "wallpaper=")
+    put_hex(&mut buf, &mut n, p.wallpaper)
+    put(&mut buf, &mut n, "\naccent=")
+    put_hex(&mut buf, &mut n, p.accent)
+    if p.keyboard == keyboard_fr {
+        put(&mut buf, &mut n, "\nkeyboard=fr\n")
+    } else {
+        put(&mut buf, &mut n, "\nkeyboard=us\n")
+    }
+    return sys::file_write("/settings.cfg", &buf[..n]) == 0
+}

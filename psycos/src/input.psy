@@ -7,7 +7,10 @@ import "display.psy"
 import "keyboard.psy"
 import "timer.psy"
 import "serial.psy"
+import "mouse.psy"
 import "../user/psy/abi.psy" as abi
+
+const input_reserve: usize = 4
 
 static mut input_on: bool = false
 static mut input_port: u64 = 0
@@ -16,10 +19,15 @@ static mut input_owner: u64 = 0
 static mut keys_routed: u64 = 0
 #[getter]
 static mut keys_dropped: u64 = 0
+#[getter]
+static mut pointer_routed: u64 = 0
+#[getter]
+static mut pointer_dropped: u64 = 0
 
 fn input_init() {
     set_key_routing(route_key, input_active)
     set_poll_hook(poll_serial_input)
+    set_pointer_hook(route_pointer)
 }
 
 fn input_active() -> bool {
@@ -48,12 +56,55 @@ fn route_key(c: u8) -> bool {
     return true
 }
 
-fn poll_serial_input() {
-    display_poll()
+fn route_pointer(urgent: bool) {
     if !input_active() {
+        pointer_forget()
         return
     }
+    if urgent {
+        send_pointer(1)
+    }
+}
+
+fn send_pointer(reserve: usize) {
+    let Some(p) = port_index(input_port) else {
+        return
+    }
+    if port_room(p) <= reserve {
+        pointer_dropped += 1
+        return
+    }
+    let mut words = [0u64; 8]
+    words[1] = abi::msg_mouse
+    words[2] = get_mouse_x() as u64
+    words[3] = get_mouse_y() as u64
+    words[4] = get_mouse_buttons()
+    words[5] = pointer_take_wheel() as u64
+    words[6] = get_mouse_source()
+    if port_send_kernel(p, &words) < 0 {
+        pointer_dropped += 1
+    } else {
+        pointer_routed += 1
+    }
+}
+
+fn poll_serial_input() {
+    display_poll()
+    tablet_poll()
+    if !input_active() {
+        pointer_forget()
+        return
+    }
+    if get_pointer_moved() {
+        send_pointer(input_reserve)
+    }
     loop {
+        let Some(p) = port_index(input_port) else {
+            return
+        }
+        if port_room(p) <= input_reserve {
+            return
+        }
         let s = serial_poll()
         if s < 0 {
             break

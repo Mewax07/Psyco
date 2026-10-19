@@ -1,0 +1,26 @@
+// disk: fat32 +programs
+// esp: psyos.cfg video=800x600
+// match: ordered
+// input: gui
+// input: echo hello
+// input: run /bin/termcheck
+// input: \x1bq
+// input: mem
+// input: shutdown
+
+import "../../../psycos/src/kernel.psy"
+
+//> PsycOS: boot ok
+//> terminal in slot 3
+//> echo hello
+//> hello
+//> run /bin/termcheck
+//> terminal: 80 x 25
+//> hello row found: true
+//> glyph drawn: true blank after: true
+//> title ok: true
+//> exit code 0
+//> [display] window server gone: text console back
+//> mem
+//> Surfaces: 0, ports: 0
+// exit: 0

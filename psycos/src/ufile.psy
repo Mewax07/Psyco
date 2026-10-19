@@ -1,0 +1,93 @@
+/// Wiki Doc sources:
+///   - https://wiki.osdev.org/FAT
+///   - https://wiki.osdev.org/System_Calls
+
+import "fat32.psy"
+import "sync.psy"
+import "usermode.psy"
+import "keyboard.psy"
+import "../user/psy/abi.psy" as abi
+
+const ufile_max: usize = 4096
+const upath_max: usize = 64
+
+static mut ufile_buf: [u8; 4096]
+static mut ufile_busy: bool = false
+
+fn ufile_take() -> bool {
+    let was_on = irq_save()
+    let free = !ufile_busy
+    ufile_busy = true
+    irq_restore(was_on)
+    return free
+}
+
+fn ufile_path(ptr: u64, len: u64, buf: &mut [u8; 64]) -> Option<usize> {
+    let n = len as usize
+    if n == 0 || n > upath_max {
+        return None
+    }
+    if !copy_from_user(&mut buf[..n], ptr) {
+        return None
+    }
+    return Some(n)
+}
+
+fn file_read(path: u64, plen: u64, dst: u64, dlen: u64) -> i64 {
+    if !get_fat_mounted() {
+        return -abi::err_noent
+    }
+    let mut p = [0u8; 64]
+    let Some(n) = ufile_path(path, plen, &mut p) else {
+        return -abi::err_fault
+    }
+    let Some(e) = fat_lookup(&p[..n]) else {
+        return -abi::err_noent
+    }
+    if !ufile_take() {
+        return -abi::err_again
+    }
+    let mut want = dlen as usize
+    if want > ufile_max {
+        want = ufile_max
+    }
+    let got = fat_read(&e, 0, &mut ufile_buf[..want]) as usize
+    let ok = copy_to_user(dst, &ufile_buf[..got])
+    ufile_busy = false
+    if !ok {
+        return -abi::err_fault
+    }
+    return got as i64
+}
+
+fn file_write(path: u64, plen: u64, src: u64, slen: u64) -> i64 {
+    if !get_fat_mounted() {
+        return -abi::err_noent
+    }
+    if slen as usize > ufile_max {
+        return -abi::err_inval
+    }
+    let mut p = [0u8; 64]
+    let Some(n) = ufile_path(path, plen, &mut p) else {
+        return -abi::err_fault
+    }
+    if !ufile_take() {
+        return -abi::err_again
+    }
+    let len = slen as usize
+    let mut result: i64 = 0
+    if !copy_from_user(&mut ufile_buf[..len], src) {
+        result = -abi::err_fault
+    } else if !fat_write_file(&p[..n], &ufile_buf[..len]) {
+        result = -abi::err_inval
+    }
+    ufile_busy = false
+    return result
+}
+
+fn set_keymap(layout: u64) -> i64 {
+    if !kbd_set_layout(layout) {
+        return -abi::err_inval
+    }
+    return 0
+}

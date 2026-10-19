@@ -1,0 +1,259 @@
+/// Wiki Doc sources:
+///   - https://wiki.osdev.org/Terminals
+///   - https://wiki.osdev.org/Message_Passing
+
+import "psy/sys.psy" as sys
+import "psy/abi.psy" as abi
+import "psy/gfx.psy" as gfx
+import "psy/wm.psy" as wm
+import "psy/libgui.psy" as gui
+
+const cols_max: usize = 128
+const rows_max: usize = 48
+const term_fg: u32 = 0xD0D0D0
+const term_bg: u32 = 0x101010
+const cursor_color: u32 = 0x80C080
+const start_cols: u64 = 80
+const start_rows: u64 = 25
+const origin_x: u64 = 40
+const origin_y: u64 = 40
+const enter: u64 = 13
+
+static mut win: gui::Window
+static mut cells: [u8; 6144]
+static mut cols: usize = 80
+static mut rows: usize = 25
+static mut cx: usize = 0
+static mut cy: usize = 0
+static mut dirty_lo: usize = 48
+static mut dirty_hi: usize = 0
+static mut inbuf: [u8; 256]
+
+fn cell(x: usize, y: usize) -> usize {
+    return y * cols_max + x
+}
+
+fn touch(y: usize) {
+    if y < dirty_lo {
+        dirty_lo = y
+    }
+    if y + 1 > dirty_hi {
+        dirty_hi = y + 1
+    }
+}
+
+fn touch_all() {
+    dirty_lo = 0
+    dirty_hi = rows
+}
+
+fn scroll() {
+    for y in 1..rows {
+        for x in 0..cols {
+            cells[cell(x, y - 1)] = cells[cell(x, y)]
+        }
+    }
+    for x in 0..cols {
+        cells[cell(x, rows - 1)] = 0
+    }
+    touch_all()
+}
+
+fn newline() {
+    cx = 0
+    if cy + 1 < rows {
+        cy += 1
+    } else {
+        scroll()
+    }
+}
+
+fn feed(c: u8) {
+    touch(cy)
+    if c == 10 {
+        newline()
+    } else if c == 13 {
+        cx = 0
+    } else if c == 8 {
+        if cx > 0 {
+            cx -= 1
+        }
+    } else if c == 9 {
+        cx = (cx / 8 + 1) * 8
+        if cx >= cols {
+            newline()
+        }
+    } else if c >= 32 && c < 127 {
+        cells[cell(cx, cy)] = c
+        cx += 1
+        if cx == cols {
+            newline()
+        }
+    }
+    touch(cy)
+}
+
+fn draw_row(y: usize) {
+    let c = &win.canvas
+    let mut line = [32u8; 128]
+    for x in 0..cols {
+        if cells[cell(x, y)] != 0 {
+            line[x] = cells[cell(x, y)]
+        }
+    }
+    let top = (y as i64) * gfx::char_h()
+    let r = gfx::rect(0, top, c.width, gfx::char_h())
+    gfx::fill(c, r, r, term_bg)
+    gfx::text(c, 0, top, &line[..cols], term_fg, term_bg, r)
+    if y == cy && cx < cols {
+        gfx::fill(c, gfx::rect(cx as i64 * gfx::char_w(), top + gfx::char_h() - 2, gfx::char_w(), 2), r, cursor_color)
+    }
+}
+
+fn flush() {
+    if dirty_lo >= dirty_hi {
+        return
+    }
+    for y in dirty_lo..dirty_hi {
+        draw_row(y)
+    }
+    let h = gfx::char_h()
+    gui::present(&win, gfx::rect(0, dirty_lo as i64 * h, win.canvas.width, (dirty_hi - dirty_lo) as i64 * h))
+    dirty_lo = rows_max
+    dirty_hi = 0
+}
+
+fn redraw() {
+    let c = &win.canvas
+    gfx::fill(c, gfx::bounds(c), gfx::bounds(c), term_bg)
+    touch_all()
+    flush()
+    gui::present_all(&win)
+}
+
+fn pump() {
+    loop {
+        let n = sys::console_read(&mut inbuf)
+        if n <= 0 {
+            break
+        }
+        for i in 0..n as usize {
+            feed(inbuf[i])
+        }
+    }
+    flush()
+}
+
+fn reshape(w: u64, h: u64) {
+    if !gui::reshape(&mut win, w, h) {
+        return
+    }
+    cols = (w / gfx::char_w() as u64) as usize
+    rows = (h / gfx::char_h() as u64) as usize
+    if cols > cols_max {
+        cols = cols_max
+    }
+    if rows > rows_max {
+        rows = rows_max
+    }
+    if cx >= cols {
+        cx = cols - 1
+    }
+    while cy >= rows {
+        scroll()
+        cy -= 1
+    }
+    redraw()
+}
+
+fn reply(port: u64, kind: u64, words: &[u64]) {
+    let mut m = sys::Message { sender: 0, kind: kind, data: [0u64; 6] }
+    for i in 0..words.len() {
+        m.data[i] = words[i]
+    }
+    sys::send(port, &m)
+}
+
+fn dump_row(row: usize, port: u64) {
+    let mut w = [0u64; 6]
+    w[0] = row as u64
+    if row < rows {
+        let mut n: usize = 0
+        for x in 0..cols {
+            if cells[cell(x, row)] != 0 {
+                n = x + 1
+            }
+        }
+        if n > 32 {
+            n = 32
+        }
+        w[1] = n as u64
+        for k in 0..n {
+            let mut b = cells[cell(k, row)]
+            if b == 0 {
+                b = 32
+            }
+            w[2 + k / 8] = w[2 + k / 8] | ((b as u64) << ((k % 8) * 8))
+        }
+    }
+    reply(port, wm::term_row, &w)
+}
+
+fn send_info(port: u64) {
+    let mut w = [0u64; 6]
+    w[0] = cols as u64
+    w[1] = rows as u64
+    w[2] = cy as u64
+    w[3] = win.id
+    w[4] = origin_x
+    w[5] = origin_y
+    reply(port, wm::term_info_reply, &w)
+}
+
+fn main() {
+    if !gui::connect() {
+        exit(3)
+    }
+    let Some(w) = gui::open(start_cols * gfx::char_w() as u64, start_rows * gfx::char_h() as u64, origin_x, origin_y, "Terminal") else {
+        exit(4)
+    }
+    win = w
+    redraw()
+    let port = gui::event_port()
+    if sys::console_attach(port) < 0 {
+        exit(5)
+    }
+    sys::publish(port, "terminal")
+    sys::console_input(enter)
+    let mut e = gui::event()
+    loop {
+        gui::wait(&mut e)
+        let trusted = gui::trusted(&e)
+        match e.kind {
+            abi::msg_console => {
+                if e.sender == 0 {
+                    pump()
+                }
+            }
+            wm::ev_key => {
+                if trusted {
+                    sys::console_input(e.a)
+                }
+            }
+            wm::ev_resize => {
+                if trusted {
+                    reshape(e.a, e.b)
+                }
+            }
+            wm::ev_close => {
+                if trusted {
+                    break
+                }
+            }
+            wm::term_dump => dump_row(e.window as usize, e.a),
+            wm::term_info => send_info(e.window),
+            _ => {}
+        }
+    }
+    gui::close(&mut win)
+}

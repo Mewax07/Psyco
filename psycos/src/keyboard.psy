@@ -26,6 +26,9 @@ const sc_slash: u8 = 0x35
 
 const kbd_buf_size: usize = 64
 
+const layout_us: u64 = 0
+const layout_fr: u64 = 1
+
 static keymap: [u8; 58] = [
     0, 27, '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', 8, '\t',
     'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p', '[', ']', 13, 0, 'a', 's',
@@ -40,6 +43,22 @@ static keymap_shift: [u8; 58] = [
     'B', 'N', 'M', '<', '>', '?', 0, '*', 0, ' ',
 ]
 
+static keymap_fr: [u8; 58] = [
+    0, 27, '&', 0, '"', '\'', '(', '-', 0, '_', 0, 0, ')', '=', 8, '\t',
+    'a', 'z', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p', '^', '$', 13, 0, 'q', 's',
+    'd', 'f', 'g', 'h', 'j', 'k', 'l', 'm', 0, 0, 0, '*', 'w', 'x', 'c', 'v',
+    'b', 'n', ',', ';', ':', '!', 0, '*', 0, ' ',
+]
+
+static keymap_fr_shift: [u8; 58] = [
+    0, 27, '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', 0, '+', 8, '\t',
+    'A', 'Z', 'E', 'R', 'T', 'Y', 'U', 'I', 'O', 'P', 0, 0, 13, 0, 'Q', 'S',
+    'D', 'F', 'G', 'H', 'J', 'K', 'L', 'M', '%', 0, 0, 0, 'W', 'X', 'C', 'V',
+    'B', 'N', '?', '.', '/', 0, 0, '*', 0, ' ',
+]
+
+#[getter]
+static mut kbd_layout: u64 = 0
 static mut kbd_shift: u8 = 0
 static mut kbd_ctrl: bool = false
 static mut kbd_caps: bool = false
@@ -107,6 +126,14 @@ fn serial_key(c: u8) -> u8 {
         return key_backspace
     }
     return c
+}
+
+fn kbd_set_layout(layout: u64) -> bool {
+    if layout != layout_us && layout != layout_fr {
+        return false
+    }
+    kbd_layout = layout
+    return true
 }
 
 fn kbd_push(c: u8) {
@@ -189,6 +216,12 @@ fn kbd_translate(sc: u8) -> u8 {
     if kbd_shift != 0 {
         c = keymap_shift[code as usize]
     }
+    if kbd_layout == layout_fr {
+        c = keymap_fr[code as usize]
+        if kbd_shift != 0 {
+            c = keymap_fr_shift[code as usize]
+        }
+    }
     if kbd_caps && is_letter(c) {
         c ^= 0x20
     }
@@ -201,12 +234,12 @@ fn kbd_translate(sc: u8) -> u8 {
 fn read_key() -> u8 {
     loop {
         cli()
+        let k = kbd_try_read()
+        if k >= 0 {
+            sti()
+            return k as u8
+        }
         if !routing_active() {
-            let k = kbd_try_read()
-            if k >= 0 {
-                sti()
-                return k as u8
-            }
             let s = serial_poll()
             if s >= 0 {
                 sti()

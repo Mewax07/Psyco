@@ -1,6 +1,7 @@
 /// Wiki Doc sources:
 ///   - https://wiki.osdev.org/PCI
 ///   - https://wiki.osdev.org/PCI#Configuration_Space_Access_Mechanism_.231
+///   - https://wiki.osdev.org/PCI#Base_Address_Registers
 
 #![trusted]
 
@@ -19,6 +20,10 @@ const pci_class_offset: u32 = 0x08
 const pci_header_offset: u32 = 0x0C
 const pci_bar0_offset: u32 = 0x10
 const pci_interrupt_offset: u32 = 0x3C
+const pci_cap_pointer_offset: u32 = 0x34
+const pci_status_has_caps: u32 = 0x100000
+const pci_cap_mask: u32 = 0xFC
+const pci_max_caps: u32 = 48
 
 const pci_command_io: u32 = 0x1
 const pci_command_memory: u32 = 0x2
@@ -26,6 +31,10 @@ const pci_command_bus_master: u32 = 0x4
 
 const pci_multifunction: u32 = 0x80
 const pci_bar_io: u32 = 0x1
+const pci_bar_kind: u32 = 0x6
+const pci_bar_64: u32 = 0x4
+const pci_bar_memory_mask: u32 = 0xFFFFFFF0
+const pci_bar_count: u32 = 6
 
 struct PciAddr {
     bus: u32,
@@ -67,6 +76,11 @@ fn pci_function_count(bus: u32, device: u32) -> u32 {
 }
 
 fn pci_find(vendor: u32, device_a: u32, device_b: u32) -> Option<PciAddr> {
+    return pci_find_nth(vendor, device_a, device_b, 0)
+}
+
+fn pci_find_nth(vendor: u32, device_a: u32, device_b: u32, n: u32) -> Option<PciAddr> {
+    let mut seen: u32 = 0
     for bus in 0..pci_max_bus {
         for device in 0..pci_max_device {
             if pci_vendor(bus, device, 0) == pci_no_vendor {
@@ -78,7 +92,10 @@ fn pci_find(vendor: u32, device_a: u32, device_b: u32) -> Option<PciAddr> {
                 }
                 let id = pci_device_id(bus, device, function)
                 if id == device_a || id == device_b {
-                    return Some(PciAddr { bus: bus, device: device, function: function })
+                    if seen == n {
+                        return Some(PciAddr { bus: bus, device: device, function: function })
+                    }
+                    seen += 1
                 }
             }
         }
@@ -96,6 +113,43 @@ fn pci_io_bar(a: &PciAddr, index: u32) -> u16 {
         return 0
     }
     return (bar & 0xFFFC) as u16
+}
+
+fn pci_config(a: &PciAddr, offset: u32) -> u32 {
+    return pci_read32(a.bus, a.device, a.function, offset)
+}
+
+fn pci_config_byte(a: &PciAddr, offset: u32) -> u32 {
+    return (pci_config(a, offset) >> ((offset & 3) * 8)) & 0xFF
+}
+
+fn pci_first_cap(a: &PciAddr) -> u32 {
+    if pci_config(a, pci_command_offset) & pci_status_has_caps == 0 {
+        return 0
+    }
+    return pci_config_byte(a, pci_cap_pointer_offset) & pci_cap_mask
+}
+
+fn pci_next_cap(a: &PciAddr, cap: u32) -> u32 {
+    return pci_config_byte(a, cap + 1) & pci_cap_mask
+}
+
+fn pci_memory_bar(a: &PciAddr, index: u32) -> Option<u64> {
+    if index >= pci_bar_count {
+        return None
+    }
+    let low = pci_bar(a, index)
+    if low & pci_bar_io != 0 {
+        return None
+    }
+    let mut addr = (low & pci_bar_memory_mask) as u64
+    if low & pci_bar_kind == pci_bar_64 && index + 1 < pci_bar_count {
+        addr |= (pci_bar(a, index + 1) as u64) << 32
+    }
+    if addr == 0 {
+        return None
+    }
+    return Some(addr)
 }
 
 fn pci_enable(a: &PciAddr) {

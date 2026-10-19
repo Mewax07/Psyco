@@ -34,6 +34,7 @@ static mut con_bg: u32 = black
 static mut con_ready: bool = false
 #[setter]
 static mut con_mirror: bool = true
+static mut con_tap: fn(u8)
 
 fn con_init(has_fb: bool) {
     if has_fb {
@@ -99,9 +100,17 @@ fn newline() {
     }
 }
 
+fn set_con_tap(f: fn(u8)) {
+    con_tap = f
+}
+
 fn putc(c: u8) {
     if con_mirror {
         serial_putc(c)
+    }
+    if con_tap as u64 != 0 {
+        let tap = con_tap
+        tap(c)
     }
     if !con_ready {
         return

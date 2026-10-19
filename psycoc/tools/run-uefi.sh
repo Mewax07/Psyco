@@ -11,6 +11,7 @@ WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 mkdir -p "$WORK/esp/EFI/BOOT"
 cp "$EFI" "$WORK/esp/EFI/BOOT/BOOTX64.EFI"
+if [[ -n "${ESP_EXTRA:-}" ]]; then cp -r "$ESP_EXTRA"/. "$WORK/esp/"; fi
 cp "$OVMF_VARS_TEMPLATE" "$WORK/vars.fd"
 
 DISPLAY_ARGS=(-display none)

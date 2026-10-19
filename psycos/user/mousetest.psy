@@ -1,0 +1,134 @@
+/// Wiki Doc sources:
+///   - https://wiki.osdev.org/Mouse_Input
+///   - https://wiki.osdev.org/Message_Passing
+
+import "psy/sys.psy" as sys
+import "psy/gfx.psy" as gfx
+import "psy/wm.psy" as wm
+import "psy/libgui.psy" as gui
+
+const color_a: u32 = 0x308040
+const color_b: u32 = 0x806030
+const probes: [u64; 10] = [150, 49, 300, 200, 162, 145, 450, 300, 100, 100]
+
+static mut a: gui::Window
+static mut b: gui::Window
+
+fn name(id: u64) -> Str {
+    if id == a.id {
+        return "Hello"
+    }
+    if id == b.id {
+        return "Second"
+    }
+    return "?"
+}
+
+fn window(id: u64) -> &mut gui::Window {
+    if id == a.id {
+        return &mut a
+    }
+    return &mut b
+}
+
+fn draw(win: &gui::Window, color: u32, label: Str) {
+    let c = &win.canvas
+    gfx::fill(c, gfx::bounds(c), gfx::bounds(c), color)
+    gfx::text(c, 8, 8, label.as_bytes(), 0xFFFFFF, color, gfx::bounds(c))
+    gui::present_all(win)
+}
+
+fn show_probes() {
+    let mut e = gui::event()
+    for k in 0..probes.len() / 2 {
+        gui::probe(probes[2 * k], probes[2 * k + 1], &mut e)
+        print("probe", probes[2 * k], probes[2 * k + 1], "window", e.window)
+    }
+}
+
+fn color(x: u64, y: u64) -> u64 {
+    let mut e = gui::event()
+    gui::probe(x, y, &mut e)
+    return e.a
+}
+
+fn on_key(id: u64, c: u64) -> bool {
+    if c == 10 || c == 13 {
+        return true
+    }
+    print("key", c, name(id))
+    match c {
+        112 => show_probes(),
+        99 => print("cursor", color(300, 400), color(301, 405), color(310, 400)),
+        113 => return false,
+        _ => {}
+    }
+    return true
+}
+
+fn on_event(e: &gui::Event) -> bool {
+    match e.kind {
+        wm::ev_focus => print("focus", name(e.window), e.a),
+        wm::ev_key => return on_key(e.window, e.a),
+        wm::ev_mouse_down => print("down", name(e.window), gui::event_x(e), gui::event_y(e), e.c),
+        wm::ev_mouse_up => print("up", name(e.window), gui::event_x(e), gui::event_y(e), e.c),
+        wm::ev_mouse_move => {
+            if e.c != 0 {
+                print("drag", name(e.window), gui::event_x(e), gui::event_y(e))
+            }
+        }
+        wm::ev_wheel => print("wheel", name(e.window), gui::event_x(e), gui::event_y(e), gui::event_wheel(e)),
+        wm::ev_resize => {
+            let win = window(e.window)
+            if gui::reshape(win, e.a, e.b) {
+                let mut color = color_a
+                if e.window == b.id {
+                    color = color_b
+                }
+                draw(win, color, name(e.window))
+                print("resize", name(e.window), e.a, e.b)
+            }
+        }
+        wm::ev_close => {
+            let n = name(e.window)
+            gui::close(window(e.window))
+            print("closed", n)
+        }
+        _ => {}
+    }
+    return true
+}
+
+fn main() {
+    if !gui::connect() {
+        exit(3)
+    }
+    let Some(wa) = gui::open(240, 120, 60, 60, "Hello") else {
+        exit(4)
+    }
+    a = wa
+    draw(&a, color_a, "Hello")
+    let Some(wb) = gui::open(200, 100, 200, 140, "Second") else {
+        exit(5)
+    }
+    b = wb
+    draw(&b, color_b, "Second")
+    print("opened", a.id, b.id)
+    let mut e = gui::event()
+    loop {
+        gui::wait(&mut e)
+        if !gui::trusted(&e) {
+            continue
+        }
+        if !on_event(&e) {
+            break
+        }
+    }
+    if a.id != 0 {
+        gui::close(&mut a)
+    }
+    if b.id != 0 {
+        gui::close(&mut b)
+    }
+    print("mousetest done")
+}

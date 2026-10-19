@@ -1,0 +1,146 @@
+/// Wiki Doc sources:
+///   - https://wiki.osdev.org/Message_Passing
+///   - https://wiki.osdev.org/FAT
+
+import "psy/sys.psy" as sys
+import "psy/gfx.psy" as gfx
+import "psy/wm.psy" as wm
+import "psy/libgui.psy" as gui
+import "psy/prefs.psy" as prefs
+
+const panel: u32 = 0xF0F0F0
+const ink: u32 = 0x202020
+const palette_size: usize = 4
+const line_h: i64 = 28
+const first_row: i64 = 12
+const row_count: i64 = 3
+
+static mut win: gui::Window
+static mut cfg: prefs::Prefs
+static wallpapers: [u32; 4] = [0x204060, 0x306030, 0x603040, 0x404040]
+static accents: [u32; 4] = [0x5A7AB0, 0xB05A5A, 0x5AB07A, 0xB0905A]
+
+fn next_in(list: &[u32; 4], current: u32) -> u32 {
+    for i in 0..palette_size {
+        if list[i] == current {
+            return list[(i + 1) % palette_size]
+        }
+    }
+    return list[0]
+}
+
+fn row(y: i64, label: Str, swatch: u32, show: bool) {
+    let c = &win.canvas
+    let all = gfx::bounds(c)
+    gfx::text(c, 16, y, label.as_bytes(), ink, panel, all)
+    if show {
+        let r = gfx::rect(220, y, 100, gfx::char_h())
+        gfx::fill(c, r, all, swatch)
+        gfx::frame(c, r, all, ink)
+    }
+}
+
+fn draw() {
+    let c = &win.canvas
+    let all = gfx::bounds(c)
+    gfx::fill(c, all, all, panel)
+    row(first_row, "w  Wallpaper", cfg.wallpaper, true)
+    row(first_row + line_h, "a  Accent color", cfg.accent, true)
+    if cfg.keyboard == prefs::keyboard_fr {
+        row(first_row + 2 * line_h, "k  Keyboard: fr (AZERTY)", 0, false)
+    } else {
+        row(first_row + 2 * line_h, "k  Keyboard: us (QWERTY)", 0, false)
+    }
+    row(first_row + 3 * line_h + 8, "Esc q  close, or click a line", 0, false)
+    gui::present_all(&win)
+}
+
+fn apply() {
+    let saved = prefs::save(&cfg)
+    sys::set_keymap(cfg.keyboard)
+    gui::reload_prefs()
+    draw()
+    print("saved", saved, "wallpaper", cfg.wallpaper, "accent", cfg.accent, "keyboard", cfg.keyboard)
+}
+
+fn show_probe() {
+    let mut e = gui::event()
+    gui::probe(10, 10, &mut e)
+    let w = e.a
+    gui::probe(110, 585, &mut e)
+    print("probe wallpaper", w, "accent", e.a)
+}
+
+fn on_click(y: i64) {
+    let top = first_row - (line_h - gfx::char_h()) / 2
+    if y < top {
+        return
+    }
+    let r = (y - top) / line_h
+    if r >= row_count {
+        return
+    }
+    print("click row", r)
+    let keys = [119u64, 97, 107]
+    choose(keys[r as usize])
+}
+
+fn on_key(c: u64) {
+    print("key", c)
+    choose(c)
+}
+
+fn choose(c: u64) {
+    match c {
+        119 => {
+            cfg.wallpaper = next_in(&wallpapers, cfg.wallpaper)
+            apply()
+        }
+        97 => {
+            cfg.accent = next_in(&accents, cfg.accent)
+            apply()
+        }
+        107 => {
+            cfg.keyboard = 1 - cfg.keyboard
+            apply()
+        }
+        112 => show_probe(),
+        _ => {}
+    }
+}
+
+fn main() {
+    if !gui::connect() {
+        exit(3)
+    }
+    cfg = prefs::defaults()
+    let found = prefs::load(&mut cfg)
+    print("settings: loaded", found, "wallpaper", cfg.wallpaper, "accent", cfg.accent, "keyboard", cfg.keyboard)
+    let Some(w) = gui::open(360, 140, 220, 160, "Settings") else {
+        exit(4)
+    }
+    win = w
+    draw()
+    let mut e = gui::event()
+    loop {
+        gui::wait(&mut e)
+        if !gui::trusted(&e) {
+            continue
+        }
+        match e.kind {
+            wm::ev_key => {
+                if e.a != 10 && e.a != 13 {
+                    on_key(e.a)
+                }
+            }
+            wm::ev_mouse_down => {
+                if e.c == wm::button_left {
+                    on_click(gui::event_y(&e))
+                }
+            }
+            wm::ev_close => break,
+            _ => {}
+        }
+    }
+    gui::close(&mut win)
+}

@@ -21,6 +21,8 @@ const pte_user: u64 = 0x4
 const pte_huge: u64 = 0x80
 const pte_global: u64 = 0x100
 const pte_shared: u64 = 0x200
+const pte_write_through: u64 = 0x8
+const pte_no_cache: u64 = 0x10
 const pte_addr_mask: u64 = 0x000FFFFFFFFFF000
 
 const entries_per_table: u64 = 512
@@ -40,6 +42,9 @@ const pml4_direct_map_slot: usize = 256
 
 const not_mapped: u64 = 0xFFFFFFFFFFFFFFFF
 
+const mmio_base: u64 = 0xFFFFB00000000000
+const mmio_limit: u64 = 0xFFFFB00040000000
+
 #[getter]
 static mut pml4_phys: u64 = 0
 #[getter]
@@ -48,6 +53,7 @@ static mut identity_limit: u64 = 0
 static mut table_pages: u64 = 0
 #[getter]
 static mut paging_ready: bool = false
+static mut mmio_next: u64 = mmio_base
 
 fn phys_ptr(phys: u64) -> *mut u64 {
     if paging_ready {
@@ -325,6 +331,25 @@ fn rebase_kernel_statics() {
 
 fn zero_phys(phys: u64, bytes: u64) {
     memset(phys_to_virt(phys) as *mut u8, 0, bytes as usize)
+}
+
+fn map_mmio(phys: u64, len: u64) -> Option<u64> {
+    if len == 0 {
+        return None
+    }
+    let first = phys / size_4k * size_4k
+    let pages = (phys + len - first + size_4k - 1) / size_4k
+    if pages * size_4k > mmio_limit - mmio_next {
+        return None
+    }
+    let virt = mmio_next
+    for p in 0..pages {
+        if !map_page(virt + p * size_4k, first + p * size_4k, pte_write_through | pte_no_cache) {
+            return None
+        }
+    }
+    mmio_next = virt + pages * size_4k
+    return Some(virt + (phys - first))
 }
 
 fn phys_to_virt(phys: u64) -> u64 {

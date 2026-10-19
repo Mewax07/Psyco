@@ -2,8 +2,6 @@
 ///   - https://wiki.osdev.org/System_Calls
 ///   - https://man7.org/linux/man-pages/man2/syscall.2.html
 
-// Constants
-
 const version: u64 = 1
 const first_call: u64 = 0x1000
 
@@ -43,9 +41,17 @@ const sys_input_release: u64 = 0x1041
 
 const sys_display_claim: u64 = 0x1050
 const sys_display_info: u64 = 0x1051
+const sys_console_attach: u64 = 0x1060
+const sys_console_read: u64 = 0x1061
+const sys_console_input: u64 = 0x1062
+const sys_file_read: u64 = 0x1070
+const sys_file_write: u64 = 0x1071
+const sys_set_keymap: u64 = 0x1080
 
 const msg_surface: u64 = 0xF001
 const msg_key: u64 = 0xF002
+const msg_console: u64 = 0xF003
+const msg_mouse: u64 = 0xF004
 
 const err_perm: i64 = 1
 const err_noent: i64 = 2

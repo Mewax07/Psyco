@@ -4,5 +4,6 @@ cd .\psycoc
   -drive "if=pflash,format=raw,readonly=on,file=C:\Program Files\qemu\share\edk2-x86_64-code.fd" `
   -drive format=raw,file=fat:rw:esp `
   -drive file=disk.img,if=virtio,format=raw `
+  -device virtio-tablet-pci `
   -serial stdio -device isa-debug-exit,iobase=0xf4,iosize=0x04
 cd ..

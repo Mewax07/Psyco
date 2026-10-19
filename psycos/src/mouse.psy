@@ -1,0 +1,230 @@
+/// Wiki Doc sources:
+///   - https://wiki.osdev.org/PS/2_Mouse
+///   - https://wiki.osdev.org/Mouse_Input
+
+import "ps2.psy"
+import "idt.psy"
+import "pic.psy"
+import "fb.psy"
+import "virtio_input.psy" as tablet
+
+const mouse_irq: u8 = 12
+const mouse_vector: usize = 44
+
+const source_ps2: u64 = 1
+const source_tablet: u64 = 2
+
+const button_left: u64 = 1
+const button_right: u64 = 2
+const button_middle: u64 = 4
+const button_mask: u64 = 7
+
+const flag_always_one: u8 = 0x08
+const flag_x_sign: u8 = 0x10
+const flag_y_sign: u8 = 0x20
+const flag_overflow: u8 = 0xC0
+
+#[getter]
+static mut mouse_x: i64 = 0
+#[getter]
+static mut mouse_y: i64 = 0
+#[getter]
+static mut mouse_buttons: u64 = 0
+#[getter]
+static mut mouse_wheel: i64 = 0
+#[getter]
+static mut mouse_source: u64 = 0
+#[getter]
+static mut mouse_packet_size: usize = 0
+#[getter]
+static mut mouse_packets: u64 = 0
+#[getter]
+static mut mouse_resyncs: u64 = 0
+#[getter]
+static mut mouse_overflows: u64 = 0
+#[getter]
+static mut pointer_moved: bool = false
+
+static mut packet: [u8; 4]
+static mut packet_len: usize = 0
+static mut ps2_buttons: u64 = 0
+static mut tablet_buttons: u64 = 0
+static mut wheel_pending: i64 = 0
+static mut tablet_x: i64 = 0
+static mut tablet_y: i64 = 0
+static mut tablet_held: u64 = 0
+static mut tablet_wheel: i64 = 0
+
+#[setter]
+static mut pointer_hook: fn(bool)
+
+fn mouse_init() {
+    mouse_x = (get_fb_width() / 2) as i64
+    mouse_y = (get_fb_height() / 2) as i64
+    mouse_packet_size = ps2_mouse_init()
+    if mouse_packet_size != 0 {
+        idt_set_gate(mouse_vector, irq_mouse as u64, 0)
+        pic_unmask(mouse_irq)
+    }
+}
+
+#[interrupt]
+fn irq_mouse(frame: &Frame) {
+    while let Some(b) = ps2_aux_byte() {
+        mouse_byte(b)
+    }
+    pic_eoi(mouse_irq)
+}
+
+fn mouse_byte(b: u8) {
+    if mouse_packet_size == 0 {
+        return
+    }
+    if packet_len == 0 && b & flag_always_one == 0 {
+        mouse_resyncs += 1
+        return
+    }
+    packet[packet_len] = b
+    packet_len += 1
+    if packet_len < mouse_packet_size {
+        return
+    }
+    packet_len = 0
+    mouse_packets += 1
+    let flags = packet[0]
+    if flags & flag_overflow != 0 {
+        mouse_overflows += 1
+        return
+    }
+    let mut dx = packet[1] as i64
+    if flags & flag_x_sign != 0 {
+        dx -= 256
+    }
+    let mut dy = packet[2] as i64
+    if flags & flag_y_sign != 0 {
+        dy -= 256
+    }
+    let mut dz: i64 = 0
+    if mouse_packet_size == 4 {
+        let z = packet[3] & 0x0F
+        dz = z as i64
+        if z & 0x08 != 0 {
+            dz -= 16
+        }
+    }
+    ps2_buttons = flags as u64 & button_mask
+    pointer_set(source_ps2, mouse_x + dx, mouse_y - dy, 0 - dz)
+}
+
+fn clamp_axis(v: i64, size: usize) -> i64 {
+    if v < 0 || size == 0 {
+        return 0
+    }
+    if v >= size as i64 {
+        return size as i64 - 1
+    }
+    return v
+}
+
+fn pointer_set(source: u64, x: i64, y: i64, wheel: i64) {
+    let nx = clamp_axis(x, get_fb_width())
+    let ny = clamp_axis(y, get_fb_height())
+    let buttons = ps2_buttons | tablet_buttons
+    let urgent = buttons != mouse_buttons || wheel != 0
+    let moved = nx != mouse_x || ny != mouse_y
+    mouse_source = source
+    mouse_x = nx
+    mouse_y = ny
+    mouse_buttons = buttons
+    mouse_wheel += wheel
+    wheel_pending += wheel
+    if moved {
+        pointer_moved = true
+    }
+    if (urgent || moved) && pointer_hook as u64 != 0 {
+        let hook = pointer_hook
+        hook(urgent)
+    }
+}
+
+fn pointer_scaled(v: i64, min: i64, max: i64, size: usize) -> i64 {
+    if max <= min {
+        return 0
+    }
+    return (v - min) * size as i64 / (max - min + 1)
+}
+
+fn tablet_init() {
+    if tablet::init() {
+        tablet_x = tablet::get_axis_x().min
+        tablet_y = tablet::get_axis_y().min
+    }
+}
+
+fn tablet_button(code: u16) -> u64 {
+    if code == tablet::btn_left {
+        return button_left
+    }
+    if code == tablet::btn_right {
+        return button_right
+    }
+    if code == tablet::btn_middle {
+        return button_middle
+    }
+    return 0
+}
+
+fn tablet_event(e: tablet::Event) {
+    let value = e.value as i32 as i64
+    if e.kind == tablet::ev_abs {
+        if e.code == tablet::abs_x {
+            tablet_x = value
+        } else if e.code == tablet::abs_y {
+            tablet_y = value
+        }
+    } else if e.kind == tablet::ev_key {
+        let bit = tablet_button(e.code)
+        if value != 0 {
+            tablet_held |= bit
+        } else {
+            tablet_held &= ~bit
+        }
+    } else if e.kind == tablet::ev_rel && e.code == tablet::rel_wheel {
+        tablet_wheel += value
+    } else if e.kind == tablet::ev_syn {
+        let ax = tablet::get_axis_x()
+        let ay = tablet::get_axis_y()
+        let x = pointer_scaled(tablet_x, ax.min, ax.max, get_fb_width())
+        let y = pointer_scaled(tablet_y, ay.min, ay.max, get_fb_height())
+        tablet_buttons = tablet_held
+        let wheel = tablet_wheel
+        tablet_wheel = 0
+        pointer_set(source_tablet, x, y, wheel)
+    }
+}
+
+fn tablet_poll() {
+    if !tablet::get_ready() {
+        return
+    }
+    while let Some(e) = tablet::next() {
+        tablet_event(e)
+    }
+    tablet::kick()
+}
+
+fn pointer_take_wheel() -> i64 {
+    let w = wheel_pending
+    wheel_pending = 0
+    pointer_moved = false
+    return w
+}
+
+fn pointer_forget() {
+    wheel_pending = 0
+    pointer_moved = false
+}
+
+fn mouse_present() -> bool {
+    return mouse_packet_size != 0
+}

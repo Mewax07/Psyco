@@ -16,6 +16,7 @@ struct Window {
 }
 
 struct Event {
+    sender: u64,
     kind: u64,
     window: u64,
     a: u64,
@@ -60,7 +61,31 @@ fn send(m: &sys::Message) {
 }
 
 fn to_event(m: &sys::Message) -> Event {
-    return Event { kind: m.kind, window: m.data[0], a: m.data[1], b: m.data[2], c: m.data[3] }
+    return Event { sender: m.sender, kind: m.kind, window: m.data[0], a: m.data[1], b: m.data[2], c: m.data[3] }
+}
+
+fn event() -> Event {
+    return Event { sender: 0, kind: 0, window: 0, a: 0, b: 0, c: 0 }
+}
+
+fn trusted(e: &Event) -> bool {
+    return e.sender == 0 || e.sender == server_pid
+}
+
+fn event_x(e: &Event) -> i64 {
+    return e.a as i64
+}
+
+fn event_y(e: &Event) -> i64 {
+    return e.b as i64
+}
+
+fn event_wheel(e: &Event) -> i64 {
+    return e.c as i64
+}
+
+fn event_port() -> u64 {
+    return events
 }
 
 fn stash(e: Event) {
@@ -78,9 +103,7 @@ fn await_kind(kind: u64, m: &mut sys::Message) {
             server_pid = m.sender
             return
         }
-        if from_server(m) {
-            stash(to_event(m))
-        }
+        stash(to_event(m))
     }
 }
 
@@ -207,13 +230,8 @@ fn wait(e: &mut Event) {
         return
     }
     let mut m = message(0)
-    loop {
-        sys::recv(events, &mut m)
-        if from_server(&m) {
-            *e = to_event(&m)
-            return
-        }
-    }
+    sys::recv(events, &mut m)
+    *e = to_event(&m)
 }
 
 fn probe(x: u64, y: u64, e: &mut Event) {
@@ -223,10 +241,14 @@ fn probe(x: u64, y: u64, e: &mut Event) {
     m.data[2] = events
     send(&m)
     await_kind(wm::probe_reply, &mut m)
-    *e = Event { kind: m.kind, window: m.data[1], a: m.data[0], b: m.data[3], c: m.data[4] }
+    *e = Event { sender: m.sender, kind: m.kind, window: m.data[1], a: m.data[0], b: m.data[3], c: m.data[4] }
     if m.data[2] != m.data[0] {
         e.a = 0xFFFFFFFF
     }
+}
+
+fn reload_prefs() {
+    send(&message(wm::reload))
 }
 
 fn crash_server() {

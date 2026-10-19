@@ -51,6 +51,13 @@ fn config_find(key: Str) -> Option<ConfigRange> {
     return None
 }
 
+fn config_is(key: Str, value: Str) -> bool {
+    let Some(r) = config_find(key) else {
+        return false
+    }
+    return bytes_equal(&config_text[r.start..r.end], value.as_bytes())
+}
+
 fn parse_decimal(r: ConfigRange, pos: &mut usize) -> usize {
     let mut v: usize = 0
     while *pos < r.end && config_text[*pos] >= '0' && config_text[*pos] <= '9' {

@@ -112,6 +112,10 @@ fn port_send(id: u64, msg: u64) -> i64 {
     return 0
 }
 
+fn port_room(p: usize) -> usize {
+    return port_queue_size - ports[p].count
+}
+
 fn port_owner(p: usize) -> u64 {
     return ports[p].owner
 }

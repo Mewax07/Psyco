@@ -11,6 +11,8 @@ import "surface.psy"
 import "input.psy"
 import "display.psy"
 import "clock.psy"
+import "term.psy"
+import "ufile.psy"
 import "../user/psy/abi.psy" as abi
 
 const write_chunk_size: usize = 128
@@ -55,6 +57,12 @@ fn psy_dispatch(n: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u64) ->
         abi::sys_port_recv_timeout => return port_recv_timeout(a1, a2, a3),
         abi::sys_display_claim => return display_claim(),
         abi::sys_display_info => return display_info(a1),
+        abi::sys_console_attach => return console_attach(a1),
+        abi::sys_console_read => return console_read(a1, a2),
+        abi::sys_console_input => return console_input(a1),
+        abi::sys_file_read => return file_read(a1, a2, a3, a4),
+        abi::sys_file_write => return file_write(a1, a2, a3, a4),
+        abi::sys_set_keymap => return set_keymap(a1),
         _ => return -abi::err_nosys,
     }
 }

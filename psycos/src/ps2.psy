@@ -1,6 +1,7 @@
 /// Wiki Doc sources:
 ///   - https://wiki.osdev.org/I8042_PS/2_Controller
 ///   - https://wiki.osdev.org/PS/2_Keyboard
+///   - https://wiki.osdev.org/PS/2_Mouse
 
 #![trusted]
 
@@ -15,10 +16,23 @@ const status_from_mouse: u8 = 0x20
 const cmd_read_config: u8 = 0x20
 const cmd_write_config: u8 = 0x60
 const cmd_inject_keyboard_byte: u8 = 0xD2
+const cmd_enable_aux: u8 = 0xA8
+const cmd_write_aux: u8 = 0xD4
 
 const config_keyboard_irq: u8 = 0x01
 const config_mouse_irq: u8 = 0x02
+const config_aux_clock_off: u8 = 0x20
 const config_translation: u8 = 0x40
+
+const aux_ack: u8 = 0xFA
+const aux_set_defaults: u8 = 0xF6
+const aux_enable_reporting: u8 = 0xF4
+const aux_set_sample_rate: u8 = 0xF3
+const aux_get_id: u8 = 0xF2
+const aux_id_wheel: u8 = 3
+const aux_wheel_rates: [u8; 3] = [200, 100, 80]
+const aux_packet_plain: usize = 3
+const aux_packet_wheel: usize = 4
 
 const ps2_timeout: i64 = 100000
 const max_stale_bytes: i64 = 32
@@ -105,4 +119,96 @@ fn ps2_inject(byte: u8) -> bool {
         pause()
     }
     return false
+}
+
+fn ps2_read_aux() -> Option<u8> {
+    for i in 0..ps2_timeout {
+        let status = inb(ps2_status)
+        if status & status_output_full != 0 {
+            let data = inb(ps2_data)
+            if status & status_from_mouse != 0 {
+                return Some(data)
+            }
+        } else {
+            pause()
+        }
+    }
+    return None
+}
+
+fn ps2_aux_send(byte: u8) -> bool {
+    if !ps2_wait_write() {
+        return false
+    }
+    outb(ps2_command, cmd_write_aux)
+    if !ps2_wait_write() {
+        return false
+    }
+    outb(ps2_data, byte)
+    let Some(reply) = ps2_read_aux() else {
+        return false
+    }
+    return reply == aux_ack
+}
+
+fn ps2_write_config(set: u8, clear: u8) -> bool {
+    if !ps2_wait_write() {
+        return false
+    }
+    outb(ps2_command, cmd_read_config)
+    if !ps2_wait_read() {
+        return false
+    }
+    let config = (inb(ps2_data) & ~clear) | set
+    if !ps2_wait_write() {
+        return false
+    }
+    outb(ps2_command, cmd_write_config)
+    if !ps2_wait_write() {
+        return false
+    }
+    outb(ps2_data, config)
+    return true
+}
+
+fn ps2_mouse_init() -> usize {
+    if inb(ps2_status) == 0xFF || !ps2_wait_write() {
+        return 0
+    }
+    outb(ps2_command, cmd_enable_aux)
+    if !ps2_write_config(0, config_mouse_irq | config_aux_clock_off) {
+        return 0
+    }
+    if !ps2_aux_send(aux_set_defaults) {
+        return 0
+    }
+    for i in 0..aux_wheel_rates.len() {
+        if !ps2_aux_send(aux_set_sample_rate) || !ps2_aux_send(aux_wheel_rates[i]) {
+            return 0
+        }
+    }
+    if !ps2_aux_send(aux_get_id) {
+        return 0
+    }
+    let Some(id) = ps2_read_aux() else {
+        return 0
+    }
+    if !ps2_aux_send(aux_enable_reporting) {
+        return 0
+    }
+    if !ps2_write_config(config_mouse_irq, config_aux_clock_off) {
+        return 0
+    }
+    if id == aux_id_wheel {
+        return aux_packet_wheel
+    }
+    return aux_packet_plain
+}
+
+fn ps2_aux_byte() -> Option<u8> {
+    let status = inb(ps2_status)
+    if status & status_output_full == 0 || status & status_from_mouse == 0 {
+        return None
+    }
+    return Some(inb(ps2_data))
 }

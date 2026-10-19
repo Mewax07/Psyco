@@ -23,6 +23,9 @@ import "programs.psy"
 import "virtio_blk.psy"
 import "fat32.psy"
 import "clock.psy"
+import "term.psy"
+import "mouse.psy"
+import "input.psy"
 
 const line_max: usize = 76
 const bytes_per_kib: u64 = 1024
@@ -94,6 +97,7 @@ fn cmd_help() {
     puts("  kill N     stop the task in slot N\n")
     puts("  progs      list the user programs\n")
     puts("  lspci      list PCI devices\n")
+    puts("  mouse      pointer position, buttons and devices\n")
     puts("  ls [DIR]   list a directory of the disk (default /)\n")
     puts("  cat FILE   print a file\n")
     puts("  write F T  write the text T into file F (created or replaced)\n")
@@ -102,6 +106,7 @@ fn cmd_help() {
     puts("  df         disk usage\n")
     puts("  run P      run a user program (ring 3): /path, /bin/P or built-in\n")
     puts("  start P    same, in the background\n")
+    puts("  gui        start the window server and a terminal\n")
     puts("  fb         framebuffer info and test pattern\n")
     puts("  echo TXT   print TXT\n")
     puts("  int3       trigger a breakpoint (execution resumes)\n")
@@ -453,6 +458,44 @@ fn cmd_lspci() {
     }
 }
 
+fn cmd_mouse() {
+    puts("mouse: ")
+    if !mouse_present() {
+        puts("no ps2")
+    } else if get_mouse_packet_size() == 4 {
+        puts("ps2 wheel")
+    } else {
+        puts("ps2")
+    }
+    puts(", tablet ")
+    if tablet::get_ready() {
+        puts("on")
+    } else {
+        puts("off")
+    }
+    puts("\npointer: ")
+    put_i64(get_mouse_x())
+    putc(' ')
+    put_i64(get_mouse_y())
+    puts(" buttons ")
+    put_u64(get_mouse_buttons())
+    puts(" wheel ")
+    put_i64(get_mouse_wheel())
+    puts("\npackets: ")
+    put_u64(get_mouse_packets())
+    puts(", resyncs ")
+    put_u64(get_mouse_resyncs())
+    puts(", overflows ")
+    put_u64(get_mouse_overflows())
+    puts(", tablet events ")
+    put_u64(tablet::get_events())
+    puts(", routed ")
+    put_u64(get_pointer_routed())
+    puts(", dropped ")
+    put_u64(get_pointer_dropped())
+    putc('\n')
+}
+
 fn cmd_progs() {
     set_color(yellow)
     puts("User programs (ring 3, psycoc Linux executables):\n")
@@ -533,6 +576,25 @@ fn cmd_run(start: usize, wait: bool) {
     put_i64(code)
     putc('\n')
     set_color(white)
+}
+
+fn cmd_gui() {
+    let server = process_spawn_file("/bin/windowserver".as_bytes())
+    if server < 0 {
+        puts("gui: /bin/windowserver not found\n")
+        return
+    }
+    let term = process_spawn_file("/bin/terminal".as_bytes())
+    if term < 0 {
+        task_kill(server as usize)
+        puts("gui: /bin/terminal not found\n")
+        return
+    }
+    puts("gui: window server in slot ")
+    put_u64(server as u64)
+    puts(", terminal in slot ")
+    put_u64(term as u64)
+    putc('\n')
 }
 
 fn skip_spaces(start: usize) -> usize {
@@ -793,6 +855,8 @@ fn run_command() {
         cmd_progs()
     } else if line_is("lspci") {
         cmd_lspci()
+    } else if line_is("mouse") {
+        cmd_mouse()
     } else if line_is("ls") || line_starts_with("ls ") {
         cmd_ls(2)
     } else if line_starts_with("cat ") {
@@ -809,6 +873,8 @@ fn run_command() {
         cmd_run(4, true)
     } else if line_starts_with("start ") {
         cmd_run(6, false)
+    } else if line_is("gui") {
+        cmd_gui()
     } else if line_is("int3") {
         int3()
         puts("resumed after int3 (")
@@ -894,11 +960,17 @@ fn kmain() {
         fat_mount()
     }
     kbd_init()
+    mouse_init()
+    tablet_init()
     input_init()
+    term_init()
     sti()
     clock_init()
     print("PsycOS: boot ok")
     banner()
+    if config_is("gui", "on") {
+        cmd_gui()
+    }
     loop {
         prompt()
         read_line()

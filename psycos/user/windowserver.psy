@@ -1,15 +1,16 @@
 /// Wiki Doc sources:
 ///   - https://wiki.osdev.org/Drawing_In_a_Linear_Framebuffer
 ///   - https://wiki.osdev.org/Message_Passing
+///   - https://wiki.osdev.org/Mouse_Input
 
 import "psy/sys.psy" as sys
 import "psy/abi.psy" as abi
 import "psy/gfx.psy" as gfx
 import "psy/wm.psy" as wm
+import "psy/prefs.psy" as prefs
 
 const max_windows: usize = 16
 const max_dirty: usize = 16
-const wallpaper: u32 = 0x204060
 const idle_ms: u64 = 200
 const title_on: u32 = 0xE0E0E0
 const title_off: u32 = 0xA8A8A8
@@ -21,12 +22,41 @@ const maximize_color: u32 = 0x40B040
 const button_r: i64 = 6
 const step: i64 = 20
 const bar_color: u32 = 0x303030
-const button_on: u32 = 0x5A7AB0
 const button_off: u32 = 0x707070
 const button_min: u32 = 0x484848
 const bar_text: u32 = 0xFFFFFF
 const button_w: i64 = 120
 const button_gap: i64 = 4
+const grip: i64 = 4
+const corner: i64 = 12
+const button_hit: i64 = 8
+const double_click_ms: u64 = 400
+const resize_wait_ms: u64 = 500
+const cursor_w: i64 = 12
+const cursor_h: i64 = 19
+const cursor_edge_color: u32 = 0x000000
+const cursor_fill_color: u32 = 0xFFFFFF
+const cursor_edge: [u16; 19] = [0x800, 0xC00, 0xA00, 0x900, 0x880, 0x840, 0x820, 0x810, 0x808, 0x804, 0x802, 0x81F, 0x890, 0x990, 0xA48, 0xC48, 0x824, 0x024, 0x018]
+const cursor_fill: [u16; 19] = [0x000, 0x000, 0x400, 0x600, 0x700, 0x780, 0x7C0, 0x7E0, 0x7F0, 0x7F8, 0x7FC, 0x7E0, 0x760, 0x660, 0x430, 0x030, 0x018, 0x018, 0x000]
+
+const part_content: u64 = 1
+const part_title: u64 = 2
+const part_close: u64 = 3
+const part_minimize: u64 = 4
+const part_maximize: u64 = 5
+const part_edge: u64 = 6
+
+const edge_left: u64 = 1
+const edge_right: u64 = 2
+const edge_top: u64 = 4
+const edge_bottom: u64 = 8
+
+const drag_none: u64 = 0
+const drag_move: u64 = 1
+const drag_resize: u64 = 2
+const drag_button: u64 = 3
+const drag_app: u64 = 4
+const drag_bar: u64 = 5
 
 struct Window {
     used: bool,
@@ -42,6 +72,20 @@ struct Window {
     minimized: bool,
     maximized: bool,
     saved: gfx::Rect,
+    resizing: bool,
+    resize_ms: u64,
+    want_w: i64,
+    want_h: i64,
+    sizing: bool,
+    anchor: u64,
+    anchor_right: i64,
+    anchor_bottom: i64,
+}
+
+struct Hit {
+    index: usize,
+    part: u64,
+    edges: u64,
 }
 
 static mut windows: [Window; 16]
@@ -57,6 +101,22 @@ static mut focused: u64 = 0
 static mut input_held: bool = false
 static mut esc_pending: bool = false
 static mut bar_sig: u64 = 0
+static mut wallpaper_color: u32 = 0x204060
+static mut accent_color: u32 = 0x5A7AB0
+static mut had_windows: bool = false
+static mut pointer_on: bool = false
+static mut px: i64 = 0
+static mut py: i64 = 0
+static mut pbuttons: u64 = 0
+static mut drag: u64 = 0
+static mut drag_win: u64 = 0
+static mut drag_part: u64 = 0
+static mut drag_edges: u64 = 0
+static mut drag_x0: i64 = 0
+static mut drag_y0: i64 = 0
+static mut drag_start: gfx::Rect
+static mut last_click_ms: u64 = 0
+static mut last_click_win: u64 = 0
 
 fn damage(r: gfx::Rect) {
     let a = gfx::intersect(r, gfx::bounds(&back))
@@ -97,10 +157,12 @@ fn draw_frame(i: usize, clip: gfx::Rect) {
         return
     }
     let mut bar = title_off
+    let mut edge = border_color
     if windows[i].id == focused {
         bar = title_on
+        edge = accent_color
     }
-    gfx::frame(&back, f, clip, border_color)
+    gfx::frame(&back, f, clip, edge)
     gfx::fill(&back, gfx::rect(t.x + 1, t.y + 1, t.w - 2, t.h - 1), clip, bar)
     let cy = t.y + wm::title_h / 2
     gfx::disc(&back, t.x + 12, cy, button_r, clip, close_color)
@@ -118,7 +180,7 @@ fn draw_frame(i: usize, clip: gfx::Rect) {
 }
 
 fn compose_rect(r: gfx::Rect) {
-    gfx::fill(&back, r, r, wallpaper)
+    gfx::fill(&back, r, r, wallpaper_color)
     for k in 0..zcount {
         let i = zorder[k]
         if windows[i].minimized {
@@ -128,7 +190,33 @@ fn compose_rect(r: gfx::Rect) {
         gfx::blit(&back, windows[i].x, windows[i].y, &windows[i].pixels, r)
     }
     draw_taskbar(r)
+    draw_cursor(r)
     gfx::copy(&screen, &back, r)
+}
+
+fn cursor_rect() -> gfx::Rect {
+    return gfx::rect(px, py, cursor_w, cursor_h)
+}
+
+fn draw_cursor(clip: gfx::Rect) {
+    if !pointer_on || gfx::is_empty(gfx::intersect(cursor_rect(), clip)) {
+        return
+    }
+    for row in 0..cursor_h as usize {
+        for col in 0..cursor_w as usize {
+            let bit = 0x800u16 >> col as u16
+            let x = px + col as i64
+            let y = py + row as i64
+            if !gfx::contains(clip, x, y) {
+                continue
+            }
+            if cursor_edge[row] & bit != 0 {
+                gfx::put(&back, x, y, cursor_edge_color)
+            } else if cursor_fill[row] & bit != 0 {
+                gfx::put(&back, x, y, cursor_fill_color)
+            }
+        }
+    }
 }
 
 fn taskbar_rect() -> gfx::Rect {
@@ -158,7 +246,7 @@ fn draw_button(k: usize, i: usize, clip: gfx::Rect) {
     if windows[i].minimized {
         color = button_min
     } else if windows[i].id == focused {
-        color = button_on
+        color = accent_color
     }
     gfx::fill(&back, b, clip, color)
     let inner = gfx::intersect(clip, gfx::rect(b.x + 4, b.y, b.w - 8, b.h))
@@ -290,10 +378,15 @@ fn top_id() -> u64 {
 }
 
 fn notify(i: usize, kind: u64, a: u64, b: u64) {
+    notify3(i, kind, a, b, 0)
+}
+
+fn notify3(i: usize, kind: u64, a: u64, b: u64, c: u64) {
     let mut m = sys::Message { sender: 0, kind: kind, data: [0u64; 6] }
     m.data[0] = windows[i].id
     m.data[1] = a
     m.data[2] = b
+    m.data[3] = c
     sys::send(windows[i].events, &m)
 }
 
@@ -366,10 +459,49 @@ fn attach_surface(i: usize, id: u64) {
     let h = (info as u64 >> 32) as i64
     windows[i].surface = id
     windows[i].pixels = gfx::canvas(base as u64, w, h, w)
+    windows[i].resizing = false
+    if windows[i].sizing {
+        if windows[i].anchor & edge_left != 0 {
+            windows[i].x = windows[i].anchor_right - w
+        }
+        if windows[i].anchor & edge_top != 0 {
+            windows[i].y = windows[i].anchor_bottom - h
+        }
+    }
     damage(frame_rect(i))
+    if windows[i].sizing {
+        settle_size(i)
+    }
+}
+
+fn settle_size(i: usize) {
+    if windows[i].want_w != windows[i].pixels.width || windows[i].want_h != windows[i].pixels.height {
+        drag_size(i, windows[i].want_w, windows[i].want_h)
+    } else if !(drag == drag_resize && drag_win == windows[i].id) {
+        windows[i].sizing = false
+        windows[i].anchor = 0
+    }
+}
+
+fn drag_size(i: usize, w: i64, h: i64) {
+    let ww = clamp(w as u64, wm::min_side, back.width as u64) as i64
+    let hh = clamp(h as u64, wm::min_side, back.height as u64) as i64
+    windows[i].want_w = ww
+    windows[i].want_h = hh
+    if windows[i].resizing && sys::uptime_ms() - windows[i].resize_ms < resize_wait_ms {
+        return
+    }
+    if ww == windows[i].pixels.width && hh == windows[i].pixels.height {
+        return
+    }
+    windows[i].resizing = true
+    windows[i].resize_ms = sys::uptime_ms()
+    notify(i, wm::ev_resize, ww as u64, hh as u64)
 }
 
 fn ask_size(i: usize, w: i64, h: i64) {
+    windows[i].sizing = false
+    windows[i].anchor = 0
     let ww = clamp(w as u64, wm::min_side, back.width as u64)
     let hh = clamp(h as u64, wm::min_side, back.height as u64)
     notify(i, wm::ev_resize, ww, hh)
@@ -419,6 +551,331 @@ fn restore(k: usize) {
     damage(frame_rect(i))
 }
 
+fn minimize(i: usize) {
+    windows[i].minimized = true
+    damage(frame_rect(i))
+}
+
+fn bar_click(k: usize) {
+    let Some(i) = bar_slot(k) else {
+        return
+    }
+    if windows[i].minimized || windows[i].id != focused {
+        restore(k)
+    } else {
+        minimize(i)
+    }
+}
+
+fn bar_at(x: i64, y: i64) -> Option<usize> {
+    if !gfx::contains(taskbar_rect(), x, y) {
+        return None
+    }
+    let mut k: usize = 0
+    for i in 0..max_windows {
+        if windows[i].used {
+            if gfx::contains(button_rect(k), x, y) {
+                return Some(k)
+            }
+            k += 1
+        }
+    }
+    return None
+}
+
+fn grow(r: gfx::Rect, d: i64) -> gfx::Rect {
+    return gfx::rect(r.x - d, r.y - d, r.w + 2 * d, r.h + 2 * d)
+}
+
+fn near(x: i64, y: i64, cx: i64, cy: i64) -> bool {
+    return (x - cx) * (x - cx) + (y - cy) * (y - cy) <= button_hit * button_hit
+}
+
+fn edges_at(f: gfx::Rect, x: i64, y: i64) -> u64 {
+    let mut e: u64 = 0
+    if x < f.x + wm::border {
+        e |= edge_left
+    }
+    if x >= f.x + f.w - wm::border {
+        e |= edge_right
+    }
+    if y < f.y + wm::border {
+        e |= edge_top
+    }
+    if y >= f.y + f.h - wm::border {
+        e |= edge_bottom
+    }
+    if e & (edge_left | edge_right) != 0 {
+        if y < f.y + corner {
+            e |= edge_top
+        }
+        if y >= f.y + f.h - corner {
+            e |= edge_bottom
+        }
+    }
+    if e & (edge_top | edge_bottom) != 0 {
+        if x < f.x + corner {
+            e |= edge_left
+        }
+        if x >= f.x + f.w - corner {
+            e |= edge_right
+        }
+    }
+    return e
+}
+
+fn hit_window(i: usize, x: i64, y: i64) -> Hit {
+    if gfx::contains(window_rect(i), x, y) {
+        return Hit { index: i, part: part_content, edges: 0 }
+    }
+    if !windows[i].maximized {
+        let e = edges_at(frame_rect(i), x, y)
+        if e != 0 {
+            return Hit { index: i, part: part_edge, edges: e }
+        }
+    }
+    let t = title_rect(i)
+    let cy = t.y + wm::title_h / 2
+    let mut part = part_title
+    if near(x, y, t.x + 12, cy) {
+        part = part_close
+    } else if near(x, y, t.x + 30, cy) {
+        part = part_minimize
+    } else if near(x, y, t.x + 48, cy) {
+        part = part_maximize
+    }
+    return Hit { index: i, part: part, edges: 0 }
+}
+
+fn hit(x: i64, y: i64) -> Option<Hit> {
+    let mut k = zcount
+    while k > 0 {
+        k -= 1
+        let i = zorder[k]
+        if windows[i].minimized || !gfx::contains(grow(frame_rect(i), grip), x, y) {
+            continue
+        }
+        return Some(hit_window(i, x, y))
+    }
+    return None
+}
+
+fn notify_pointer(i: usize, kind: u64, c: u64) {
+    let lx = px - windows[i].x
+    let ly = py - windows[i].y
+    notify3(i, kind, lx as u64, ly as u64, c)
+}
+
+fn content_at(x: i64, y: i64) -> Option<usize> {
+    if gfx::contains(taskbar_rect(), x, y) {
+        return None
+    }
+    let Some(h) = hit(x, y) else {
+        return None
+    }
+    if h.part != part_content {
+        return None
+    }
+    return Some(h.index)
+}
+
+fn pointer_target() -> Option<usize> {
+    if drag == drag_app {
+        return find(drag_win)
+    }
+    return content_at(px, py)
+}
+
+fn start_drag(h: Hit) {
+    let i = h.index
+    let id = windows[i].id
+    windows[i].minimized = false
+    z_top(i)
+    damage(frame_rect(i))
+    drag_win = id
+    drag_x0 = px
+    drag_y0 = py
+    if h.part == part_content {
+        drag = drag_app
+        notify_pointer(i, wm::ev_mouse_down, wm::button_left)
+    } else if h.part == part_title {
+        let now = sys::uptime_ms()
+        if last_click_win == id && now - last_click_ms < double_click_ms {
+            last_click_win = 0
+            drag = drag_none
+            toggle_maximize(i)
+            return
+        }
+        last_click_win = id
+        last_click_ms = now
+        drag = drag_move
+        drag_start = window_rect(i)
+    } else if h.part == part_edge {
+        drag = drag_resize
+        drag_edges = h.edges
+        drag_start = window_rect(i)
+        windows[i].anchor = h.edges & (edge_left | edge_top)
+        windows[i].anchor_right = drag_start.x + drag_start.w
+        windows[i].anchor_bottom = drag_start.y + drag_start.h
+        windows[i].want_w = drag_start.w
+        windows[i].want_h = drag_start.h
+        windows[i].sizing = true
+    } else {
+        drag = drag_button
+        drag_part = h.part
+    }
+}
+
+fn left_down() {
+    if let Some(k) = bar_at(px, py) {
+        drag = drag_bar
+        drag_part = k as u64
+        return
+    }
+    if gfx::contains(taskbar_rect(), px, py) {
+        return
+    }
+    let Some(h) = hit(px, py) else {
+        return
+    }
+    start_drag(h)
+}
+
+fn title_action(i: usize, part: u64) {
+    if part == part_close {
+        notify(i, wm::ev_close, 0, 0)
+    } else if part == part_minimize {
+        minimize(i)
+    } else if part == part_maximize {
+        toggle_maximize(i)
+    }
+}
+
+fn left_up() {
+    let kind = drag
+    drag = drag_none
+    if kind == drag_bar {
+        if let Some(k) = bar_at(px, py) {
+            if k as u64 == drag_part {
+                bar_click(k)
+            }
+        }
+        return
+    }
+    let Some(i) = find(drag_win) else {
+        return
+    }
+    if kind == drag_app {
+        notify_pointer(i, wm::ev_mouse_up, wm::button_left)
+    } else if kind == drag_button {
+        if let Some(h) = hit(px, py) {
+            if h.index == i && h.part == drag_part {
+                title_action(i, drag_part)
+            }
+        }
+    } else if kind == drag_resize && !windows[i].resizing {
+        settle_size(i)
+    }
+}
+
+fn other_button(bit: u64, down: bool) {
+    let Some(i) = pointer_target() else {
+        return
+    }
+    if down {
+        notify_pointer(i, wm::ev_mouse_down, bit)
+    } else {
+        notify_pointer(i, wm::ev_mouse_up, bit)
+    }
+}
+
+fn drag_motion() {
+    let Some(i) = find(drag_win) else {
+        drag = drag_none
+        return
+    }
+    let dx = px - drag_x0
+    let dy = py - drag_y0
+    let s = drag_start
+    if drag == drag_move {
+        let mut ny = s.y + dy
+        if ny < wm::title_h + wm::border {
+            ny = wm::title_h + wm::border
+        }
+        if ny > back.height - wm::taskbar_h {
+            ny = back.height - wm::taskbar_h
+        }
+        if windows[i].maximized {
+            windows[i].maximized = false
+        }
+        move_by(i, s.x + dx - windows[i].x, ny - windows[i].y)
+    } else if drag == drag_resize {
+        let mut w = s.w
+        let mut h = s.h
+        if drag_edges & edge_right != 0 {
+            w = s.w + dx
+        }
+        if drag_edges & edge_left != 0 {
+            w = s.w - dx
+        }
+        if drag_edges & edge_bottom != 0 {
+            h = s.h + dy
+        }
+        if drag_edges & edge_top != 0 {
+            h = s.h - dy
+        }
+        drag_size(i, w, h)
+    } else if drag == drag_app {
+        notify_pointer(i, wm::ev_mouse_move, pbuttons)
+    }
+}
+
+fn pointer_moved(x: i64, y: i64) {
+    if pointer_on && x == px && y == py {
+        return
+    }
+    if pointer_on {
+        damage(cursor_rect())
+    }
+    pointer_on = true
+    px = x
+    py = y
+    damage(cursor_rect())
+    if drag != drag_none {
+        drag_motion()
+        return
+    }
+    if let Some(i) = content_at(px, py) {
+        notify_pointer(i, wm::ev_mouse_move, pbuttons)
+    }
+}
+
+fn on_pointer(m: &sys::Message) {
+    pointer_moved(m.data[0] as i64, m.data[1] as i64)
+    let buttons = m.data[2]
+    let changed = buttons ^ pbuttons
+    pbuttons = buttons
+    if changed & wm::button_left != 0 {
+        if buttons & wm::button_left != 0 {
+            left_down()
+        } else {
+            left_up()
+        }
+    }
+    if changed & wm::button_right != 0 {
+        other_button(wm::button_right, buttons & wm::button_right != 0)
+    }
+    if changed & wm::button_middle != 0 {
+        other_button(wm::button_middle, buttons & wm::button_middle != 0)
+    }
+    let wheel = m.data[3] as i64
+    if wheel != 0 {
+        if let Some(i) = pointer_target() {
+            notify_pointer(i, wm::ev_wheel, wheel as u64)
+        }
+    }
+}
+
 fn wm_command(c: u64) {
     if c == wm::key_tab {
         cycle()
@@ -434,10 +891,7 @@ fn wm_command(c: u64) {
     let w = windows[i].pixels.width
     let h = windows[i].pixels.height
     match c {
-        109 => {
-            windows[i].minimized = true
-            damage(frame_rect(i))
-        }
+        109 => minimize(i),
         120 => toggle_maximize(i),
         113 => notify(i, wm::ev_close, 0, 0),
         104 => move_by(i, 0 - step, 0),
@@ -493,8 +947,17 @@ fn create_window(m: &sys::Message) {
         minimized: false,
         maximized: false,
         saved: gfx::rect(0, 0, 0, 0),
+        resizing: false,
+        resize_ms: 0,
+        want_w: w,
+        want_h: h,
+        sizing: false,
+        anchor: 0,
+        anchor_right: 0,
+        anchor_bottom: 0,
     }
     next_id += 1
+    had_windows = true
     z_top(i)
     damage(frame_rect(i))
     let mut r = sys::Message { sender: 0, kind: wm::created, data: [0u64; 6] }
@@ -593,12 +1056,27 @@ fn handle(m: &sys::Message) {
                 on_key(m.data[0])
             }
         }
+        abi::msg_mouse => {
+            if m.sender == 0 {
+                on_pointer(m)
+            }
+        }
+        wm::reload => load_prefs(),
         wm::crash => {
             ud2()
         }
         _ => {}
     }
     update_focus()
+}
+
+fn load_prefs() {
+    let mut p = prefs::defaults()
+    prefs::load(&mut p)
+    wallpaper_color = p.wallpaper
+    accent_color = p.accent
+    sys::set_keymap(p.keyboard)
+    damage(gfx::bounds(&back))
 }
 
 fn check_clients() {
@@ -629,6 +1107,7 @@ fn main() {
     let port = sys::port_create() as u64
     server_port = port
     sys::publish(port, "window")
+    load_prefs()
     damage(gfx::bounds(&back))
     compose()
     print("windowserver: ready", w, h)
@@ -641,6 +1120,9 @@ fn main() {
             }
         }
         check_clients()
+        if had_windows && zcount == 0 {
+            exit(0)
+        }
         refresh_bar()
         compose()
     }

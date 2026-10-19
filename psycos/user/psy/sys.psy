@@ -154,6 +154,32 @@ fn recv_timeout(port: u64, m: &mut Message, ms: u64) -> i64 {
     return call(abi::sys_port_recv_timeout, port, m as *mut Message as u64, ms, 0, 0, 0)
 }
 
+fn console_attach(port: u64) -> i64 {
+    return call(abi::sys_console_attach, port, 0, 0, 0, 0, 0)
+}
+
+fn console_read(buf: &mut [u8]) -> i64 {
+    return call(abi::sys_console_read, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0, 0, 0)
+}
+
+fn console_input(c: u64) -> i64 {
+    return call(abi::sys_console_input, c, 0, 0, 0, 0, 0)
+}
+
+fn file_read(path: Str, buf: &mut [u8]) -> i64 {
+    let p = path.as_bytes()
+    return call(abi::sys_file_read, p.as_ptr() as u64, p.len() as u64, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0)
+}
+
+fn file_write(path: Str, data: &[u8]) -> i64 {
+    let p = path.as_bytes()
+    return call(abi::sys_file_write, p.as_ptr() as u64, p.len() as u64, data.as_ptr() as u64, data.len() as u64, 0, 0)
+}
+
+fn set_keymap(layout: u64) -> i64 {
+    return call(abi::sys_set_keymap, layout, 0, 0, 0, 0, 0)
+}
+
 fn display_claim() -> i64 {
     return call(abi::sys_display_claim, 0, 0, 0, 0, 0, 0)
 }

@@ -1,0 +1,120 @@
+/// Wiki Doc sources:
+///   - https://wiki.osdev.org/Terminals
+///   - https://wiki.osdev.org/Message_Passing
+
+import "ipc.psy"
+import "sched.psy"
+import "sync.psy"
+import "console.psy"
+import "keyboard.psy"
+import "usermode.psy"
+import "../user/psy/abi.psy" as abi
+
+const term_buf_size: usize = 8192
+const term_chunk: usize = 256
+
+static mut term_buf: [u8; 8192]
+static mut term_head: usize = 0
+static mut term_count: usize = 0
+static mut term_on: bool = false
+static mut term_port: u64 = 0
+static mut term_owner: u64 = 0
+static mut term_signaled: bool = false
+#[getter]
+static mut term_lost: u64 = 0
+
+fn term_init() {
+    set_con_tap(term_tap)
+}
+
+fn term_active() -> bool {
+    if term_on && task_slot_of(term_owner) < 0 {
+        term_on = false
+    }
+    return term_on
+}
+
+fn term_tap(c: u8) {
+    if !term_active() {
+        return
+    }
+    let was_on = irq_save()
+    if term_count == term_buf_size {
+        term_head = (term_head + 1) % term_buf_size
+        term_count -= 1
+        term_lost += 1
+    }
+    term_buf[(term_head + term_count) % term_buf_size] = c
+    term_count += 1
+    let wake = !term_signaled
+    term_signaled = true
+    irq_restore(was_on)
+    if wake {
+        let Some(p) = port_index(term_port) else {
+            term_on = false
+            return
+        }
+        let mut words = [0u64; 8]
+        words[1] = abi::msg_console
+        port_send_kernel(p, &words)
+    }
+}
+
+fn console_attach(port: u64) -> i64 {
+    let Some(p) = port_index(port) else {
+        return -abi::err_badf
+    }
+    if port_owner(p) != current_task_id() {
+        return -abi::err_perm
+    }
+    if term_active() {
+        return -abi::err_busy
+    }
+    let was_on = irq_save()
+    term_port = port
+    term_owner = current_task_id()
+    term_head = 0
+    term_count = 0
+    term_signaled = false
+    term_on = true
+    irq_restore(was_on)
+    return 0
+}
+
+fn console_read(dst: u64, len: u64) -> i64 {
+    if !term_active() || term_owner != current_task_id() {
+        return -abi::err_perm
+    }
+    let mut chunk = [0u8; 256]
+    let was_on = irq_save()
+    let mut n = term_count
+    if n > term_chunk {
+        n = term_chunk
+    }
+    if n > len as usize {
+        n = len as usize
+    }
+    for i in 0..n {
+        chunk[i] = term_buf[(term_head + i) % term_buf_size]
+    }
+    term_head = (term_head + n) % term_buf_size
+    term_count -= n
+    if term_count == 0 {
+        term_signaled = false
+    }
+    irq_restore(was_on)
+    if !copy_to_user(dst, &chunk[..n]) {
+        return -abi::err_fault
+    }
+    return n as i64
+}
+
+fn console_input(c: u64) -> i64 {
+    if !term_active() || term_owner != current_task_id() {
+        return -abi::err_perm
+    }
+    let was_on = irq_save()
+    kbd_push(c as u8)
+    irq_restore(was_on)
+    return 0
+}

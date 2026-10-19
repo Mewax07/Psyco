@@ -1,0 +1,80 @@
+/// Wiki Doc sources:
+///   - https://wiki.osdev.org/Message_Passing
+
+import "psy/sys.psy" as sys
+import "psy/gfx.psy" as gfx
+import "psy/wm.psy" as wm
+import "psy/libgui.psy" as gui
+
+const term_fg: u32 = 0xD0D0D0
+const term_bg: u32 = 0x101010
+
+static mut reply_port: u64 = 0
+
+fn ask(port: u64, kind: u64, a: u64, b: u64, m: &mut sys::Message) {
+    let mut q = sys::Message { sender: 0, kind: kind, data: [0u64; 6] }
+    q.data[0] = a
+    q.data[1] = b
+    sys::send(port, &q)
+    sys::recv(reply_port, m)
+}
+
+fn row_is(m: &sys::Message, text: Str) -> bool {
+    let t = text.as_bytes()
+    if m.data[1] != t.len() as u64 {
+        return false
+    }
+    for k in 0..t.len() {
+        if ((m.data[2 + k / 8] >> ((k % 8) * 8)) & 0xFF) as u8 != t[k] {
+            return false
+        }
+    }
+    return true
+}
+
+fn count(x: u64, y: u64, color: u32) -> u64 {
+    let mut e = gui::event()
+    let mut n: u64 = 0
+    for j in 0..gfx::char_h() as u64 {
+        for i in 0..gfx::char_w() as u64 {
+            gui::probe(x + i, y + j, &mut e)
+            if e.a == color as u64 {
+                n += 1
+            }
+        }
+    }
+    return n
+}
+
+fn main() {
+    let t = sys::lookup("terminal")
+    if t < 0 || !gui::connect() {
+        print("termcheck: no terminal")
+        exit(1)
+    }
+    reply_port = sys::port_create() as u64
+    let mut m = sys::Message { sender: 0, kind: 0, data: [0u64; 6] }
+    ask(t as u64, wm::term_info, reply_port, 0, &mut m)
+    let cols = m.data[0]
+    let rows = m.data[1]
+    let x0 = m.data[4]
+    let y0 = m.data[5]
+    let mut found = false
+    let mut hello_row: u64 = 0
+    for r in 0..rows {
+        ask(t as u64, wm::term_dump, r, reply_port, &mut m)
+        if row_is(&m, "hello") {
+            found = true
+            hello_row = r
+        }
+    }
+    let y = y0 + hello_row * gfx::char_h() as u64
+    let glyph = count(x0, y, term_fg)
+    let blank = count(x0 + 5 * gfx::char_w() as u64, y, term_bg)
+    let mut e = gui::event()
+    gui::probe(x0 + 1, y0 + 1, &mut e)
+    print("terminal:", cols, "x", rows)
+    print("hello row found:", found)
+    print("glyph drawn:", glyph > 0, "blank after:", blank == (gfx::char_w() * gfx::char_h()) as u64)
+    print("title ok:", e.c == gui::title_word("Terminal"))
+}

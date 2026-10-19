@@ -30,13 +30,13 @@ fn draw(win: &gui::Window, color: u32, label: Str) {
 }
 
 fn show_probe(x: u64, y: u64) {
-    let mut e = gui::Event { kind: 0, window: 0, a: 0, b: 0, c: 0 }
+    let mut e = gui::event()
     gui::probe(x, y, &mut e)
     print("probe", x, y, ": window", e.window, "focus", e.b, "color", e.a, "renamed", e.c == gui::title_word("Renamed"))
 }
 
 fn color_at(x: u64, y: u64) -> u64 {
-    let mut e = gui::Event { kind: 0, window: 0, a: 0, b: 0, c: 0 }
+    let mut e = gui::event()
     gui::probe(x, y, &mut e)
     return e.a
 }
@@ -97,9 +97,12 @@ fn main() {
     b = wb
     draw(&b, color_b, "Second")
     print("opened", a.id, b.id)
-    let mut e = gui::Event { kind: 0, window: 0, a: 0, b: 0, c: 0 }
+    let mut e = gui::event()
     loop {
         gui::wait(&mut e)
+        if !gui::trusted(&e) {
+            continue
+        }
         match e.kind {
             wm::ev_focus => print("focus", name(e.window), e.a),
             wm::ev_key => {
