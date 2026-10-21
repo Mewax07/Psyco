@@ -1,0 +1,22 @@
+/// Wiki Doc sources:
+///   - https://wiki.osdev.org/Symmetric_Multiprocessing
+
+import "psy/sys.psy" as sys
+
+const run_ms: u64 = 4000
+const batch: u64 = 200000
+
+fn main() {
+    let first = sys::cpu()
+    print("burn on cpu", first)
+    let start = sys::uptime_ms()
+    let mut x: u64 = 1
+    let mut rounds: u64 = 0
+    while sys::uptime_ms() - start < run_ms {
+        for i in 0..batch {
+            x = x *% 6364136223846793005 +% 1442695040888963407
+        }
+        rounds += 1
+    }
+    print("burn done on cpu", sys::cpu(), "rounds", rounds > 0, "value", x != 0)
+}

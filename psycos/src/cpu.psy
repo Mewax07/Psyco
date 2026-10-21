@@ -1,0 +1,98 @@
+/// Wiki Doc sources:
+///   - https://wiki.osdev.org/Symmetric_Multiprocessing
+///   - https://wiki.osdev.org/Spinlock
+
+import "apic.psy"
+import "spinlock.psy"
+
+const max_cpus: usize = 16
+const no_cpu: usize = 0xFFFF
+const resched_vector: u32 = 49
+
+static mut cpu_of_apic: [u8; 256]
+static mut apic_of_cpu: [u32; 16]
+#[getter]
+static mut smp_on: bool = false
+#[getter]
+static mut cpus_online: usize = 1
+
+static mut big_lock: u64 = 0
+static mut big_owner: usize = 0xFFFF
+#[getter]
+static mut big_depth: u64 = 0
+#[getter]
+static mut lock_spins: u64 = 0
+
+fn this_cpu() -> usize {
+    if !smp_on {
+        return 0
+    }
+    return cpu_of_apic[(lapic_current_id() & 0xFF) as usize] as usize
+}
+
+fn cpu_register(cpu: usize, apic_id: u32) {
+    cpu_of_apic[(apic_id & 0xFF) as usize] = cpu as u8
+    apic_of_cpu[cpu] = apic_id
+}
+
+fn cpu_apic(cpu: usize) -> u32 {
+    return apic_of_cpu[cpu]
+}
+
+fn cpu_kick(cpu: usize) {
+    if smp_on && cpu < cpus_online && cpu != this_cpu() {
+        lapic_send_ipi(apic_of_cpu[cpu], resched_vector)
+    }
+}
+
+fn smp_enable() {
+    smp_on = true
+}
+
+fn cpu_came_online() {
+    cpus_online += 1
+}
+
+fn kernel_lock() {
+    let me = this_cpu()
+    if big_depth > 0 && big_owner == me {
+        big_depth += 1
+        return
+    }
+    let waited = !spin_try(&mut big_lock as *mut u64)
+    if waited {
+        spin_lock(&mut big_lock as *mut u64)
+    }
+    big_owner = me
+    big_depth = 1
+    if waited {
+        lock_spins += 1
+    }
+}
+
+fn kernel_unlock() {
+    if big_depth == 0 {
+        panic("kernel_unlock: the kernel lock is not held")
+    }
+    big_depth -= 1
+    if big_depth == 0 {
+        big_owner = no_cpu
+        spin_unlock(&mut big_lock as *mut u64)
+    }
+}
+
+fn kernel_unlock_all() {
+    if big_depth > 0 {
+        big_depth = 1
+        kernel_unlock()
+    }
+}
+
+fn kernel_lock_resume(depth: u64) {
+    big_owner = this_cpu()
+    big_depth = depth
+}
+
+fn kernel_lock_held() -> bool {
+    return big_depth > 0 && big_owner == this_cpu()
+}

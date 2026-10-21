@@ -3715,6 +3715,7 @@ fn builtin_sig(name: &str) -> Option<(Vec<Type>, Type, bool)> {
         "slice_from_raw" | "slice_from_raw_mut" => (vec![], Type::Unit, true),
         "context_switch" => (vec![Type::raw(Type::U64, true), u(U64)], Type::Unit, true),
         "set_syscall_stack" => (vec![u(U64)], Type::Unit, true),
+        "atomic_swap" => (vec![Type::raw(Type::U64, true), u(U64)], u(U64), true),
         "rebase_statics" => (vec![u(U64)], Type::Unit, true),
         "syscall" => (vec![u(U64), u(U64), u(U64), u(U64)], u(I64), false),
         "syscall6" => (vec![u(U64); 7], u(I64), false),

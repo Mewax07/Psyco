@@ -1,9 +1,11 @@
 /// Wiki Doc sources:
 ///   - https://wiki.osdev.org/Programmable_Interval_Timer
 ///   - https://wiki.osdev.org/8259_PIC#Spurious_IRQs
+///   - https://wiki.osdev.org/APIC_Timer
 
 import "idt.psy"
 import "pic.psy"
+import "cpu.psy"
 
 const timer_hz: u64 = 100
 const timer_irq: u8 = 0
@@ -12,6 +14,7 @@ const irq_first_vector: usize = 32
 const irq_last_vector: usize = 47
 const spurious7_vector: usize = 39
 const spurious15_vector: usize = 47
+const apic_spurious_vector: usize = 255
 
 #[getter]
 static mut ticks: u64 = 0
@@ -41,6 +44,7 @@ fn irq_init() {
 
 #[interrupt]
 fn irq_timer(frame: &Frame) {
+    kernel_lock()
     ticks += 1
     pic_eoi(timer_irq)
     if poll_hook as u64 != 0 {
@@ -51,32 +55,48 @@ fn irq_timer(frame: &Frame) {
         let hook = tick_hook
         hook()
     }
+    kernel_unlock()
 }
 
 #[interrupt]
 fn irq_spurious7(frame: &Frame) {
+    kernel_lock()
     if pic_spurious(7) {
         spurious_irqs += 1
     } else {
         other_irqs += 1
         pic_eoi(7)
     }
+    kernel_unlock()
 }
 
 #[interrupt]
 fn irq_spurious15(frame: &Frame) {
+    kernel_lock()
     if pic_spurious(15) {
         spurious_irqs += 1
     } else {
         other_irqs += 1
         pic_eoi(15)
     }
+    kernel_unlock()
 }
 
 #[interrupt]
 fn irq_other(frame: &Frame) {
+    kernel_lock()
     other_irqs += 1
     pic_eoi(8)
+    kernel_unlock()
+}
+
+fn irq_use_apic() -> bool {
+    if !apic_init(apic_spurious_vector) {
+        return false
+    }
+    pic_switch_to_apic()
+    lapic_timer_start(timer_vector as u32, get_lapic_ticks_10ms() * 100 / timer_hz)
+    return true
 }
 
 fn uptime_ms() -> u64 {

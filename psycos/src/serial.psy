@@ -7,6 +7,12 @@ const com1: u16 = 0x3F8
 const com1_line_status: u16 = 0x3FD
 const lsr_data_ready: u8 = 0x01
 const lsr_transmit_empty: u8 = 0x20
+const com1_scratch: u16 = 0x3FF
+const scratch_probe: u8 = 0x5A
+const transmit_tries: u64 = 100000
+
+static mut serial_checked: bool = false
+static mut serial_found: bool = false
 
 fn serial_putc(c: u8) {
     if c == '\n' {
@@ -15,15 +21,30 @@ fn serial_putc(c: u8) {
     serial_raw(c)
 }
 
+fn serial_present() -> bool {
+    if !serial_checked {
+        serial_checked = true
+        outb(com1_scratch, scratch_probe)
+        serial_found = inb(com1_scratch) == scratch_probe && inb(com1_line_status) != 0xFF
+    }
+    return serial_found
+}
+
 fn serial_raw(c: u8) {
-    while inb(com1_line_status) & lsr_transmit_empty == 0 {
+    if !serial_present() {
+        return
+    }
+    for i in 0..transmit_tries {
+        if inb(com1_line_status) & lsr_transmit_empty != 0 {
+            outb(com1, c)
+            return
+        }
         pause()
     }
-    outb(com1, c)
 }
 
 fn serial_poll() -> i32 {
-    if inb(com1_line_status) & lsr_data_ready == 0 {
+    if !serial_present() || inb(com1_line_status) & lsr_data_ready == 0 {
         return -1
     }
     return inb(com1) as i32

@@ -11,11 +11,18 @@ impl UefiPlatform {
 
     fn emit_byte(a: &mut Assembler, byte: Option<u8>) {
         let wait = a.new_label();
+        let ready = a.new_label();
+        a.push(R11);
+        a.mov_ri(R11, 100_000);
         a.bind(wait);
         a.mov_ri(Rdx, 0x3F8 + 5);
         a.in_al_dx();
         a.alu_ri(Alu::And, Rax, 0x20);
-        a.jcc(Cond::E, wait);
+        a.jcc(Cond::NE, ready);
+        a.alu_ri(Alu::Sub, R11, 1);
+        a.jcc(Cond::NE, wait);
+        a.bind(ready);
+        a.pop(R11);
         a.mov_ri(Rdx, 0x3F8);
         match byte {
             Some(b) => a.mov_ri(Rax, b as i64),

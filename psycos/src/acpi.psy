@@ -1,0 +1,405 @@
+/// Wiki Doc sources:
+///   - https://wiki.osdev.org/RSDP
+///   - https://wiki.osdev.org/XSDT
+///   - https://wiki.osdev.org/MADT
+///   - https://wiki.osdev.org/FADT
+///   - https://wiki.osdev.org/Shutdown
+///   - https://uefi.org/specs/ACPI/6.5/05_ACPI_Software_Programming_Model.html
+
+#![trusted]
+
+import "efi.psy"
+import "paging.psy"
+
+const max_tables: usize = 32
+const max_cpus: usize = 64
+const max_ioapics: usize = 8
+const max_overrides: usize = 16
+
+const header_size: u64 = 36
+const rsdp_revision_offset: u64 = 15
+const rsdp_rsdt_offset: u64 = 16
+const rsdp_length_offset: u64 = 20
+const rsdp_xsdt_offset: u64 = 24
+const rsdp_v1_size: u64 = 20
+
+const madt_lapic_offset: u64 = 36
+const madt_flags_offset: u64 = 40
+const madt_entries_offset: u64 = 44
+const madt_cpu: u8 = 0
+const madt_ioapic: u8 = 1
+const madt_override: u8 = 2
+const madt_lapic_address: u8 = 5
+const madt_x2apic: u8 = 9
+const cpu_enabled: u32 = 1
+const cpu_online_capable: u32 = 2
+
+const fadt_dsdt_offset: u64 = 40
+const fadt_sci_offset: u64 = 46
+const fadt_smi_cmd_offset: u64 = 48
+const fadt_acpi_enable_offset: u64 = 52
+const fadt_pm1a_cnt_offset: u64 = 64
+const fadt_pm1b_cnt_offset: u64 = 68
+const fadt_flags_offset: u64 = 112
+const fadt_reset_space_offset: u64 = 116
+const fadt_reset_address_offset: u64 = 120
+const fadt_reset_value_offset: u64 = 128
+const fadt_x_dsdt_offset: u64 = 140
+const fadt_reset_supported: u32 = 0x400
+
+const space_memory: u8 = 0
+const space_io: u8 = 1
+
+const pm1_sci_enabled: u16 = 1
+const pm1_sleep_enable: u16 = 0x2000
+const pm1_sleep_type_shift: u16 = 10
+const enable_tries: u64 = 1000000
+
+const aml_name: u8 = 0x08
+const aml_package: u8 = 0x12
+const aml_byte_prefix: u8 = 0x0A
+const aml_zero: u8 = 0x00
+const aml_one: u8 = 0x01
+const aml_ones: u8 = 0xFF
+
+struct Ioapic {
+    id: u32,
+    address: u64,
+    gsi_base: u32,
+}
+
+struct Override {
+    irq: u32,
+    gsi: u32,
+    flags: u32,
+}
+
+struct TableInfo {
+    signature: u32,
+    address: u64,
+    length: u32,
+    revision: u8,
+}
+
+static mut tables: [u64; 32]
+#[getter]
+static mut table_count: usize = 0
+#[getter]
+static mut ready: bool = false
+#[getter]
+static mut revision: u8 = 0
+
+static mut cpu_ids: [u32; 64]
+#[getter]
+static mut cpu_count: usize = 0
+#[getter]
+static mut lapic_address: u64 = 0
+#[getter]
+static mut legacy_pics: bool = true
+static mut ioapics: [Ioapic; 8]
+#[getter]
+static mut ioapic_count: usize = 0
+static mut overrides: [Override; 16]
+#[getter]
+static mut override_count: usize = 0
+
+static mut pm1a_cnt: u16 = 0
+static mut pm1b_cnt: u16 = 0
+static mut smi_cmd: u32 = 0
+static mut acpi_enable_value: u8 = 0
+#[getter]
+static mut sci_irq: u16 = 0
+#[getter]
+static mut sleep_type_a: u16 = 0
+#[getter]
+static mut sleep_type_b: u16 = 0
+#[getter]
+static mut s5_found: bool = false
+static mut reset_space: u8 = 0
+static mut reset_address: u64 = 0
+static mut reset_value: u8 = 0
+#[getter]
+static mut reset_supported: bool = false
+
+fn rd8(phys: u64) -> u8 {
+    return (phys_to_virt(phys) as *const u8).read()
+}
+
+fn rd16(phys: u64) -> u16 {
+    return rd8(phys) as u16 | (rd8(phys + 1) as u16) << 8
+}
+
+fn rd32(phys: u64) -> u32 {
+    return rd16(phys) as u32 | (rd16(phys + 2) as u32) << 16
+}
+
+fn rd64(phys: u64) -> u64 {
+    return rd32(phys) as u64 | (rd32(phys + 4) as u64) << 32
+}
+
+fn signature(s: Str) -> u32 {
+    let b = s.as_bytes()
+    return b[0] as u32 | (b[1] as u32) << 8 | (b[2] as u32) << 16 | (b[3] as u32) << 24
+}
+
+fn checksum_ok(phys: u64, len: u64) -> bool {
+    let mut sum: u8 = 0
+    for i in 0..len {
+        sum = sum +% rd8(phys + i)
+    }
+    return sum == 0
+}
+
+fn table_ok(phys: u64) -> bool {
+    if phys == 0 {
+        return false
+    }
+    let len = rd32(phys + 4) as u64
+    return len >= header_size && checksum_ok(phys, len)
+}
+
+fn init() -> bool {
+    let rsdp = get_acpi_rsdp()
+    if rsdp == 0 || !checksum_ok(rsdp, rsdp_v1_size) {
+        return false
+    }
+    revision = rd8(rsdp + rsdp_revision_offset)
+    let mut root = rd32(rsdp + rsdp_rsdt_offset) as u64
+    let mut entry_size: u64 = 4
+    if revision >= 2 && checksum_ok(rsdp, rd32(rsdp + rsdp_length_offset) as u64) {
+        let x = rd64(rsdp + rsdp_xsdt_offset)
+        if table_ok(x) {
+            root = x
+            entry_size = 8
+        }
+    }
+    if !table_ok(root) {
+        return false
+    }
+    let n = (rd32(root + 4) as u64 - header_size) / entry_size
+    table_count = 0
+    for i in 0..n {
+        let at = root + header_size + i * entry_size
+        let mut t = rd32(at) as u64
+        if entry_size == 8 {
+            t = rd64(at)
+        }
+        if table_ok(t) && table_count < max_tables {
+            tables[table_count] = t
+            table_count += 1
+        }
+    }
+    ready = true
+    parse_madt()
+    parse_fadt()
+    return true
+}
+
+fn table_info(i: usize) -> TableInfo {
+    let t = tables[i]
+    return TableInfo { signature: rd32(t), address: t, length: rd32(t + 4), revision: rd8(t + 8) }
+}
+
+fn find(name: Str) -> Option<u64> {
+    let want = signature(name)
+    for i in 0..table_count {
+        if rd32(tables[i]) == want {
+            return Some(tables[i])
+        }
+    }
+    return None
+}
+
+fn parse_madt() {
+    let Some(m) = find("APIC") else {
+        return
+    }
+    lapic_address = rd32(m + madt_lapic_offset) as u64
+    legacy_pics = rd32(m + madt_flags_offset) & 1 != 0
+    let end = m + rd32(m + 4) as u64
+    let mut at = m + madt_entries_offset
+    while at + 2 <= end {
+        let kind = rd8(at)
+        let len = rd8(at + 1) as u64
+        if len < 2 || at + len > end {
+            return
+        }
+        if kind == madt_cpu {
+            add_cpu(rd8(at + 3) as u32, rd32(at + 4))
+        } else if kind == madt_x2apic {
+            add_cpu(rd32(at + 4), rd32(at + 8))
+        } else if kind == madt_ioapic && ioapic_count < max_ioapics {
+            ioapics[ioapic_count] = Ioapic { id: rd8(at + 2) as u32, address: rd32(at + 4) as u64, gsi_base: rd32(at + 8) }
+            ioapic_count += 1
+        } else if kind == madt_override && override_count < max_overrides {
+            overrides[override_count] = Override { irq: rd8(at + 3) as u32, gsi: rd32(at + 4), flags: rd16(at + 8) as u32 }
+            override_count += 1
+        } else if kind == madt_lapic_address {
+            lapic_address = rd64(at + 4)
+        }
+        at += len
+    }
+}
+
+fn add_cpu(apic_id: u32, flags: u32) {
+    if flags & (cpu_enabled | cpu_online_capable) == 0 || cpu_count >= max_cpus {
+        return
+    }
+    for i in 0..cpu_count {
+        if cpu_ids[i] == apic_id {
+            return
+        }
+    }
+    cpu_ids[cpu_count] = apic_id
+    cpu_count += 1
+}
+
+fn cpu_apic_id(i: usize) -> u32 {
+    return cpu_ids[i]
+}
+
+fn ioapic(i: usize) -> Ioapic {
+    return ioapics[i]
+}
+
+fn irq_override(i: usize) -> Override {
+    return overrides[i]
+}
+
+fn irq_to_gsi(irq: u32) -> Override {
+    for i in 0..override_count {
+        if overrides[i].irq == irq {
+            return overrides[i]
+        }
+    }
+    return Override { irq: irq, gsi: irq, flags: 0 }
+}
+
+fn parse_fadt() {
+    let Some(f) = find("FACP") else {
+        return
+    }
+    let len = rd32(f + 4) as u64
+    sci_irq = rd16(f + fadt_sci_offset)
+    smi_cmd = rd32(f + fadt_smi_cmd_offset)
+    acpi_enable_value = rd8(f + fadt_acpi_enable_offset)
+    pm1a_cnt = rd32(f + fadt_pm1a_cnt_offset) as u16
+    pm1b_cnt = rd32(f + fadt_pm1b_cnt_offset) as u16
+    if len > fadt_reset_value_offset {
+        reset_supported = rd32(f + fadt_flags_offset) & fadt_reset_supported != 0
+        reset_space = rd8(f + fadt_reset_space_offset)
+        reset_address = rd64(f + fadt_reset_address_offset)
+        reset_value = rd8(f + fadt_reset_value_offset)
+    }
+    let mut dsdt = rd32(f + fadt_dsdt_offset) as u64
+    if len >= fadt_x_dsdt_offset + 8 && rd64(f + fadt_x_dsdt_offset) != 0 {
+        dsdt = rd64(f + fadt_x_dsdt_offset)
+    }
+    if table_ok(dsdt) {
+        find_s5(dsdt)
+    }
+}
+
+fn pkg_length_size(lead: u8) -> u64 {
+    return (lead >> 6) as u64 + 1
+}
+
+fn aml_value(at: u64) -> Option<u16> {
+    let op = rd8(at)
+    if op == aml_zero {
+        return Some(0)
+    }
+    if op == aml_one {
+        return Some(1)
+    }
+    if op == aml_ones {
+        return Some(0xFF)
+    }
+    if op == aml_byte_prefix {
+        return Some(rd8(at + 1) as u16)
+    }
+    return None
+}
+
+fn aml_size(at: u64) -> u64 {
+    if rd8(at) == aml_byte_prefix {
+        return 2
+    }
+    return 1
+}
+
+fn find_s5(dsdt: u64) {
+    let end = dsdt + rd32(dsdt + 4) as u64
+    let want = signature("_S5_")
+    let mut at = dsdt + header_size
+    while at + 8 < end {
+        if rd32(at) == want && (rd8(at - 1) == aml_name || (rd8(at - 1) == '\\' && rd8(at - 2) == aml_name)) && rd8(at + 4) == aml_package {
+            let mut p = at + 5
+            p += pkg_length_size(rd8(p))
+            p += 1
+            let Some(a) = aml_value(p) else {
+                return
+            }
+            p += aml_size(p)
+            let b = aml_value(p).unwrap_or(0)
+            sleep_type_a = a & 7
+            sleep_type_b = b & 7
+            s5_found = true
+            return
+        }
+        at += 1
+    }
+}
+
+fn enable_acpi_mode() {
+    if pm1a_cnt == 0 || inw(pm1a_cnt) & pm1_sci_enabled != 0 {
+        return
+    }
+    if smi_cmd == 0 || acpi_enable_value == 0 {
+        return
+    }
+    outb(smi_cmd as u16, acpi_enable_value)
+    for i in 0..enable_tries {
+        if inw(pm1a_cnt) & pm1_sci_enabled != 0 {
+            return
+        }
+        pause()
+    }
+}
+
+fn power_off() -> bool {
+    if !ready || !s5_found || pm1a_cnt == 0 {
+        return false
+    }
+    enable_acpi_mode()
+    let a = inw(pm1a_cnt) & ~(7u16 << pm1_sleep_type_shift)
+    outw(pm1a_cnt, a | (sleep_type_a << pm1_sleep_type_shift) | pm1_sleep_enable)
+    if pm1b_cnt != 0 {
+        let b = inw(pm1b_cnt) & ~(7u16 << pm1_sleep_type_shift)
+        outw(pm1b_cnt, b | (sleep_type_b << pm1_sleep_type_shift) | pm1_sleep_enable)
+    }
+    for i in 0..enable_tries {
+        pause()
+    }
+    return false
+}
+
+fn reset() -> bool {
+    if !ready || !reset_supported || reset_address == 0 {
+        return false
+    }
+    if reset_space == space_io {
+        outb(reset_address as u16, reset_value)
+    } else if reset_space == space_memory {
+        let Some(r) = map_mmio(reset_address, 1) else {
+            return false
+        }
+        (r as *mut u8).write(reset_value)
+    } else {
+        return false
+    }
+    for i in 0..enable_tries {
+        pause()
+    }
+    return false
+}

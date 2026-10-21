@@ -357,17 +357,18 @@ impl<'a> Codegen<'a> {
         const SAVED: [Reg; 15] = [
             Rcx, R11, Rax, Rdi, Rsi, Rdx, R10, R8, R9, Rbx, Rbp, R12, R13, R14, R15,
         ];
-        let rt = self.rt;
         let a = &mut self.asm;
         a.bind(stub);
-        a.store_rw(rt.syscall_user_rsp, Rsp);
-        a.load_rw(Rsp, rt.syscall_kernel_rsp);
+        a.swapgs();
+        a.store_gs(8, Rsp);
+        a.load_gs(Rsp, 0);
         a.alu_ri(Alu::Sub, Rsp, 8); // slot for the user rsp
         for r in SAVED {
             a.push(r);
         }
-        a.load_rw(Rax, rt.syscall_user_rsp);
+        a.load_gs(Rax, 8);
         a.store(Rsp, 8 * SAVED.len() as i32, Rax);
+        a.swapgs();
         a.cld();
         a.mov_rr(Rax, Rsp); // the saved registers
         save_xmm(a);

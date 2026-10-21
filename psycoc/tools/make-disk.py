@@ -38,9 +38,14 @@ def main():
                 sys.exit("make-disk: --size requires a value")
             extra.extend(args[i : i + 2])
             i += 2
-        elif args[i] == "--mbr":
+        elif args[i] in ("--mbr", "--gpt"):
             extra.append(args[i])
             i += 1
+        elif args[i] == "--label":
+            if i + 1 >= len(args):
+                sys.exit("make-disk: --label requires a value")
+            extra.extend(args[i : i + 2])
+            i += 2
         else:
             image = args[i]
             i += 1

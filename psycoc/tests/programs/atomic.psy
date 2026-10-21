@@ -1,0 +1,20 @@
+#![trusted]
+
+static mut lock: u64 = 0
+static mut word: u64 = 5
+
+fn try_take() -> bool {
+    return atomic_swap(&mut lock as *mut u64, 1) == 0
+}
+
+fn main() {
+    print(try_take(), try_take())
+    lock = 0
+    print(try_take())
+    let old = atomic_swap(&mut word as *mut u64, 42)
+    print(old, word)
+}
+
+//> true false
+//> true
+//> 5 42

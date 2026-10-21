@@ -6,6 +6,7 @@ import "ps2.psy"
 import "idt.psy"
 import "pic.psy"
 import "fb.psy"
+import "cpu.psy"
 import "virtio_input.psy" as tablet
 
 const mouse_irq: u8 = 12
@@ -13,6 +14,8 @@ const mouse_vector: usize = 44
 
 const source_ps2: u64 = 1
 const source_tablet: u64 = 2
+const source_usb: u64 = 3
+const usb_abs_max: i64 = 32767
 
 const button_left: u64 = 1
 const button_right: u64 = 2
@@ -49,6 +52,7 @@ static mut packet: [u8; 4]
 static mut packet_len: usize = 0
 static mut ps2_buttons: u64 = 0
 static mut tablet_buttons: u64 = 0
+static mut usb_buttons: u64 = 0
 static mut wheel_pending: i64 = 0
 static mut tablet_x: i64 = 0
 static mut tablet_y: i64 = 0
@@ -70,10 +74,12 @@ fn mouse_init() {
 
 #[interrupt]
 fn irq_mouse(frame: &Frame) {
+    kernel_lock()
     while let Some(b) = ps2_aux_byte() {
         mouse_byte(b)
     }
     pic_eoi(mouse_irq)
+    kernel_unlock()
 }
 
 fn mouse_byte(b: u8) {
@@ -129,7 +135,7 @@ fn clamp_axis(v: i64, size: usize) -> i64 {
 fn pointer_set(source: u64, x: i64, y: i64, wheel: i64) {
     let nx = clamp_axis(x, get_fb_width())
     let ny = clamp_axis(y, get_fb_height())
-    let buttons = ps2_buttons | tablet_buttons
+    let buttons = ps2_buttons | tablet_buttons | usb_buttons
     let urgent = buttons != mouse_buttons || wheel != 0
     let moved = nx != mouse_x || ny != mouse_y
     mouse_source = source
@@ -211,6 +217,18 @@ fn tablet_poll() {
         tablet_event(e)
     }
     tablet::kick()
+}
+
+fn usb_pointer_move(buttons: u64, dx: i64, dy: i64, wheel: i64) {
+    usb_buttons = buttons & button_mask
+    pointer_set(source_usb, mouse_x + dx, mouse_y + dy, wheel)
+}
+
+fn usb_pointer_abs(buttons: u64, x: i64, y: i64, wheel: i64) {
+    usb_buttons = buttons & button_mask
+    let px = pointer_scaled(x, 0, usb_abs_max, get_fb_width())
+    let py = pointer_scaled(y, 0, usb_abs_max, get_fb_height())
+    pointer_set(source_usb, px, py, wheel)
 }
 
 fn pointer_take_wheel() -> i64 {

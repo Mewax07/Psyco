@@ -1,6 +1,7 @@
 import os
 import struct
 import sys
+import zlib
 
 sector = 512
 reserved = 32
@@ -227,9 +228,52 @@ def add_dir(fs, path, cluster, parent):
         fs.data[c] = chunk.ljust(fs.cluster_bytes, b"\0")
 
 
+esp_type = bytes([0x28, 0x73, 0x2A, 0xC1, 0x1F, 0xF8, 0xD2, 0x11, 0xBA, 0x4B, 0x00, 0xA0, 0xC9, 0x3E, 0xC9, 0x3B])
+
+
+def gpt_header(total, current, backup, entries_lba, entries_crc):
+    h = bytearray(sector)
+    struct.pack_into(
+        "<8sIIIIQQQQ16sQIII",
+        h,
+        0,
+        b"EFI PART",
+        0x00010000,
+        92,
+        0,
+        0,
+        current,
+        backup,
+        34,
+        total - 34,
+        b"psyos-usb-disk!!",
+        entries_lba,
+        128,
+        128,
+        entries_crc,
+    )
+    struct.pack_into("<I", h, 16, zlib.crc32(bytes(h[:92])))
+    return h
+
+
+def write_gpt(disk, total, first, last):
+    disk[446:462] = struct.pack("<B3sB3sII", 0, b"\x00\x02\x00", 0xEE, b"\xff\xff\xff", 1, min(total - 1, 0xFFFFFFFF))
+    disk[510:512] = b"\x55\xaa"
+    entries = bytearray(128 * 128)
+    name = "PSYOS".encode("utf-16-le")
+    struct.pack_into("<16s16sQQQ", entries, 0, esp_type, b"psyos-partition1", first, last, 0)
+    entries[56 : 56 + len(name)] = name
+    crc = zlib.crc32(bytes(entries))
+    disk[2 * sector : 2 * sector + len(entries)] = entries
+    backup_entries = total - 1 - len(entries) // sector
+    disk[backup_entries * sector : backup_entries * sector + len(entries)] = entries
+    disk[sector : 2 * sector] = gpt_header(total, 1, total - 1, 2, crc)
+    disk[(total - 1) * sector : total * sector] = gpt_header(total, total - 1, 1, backup_entries, crc)
+
+
 def main():
     args = sys.argv[1:]
-    size, mbr, label = 64, False, "PSYCOS"
+    size, mbr, gpt, label = 64, False, False, "PSYCOS"
     rest = []
     i = 0
     while i < len(args):
@@ -242,6 +286,9 @@ def main():
         elif args[i] == "--mbr":
             mbr = True
             i += 1
+        elif args[i] == "--gpt":
+            gpt = True
+            i += 1
         else:
             rest.append(args[i])
             i += 1
@@ -249,8 +296,9 @@ def main():
         sys.exit(__doc__)
     image_path, src = rest
     total = (size << 20) // sector
-    start = 2048 if mbr else 0
-    fs = Fat32(total - start, label, start)
+    start = 2048 if mbr or gpt else 0
+    end = total - 2048 if gpt else total
+    fs = Fat32(end - start, label, start)
     root = fs.alloc(1)
     add_dir(fs, src, root, None)
     image = fs.image()
@@ -262,6 +310,11 @@ def main():
         )
         disk[446:462] = part
         disk[510:512] = b"\x55\xaa"
+        image = disk
+    elif gpt:
+        disk = bytearray(total * sector)
+        disk[start * sector : end * sector] = image
+        write_gpt(disk, total, start, end - 1)
         image = disk
     with open(image_path, "wb") as f:
         f.write(image)

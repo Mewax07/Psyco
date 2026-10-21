@@ -139,6 +139,7 @@ pub enum Intr {
     Syscall,
     RebaseStatics,
     SetSyscallStack,
+    AtomicSwap,
     EfiImageHandle,
     EfiSystemTable,
 }

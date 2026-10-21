@@ -14,6 +14,9 @@ cp "$EFI" "$WORK/esp/EFI/BOOT/BOOTX64.EFI"
 if [[ -n "${ESP_EXTRA:-}" ]]; then cp -r "$ESP_EXTRA"/. "$WORK/esp/"; fi
 cp "$OVMF_VARS_TEMPLATE" "$WORK/vars.fd"
 
+ESP_ARGS=(-drive format=raw,file=fat:rw:"$WORK/esp")
+if [[ "${NO_ESP:-0}" == 1 ]]; then ESP_ARGS=(); fi
+
 DISPLAY_ARGS=(-display none)
 if [[ "${GUI:-0}" == 1 ]]; then DISPLAY_ARGS=(); fi
 
@@ -22,7 +25,7 @@ timeout "${TIMEOUT:-30}" qemu-system-x86_64 \
     -machine q35 -m 256M -cpu qemu64 \
     -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
     -drive if=pflash,format=raw,file="$WORK/vars.fd" \
-    -drive format=raw,file=fat:rw:"$WORK/esp" \
+    "${ESP_ARGS[@]}" \
     -net none \
     -serial stdio \
     "${DISPLAY_ARGS[@]}" \

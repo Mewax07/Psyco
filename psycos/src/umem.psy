@@ -19,10 +19,10 @@ const map_private: u64 = 0x02
 const map_fixed: u64 = 0x10
 const map_anonymous: u64 = 0x20
 
-static mut brk_start: [u64; 16]
-static mut brk_end: [u64; 16]
-static mut mmap_next: [u64; 16]
-static mut dyn_pages: [u64; 16]
+static mut brk_start: [u64; 32]
+static mut brk_end: [u64; 32]
+static mut mmap_next: [u64; 32]
+static mut dyn_pages: [u64; 32]
 
 fn page_up(addr: u64) -> u64 {
     return (addr + size_4k - 1) & ~(size_4k - 1)

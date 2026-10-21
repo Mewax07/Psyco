@@ -1,8 +1,11 @@
 /// Wiki Doc sources:
 ///   - https://wiki.osdev.org/8259_PIC
 ///   - https://wiki.osdev.org/Programmable_Interval_Timer
+///   - https://wiki.osdev.org/APIC
 
 #![trusted]
+
+import "apic.psy"
 
 const pic1_command: u16 = 0x20
 const pic1_data: u16 = 0x21
@@ -56,8 +59,23 @@ fn pic_init() {
 }
 
 fn pic_write_mask() {
+    if get_apic_on() {
+        outb(pic1_data, 0xFF)
+        outb(pic2_data, 0xFF)
+        return
+    }
     outb(pic1_data, (pic_mask_bits & 0xFF) as u8)
     outb(pic2_data, (pic_mask_bits >> 8) as u8)
+}
+
+fn pic_switch_to_apic() {
+    pic_write_mask()
+    pit_stop()
+    for irq in 1..16u8 {
+        if irq != irq_cascade && !pic_masked(irq) {
+            isa_route(irq, true)
+        }
+    }
 }
 
 fn pic_unmask(irq: u8) {
@@ -65,6 +83,12 @@ fn pic_unmask(irq: u8) {
         panic("pic_unmask: irq out of range")
     }
     pic_mask_bits &= ~(1u16 << irq as u16)
+    if get_apic_on() {
+        if irq != 0 {
+            isa_route(irq, true)
+        }
+        return
+    }
     pic_write_mask()
 }
 
@@ -73,6 +97,10 @@ fn pic_mask(irq: u8) {
         panic("pic_mask: irq out of range")
     }
     pic_mask_bits |= 1u16 << irq as u16
+    if get_apic_on() {
+        isa_route(irq, false)
+        return
+    }
     pic_write_mask()
 }
 
@@ -81,6 +109,10 @@ fn pic_masked(irq: u8) -> bool {
 }
 
 fn pic_eoi(irq: u8) {
+    if get_apic_on() {
+        lapic_eoi()
+        return
+    }
     if irq >= 8 {
         outb(pic2_command, pic_eoi_command)
     }

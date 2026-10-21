@@ -1,0 +1,45 @@
+/// Wiki Doc sources:
+///   - https://wiki.osdev.org/UEFI#Loading_files
+///   - https://wiki.osdev.org/Initrd
+
+#![trusted]
+
+import "efi.psy"
+import "paging.psy"
+
+const unit_bytes: u64 = 512
+const max_image: u64 = 0x10000000
+
+#[getter]
+static mut ram_phys: u64 = 0
+#[getter]
+static mut ram_bytes: u64 = 0
+
+fn ramdisk_load() -> bool {
+    let Some(f) = efi_load_file(u"\\PSYOS.IMG", max_image) else {
+        return false
+    }
+    ram_phys = f.phys
+    ram_bytes = f.size / unit_bytes * unit_bytes
+    return ram_bytes > 0
+}
+
+fn ram_ok(unit: u64, count: u64, len: usize) -> bool {
+    return ram_bytes != 0 && (len as u64) >= count * unit_bytes && unit + count <= ram_bytes / unit_bytes
+}
+
+fn ram_read(unit: u64, count: u64, buf: &mut [u8]) -> bool {
+    if !ram_ok(unit, count, buf.len()) {
+        return false
+    }
+    memcpy(buf.as_mut_ptr(), phys_to_virt(ram_phys + unit * unit_bytes) as *const u8, (count * unit_bytes) as usize)
+    return true
+}
+
+fn ram_write(unit: u64, count: u64, buf: &[u8]) -> bool {
+    if !ram_ok(unit, count, buf.len()) {
+        return false
+    }
+    memcpy(phys_to_virt(ram_phys + unit * unit_bytes) as *mut u8, buf.as_ptr(), (count * unit_bytes) as usize)
+    return true
+}

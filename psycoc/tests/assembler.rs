@@ -38,6 +38,35 @@ mod tests {
     }
 
     #[test]
+    fn swapgs_and_gs_slots() {
+        assert_eq!(encode(|a| a.swapgs()), vec![0x0F, 0x01, 0xF8]);
+        assert_eq!(
+            encode(|a| a.store_gs(8, Reg::Rsp)),
+            vec![0x65, 0x48, 0x89, 0x24, 0x25, 0x08, 0x00, 0x00, 0x00]
+        );
+        assert_eq!(
+            encode(|a| a.load_gs(Reg::Rsp, 0)),
+            vec![0x65, 0x48, 0x8B, 0x24, 0x25, 0x00, 0x00, 0x00, 0x00]
+        );
+        assert_eq!(
+            encode(|a| a.load_gs(Reg::Rax, 8)),
+            vec![0x65, 0x48, 0x8B, 0x04, 0x25, 0x08, 0x00, 0x00, 0x00]
+        );
+        assert_eq!(
+            encode(|a| a.store_gs(0, Reg::Rax)),
+            vec![0x65, 0x48, 0x89, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00]
+        );
+    }
+
+    #[test]
+    fn xchg_memory() {
+        assert_eq!(encode(|a| a.xchg_mem(Reg::Rcx, Reg::Rax)), vec![0x48, 0x87, 0x01]);
+        assert_eq!(encode(|a| a.xchg_mem(Reg::Rax, Reg::Rdx)), vec![0x48, 0x87, 0x10]);
+        assert_eq!(encode(|a| a.xchg_mem(Reg::R12, Reg::Rax)), vec![0x49, 0x87, 0x04, 0x24]);
+        assert_eq!(encode(|a| a.xchg_mem(Reg::Rbp, Reg::R9)), vec![0x4C, 0x87, 0x4D, 0x00]);
+    }
+
+    #[test]
     fn ret_syscall_cqo() {
         assert_eq!(encode(|a| a.ret()), vec![0xC3]);
         assert_eq!(encode(|a| a.syscall()), vec![0x0F, 0x05]);

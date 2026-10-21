@@ -160,6 +160,15 @@ fn memory_primitives_only_in_trusted_files() {
 }
 
 #[test]
+fn atomic_swap_only_in_trusted_files() {
+    bad(
+        "static mut lock: u64 = 0\nfn main() { let old = atomic_swap(&mut lock as *mut u64, 1) }",
+        "'atomic_swap' is only allowed",
+    );
+    trusted_ok("static mut lock: u64 = 0\nfn main() { let old = atomic_swap(&mut lock as *mut u64, 1) }");
+}
+
+#[test]
 fn trusted_file_exposes_a_safe_api() {
     let driver = "#![trusted]
         struct Port8 { port: u16 }

@@ -1406,6 +1406,10 @@ impl<'c, 'a> Lower<'c, 'a> {
                 self.intr(Intr::Wrmsr, o, false)
             }
             "rdtsc" => self.intr(Intr::Rdtsc, Vec::new(), true),
+            "atomic_swap" => {
+                let o = ops(self);
+                self.intr(Intr::AtomicSwap, o, true)
+            }
             "invlpg" | "lgdt" | "lidt" | "load_cs" | "load_ds" | "ltr" | "memcpy" | "memset"
             | "memset32" | "context_switch" | "rebase_statics" | "set_syscall_stack" => {
                 let kind = match name {

@@ -4,6 +4,7 @@
 ///   - https://uefi.org/specs/UEFI/2.10/07_Services_Boot_Services.html
 ///   - https://uefi.org/specs/UEFI/2.10/08_Services_Runtime_Services.html
 ///   - https://uefi.org/specs/UEFI/2.10/09_Protocols_EFI_Loaded_Image.html
+///   - https://uefi.org/specs/UEFI/2.10/04_EFI_System_Table.html#efi-configuration-table-properties-table
 
 #![trusted]
 
@@ -148,6 +149,13 @@ struct SystemTable {
     std_err: *mut SimpleTextOutput,
     runtime_services: *mut RuntimeServices,
     boot_services: *mut BootServices,
+    table_count: usize,
+    tables: *mut ConfigTable,
+}
+
+struct ConfigTable {
+    guid: Guid,
+    table: *mut u8,
 }
 
 struct LoadedImage {
@@ -177,6 +185,14 @@ struct EfiFile {
     close: extern fn(*mut EfiFile) -> u64,
     delete: *mut u8,
     read: extern fn(*mut EfiFile, *mut usize, *mut u8) -> u64,
+    write: *mut u8,
+    get_position: extern fn(*mut EfiFile, *mut u64) -> u64,
+    set_position: extern fn(*mut EfiFile, u64) -> u64,
+}
+
+struct LoadedFile {
+    phys: u64,
+    size: u64,
 }
 
 struct MemRegion {
@@ -199,12 +215,46 @@ static mut boot_device: *mut u8 = 0 as *mut u8
 static mut image_base: u64 = 0
 #[getter]
 static mut image_size: u64 = 0
+#[getter]
+static mut acpi_rsdp: u64 = 0
 
 fn efi_init() {
     st = efi_system_table() as *mut SystemTable
     let bs = (*st).boot_services
     (*bs).set_watchdog_timer(0, 0, 0, 0 as *const u16)
     read_loaded_image()
+    find_acpi()
+}
+
+fn guid_is(g: &Guid, d1: u32, d2: u16, d3: u16, d4: [u8; 8]) -> bool {
+    if g.d1 != d1 || g.d2 != d2 || g.d3 != d3 {
+        return false
+    }
+    for i in 0..8usize {
+        if g.d4[i] != d4[i] {
+            return false
+        }
+    }
+    return true
+}
+
+fn find_acpi() {
+    let n = (*st).table_count
+    let tables = (*st).tables
+    for i in 0..n {
+        let t = tables.add(i)
+        if guid_is(&(*t).guid, 0x8868E871, 0xE4F1, 0x11D3, [0xBC, 0x22, 0x00, 0x80, 0xC7, 0x3C, 0x88, 0x81]) {
+            acpi_rsdp = (*t).table as u64
+            return
+        }
+    }
+    for i in 0..n {
+        let t = tables.add(i)
+        if guid_is(&(*t).guid, 0xEB9D2D30, 0x2D88, 0x11D3, [0x9A, 0x16, 0x00, 0x90, 0x27, 0x3F, 0xC1, 0x4D]) {
+            acpi_rsdp = (*t).table as u64
+            return
+        }
+    }
 }
 
 fn read_loaded_image() {
@@ -260,6 +310,51 @@ fn efi_read_file(path: *const u16, buf: &mut [u8]) -> i64 {
         return -1
     }
     return size as i64
+}
+
+fn efi_load_file(path: *const u16, max: u64) -> Option<LoadedFile> {
+    if boot_services_done || boot_device.is_null() {
+        return None
+    }
+    let guid = Guid {
+        d1: 0x964e5b22,
+        d2: 0x6459,
+        d3: 0x11d2,
+        d4: [0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b],
+    }
+    let bs = (*st).boot_services
+    let mut fs = 0 as *mut u8
+    if (*bs).handle_protocol(boot_device, &guid as *const Guid, &mut fs as *mut *mut u8) != 0 || fs.is_null() {
+        return None
+    }
+    let sfs = fs as *mut SimpleFileSystem
+    let mut root = 0 as *mut EfiFile
+    if (*sfs).open_volume(sfs, &mut root as *mut *mut EfiFile) != 0 || root.is_null() {
+        return None
+    }
+    let mut file = 0 as *mut EfiFile
+    if (*root).open(root, &mut file as *mut *mut EfiFile, path, efi_file_mode_read, 0) != 0 || file.is_null() {
+        (*root).close(root)
+        return None
+    }
+    let mut size: u64 = 0
+    let ok = (*file).set_position(file, 0xFFFFFFFFFFFFFFFF) == 0 && (*file).get_position(file, &mut size as *mut u64) == 0 && (*file).set_position(file, 0) == 0
+    let mut result: Option<LoadedFile> = None
+    if ok && size > 0 && size <= max {
+        let pages = ((size + 4095) / 4096) as usize
+        let phys = efi_alloc_pages(pages)
+        if phys != 0 {
+            let mut got = size as usize
+            if (*file).read(file, &mut got as *mut usize, phys as *mut u8) == 0 && got as u64 == size {
+                result = Some(LoadedFile { phys: phys, size: size })
+            } else {
+                efi_free_pages(phys, pages)
+            }
+        }
+    }
+    (*file).close(file)
+    (*root).close(root)
+    return result
 }
 
 fn efi_alloc_pages(pages: usize) -> u64 {

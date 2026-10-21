@@ -1,0 +1,21 @@
+/// Wiki Doc sources:
+///   - https://wiki.osdev.org/Spinlock
+///   - https://wiki.osdev.org/Synchronization_Primitives
+
+#![trusted]
+
+fn spin_lock(word: *mut u64) {
+    while atomic_swap(word, 1) != 0 {
+        while word.read() != 0 {
+            pause()
+        }
+    }
+}
+
+fn spin_try(word: *mut u64) -> bool {
+    return atomic_swap(word, 1) == 0
+}
+
+fn spin_unlock(word: *mut u64) {
+    atomic_swap(word, 0)
+}

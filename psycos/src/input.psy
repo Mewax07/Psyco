@@ -8,6 +8,7 @@ import "keyboard.psy"
 import "timer.psy"
 import "serial.psy"
 import "mouse.psy"
+import "usb.psy"
 import "../user/psy/abi.psy" as abi
 
 const input_reserve: usize = 4
@@ -91,6 +92,7 @@ fn send_pointer(reserve: usize) {
 fn poll_serial_input() {
     display_poll()
     tablet_poll()
+    usb_poll()
     if !input_active() {
         pointer_forget()
         return

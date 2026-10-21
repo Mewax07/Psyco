@@ -1,0 +1,140 @@
+/// Wiki Doc sources:
+///   - https://wiki.osdev.org/USB_Human_Interface_Devices
+///   - https://www.usb.org/hid
+
+import "xhci.psy" as xhci
+import "keyboard.psy"
+import "mouse.psy"
+
+const usage_first: usize = 0x04
+const sc_break: u8 = 0x80
+const sc_prefix: u8 = 0xE0
+
+static usage_set1: [u8; 54] = [
+    0x1E, 0x30, 0x2E, 0x20, 0x12, 0x21, 0x22, 0x23, 0x17, 0x24, 0x25, 0x26, 0x32, 0x31, 0x18, 0x19,
+    0x10, 0x13, 0x1F, 0x14, 0x16, 0x2F, 0x11, 0x2D, 0x15, 0x2C, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+    0x08, 0x09, 0x0A, 0x0B, 0x1C, 0x01, 0x0E, 0x0F, 0x39, 0x0C, 0x0D, 0x1A, 0x1B, 0x2B, 0x2B, 0x27,
+    0x28, 0x29, 0x33, 0x34, 0x35, 0x3A,
+]
+
+static modifier_set1: [u8; 8] = [0x1D, 0x2A, 0x38, 0x5B, 0x1D, 0x36, 0x38, 0x5C]
+static modifier_extended: [bool; 8] = [false, false, false, true, true, false, true, true]
+
+static mut prev_keys: [u8; 6]
+static mut prev_mods: u8 = 0
+#[getter]
+static mut usb_ready: bool = false
+#[getter]
+static mut key_reports: u64 = 0
+#[getter]
+static mut pointer_reports: u64 = 0
+
+fn usb_init() -> bool {
+    usb_ready = xhci::init()
+    return usb_ready
+}
+
+fn send_scancode(code: u8, extended: bool, release: bool) {
+    if extended {
+        kbd_feed(sc_prefix)
+    }
+    if release {
+        kbd_feed(code | sc_break)
+    } else {
+        kbd_feed(code)
+    }
+}
+
+fn usage_code(usage: u8) -> u8 {
+    let u = usage as usize
+    if u < usage_first || u >= usage_first + usage_set1.len() {
+        return 0
+    }
+    return usage_set1[u - usage_first]
+}
+
+fn has_key(keys: &[u8], usage: u8) -> bool {
+    for i in 0..keys.len() {
+        if keys[i] == usage {
+            return true
+        }
+    }
+    return false
+}
+
+fn keyboard_report(data: &[u8; 8]) {
+    key_reports += 1
+    let mods = data[0]
+    for b in 0..8usize {
+        let bit = 1u8 << b as u8
+        if (mods ^ prev_mods) & bit != 0 {
+            send_scancode(modifier_set1[b], modifier_extended[b], mods & bit == 0)
+        }
+    }
+    prev_mods = mods
+    let mut now = [0u8; 6]
+    for i in 0..6usize {
+        now[i] = data[2 + i]
+    }
+    for i in 0..6usize {
+        let u = prev_keys[i]
+        if u != 0 && !has_key(&now, u) && usage_code(u) != 0 {
+            send_scancode(usage_code(u), false, true)
+        }
+    }
+    for i in 0..6usize {
+        let u = now[i]
+        if u > 1 && !has_key(&prev_keys, u) && usage_code(u) != 0 {
+            send_scancode(usage_code(u), false, false)
+        }
+    }
+    prev_keys = now
+}
+
+fn signed(b: u8) -> i64 {
+    return b as i8 as i64
+}
+
+fn pointer_report(r: &xhci::Report) {
+    pointer_reports += 1
+    let d = &r.data
+    if r.kind == xhci::kind_mouse {
+        let mut wheel: i64 = 0
+        if r.len >= 4 {
+            wheel = signed(d[3])
+        }
+        usb_pointer_move(d[0] as u64, signed(d[1]), signed(d[2]), wheel)
+    } else {
+        let x = d[1] as i64 | (d[2] as i64) << 8
+        let y = d[3] as i64 | (d[4] as i64) << 8
+        usb_pointer_abs(d[0] as u64, x, y, signed(d[5]))
+    }
+}
+
+fn usb_poll() {
+    if !usb_ready {
+        return
+    }
+    xhci::poll()
+    let mut r = xhci::Report { device: 0, kind: 0, data: [0u8; 8], len: 0 }
+    while xhci::take_report(&mut r) {
+        if r.kind == xhci::kind_keyboard {
+            keyboard_report(&r.data)
+        } else {
+            pointer_report(&r)
+        }
+    }
+}
+
+fn usb_kind_name(kind: u64) -> Str {
+    if kind == xhci::kind_keyboard {
+        return "keyboard"
+    }
+    if kind == xhci::kind_mouse {
+        return "mouse"
+    }
+    if kind == xhci::kind_tablet {
+        return "tablet"
+    }
+    return "?"
+}

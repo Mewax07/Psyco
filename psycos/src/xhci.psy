@@ -1,0 +1,733 @@
+/// Wiki Doc sources:
+///   - https://wiki.osdev.org/eXtensible_Host_Controller_Interface
+///   - https://wiki.osdev.org/USB
+///   - https://wiki.osdev.org/USB_Human_Interface_Devices
+///   - https://www.intel.com/content/www/us/en/products/docs/io/universal-serial-bus/extensible-host-controler-interface-usb-xhci.html
+
+#![trusted]
+
+import "pci.psy"
+import "paging.psy"
+import "pmm.psy"
+
+const class_xhci: u32 = 0x0C0330
+
+const cap_length: u64 = 0x00
+const cap_hcsparams1: u64 = 0x04
+const cap_hcsparams2: u64 = 0x08
+const cap_hccparams1: u64 = 0x10
+const cap_dboff: u64 = 0x14
+const cap_rtsoff: u64 = 0x18
+
+const op_usbcmd: u64 = 0x00
+const op_usbsts: u64 = 0x04
+const op_crcr: u64 = 0x18
+const op_dcbaap: u64 = 0x30
+const op_config: u64 = 0x38
+const op_ports: u64 = 0x400
+
+const cmd_run: u32 = 0x1
+const cmd_reset: u32 = 0x2
+const sts_halted: u32 = 0x1
+const sts_not_ready: u32 = 0x800
+
+const portsc_connected: u32 = 0x1
+const portsc_enabled: u32 = 0x2
+const portsc_reset: u32 = 0x10
+const portsc_keep: u32 = 0x4F00FFE9
+const portsc_changes: u32 = 0x00FE0000
+const portsc_reset_change: u32 = 0x00200000
+
+const ir_iman: u64 = 0x20
+const ir_erstsz: u64 = 0x28
+const ir_erstba: u64 = 0x30
+const ir_erdp: u64 = 0x38
+const erdp_busy: u64 = 0x8
+
+const legacy_id: u32 = 1
+const legacy_bios: u32 = 0x10000
+const legacy_os: u32 = 0x1000000
+
+const trb_normal: u32 = 1
+const trb_setup: u32 = 2
+const trb_data: u32 = 3
+const trb_status: u32 = 4
+const trb_link: u32 = 6
+const trb_enable_slot: u32 = 9
+const trb_address_device: u32 = 11
+const trb_configure_endpoint: u32 = 12
+const trb_evaluate_context: u32 = 13
+const trb_transfer_event: u32 = 32
+const trb_command_event: u32 = 33
+
+const trb_cycle: u32 = 0x1
+const trb_toggle: u32 = 0x2
+const trb_short_ok: u32 = 0x4
+const trb_ioc: u32 = 0x20
+const trb_immediate: u32 = 0x40
+const trb_dir_in: u32 = 0x10000
+const trt_out: u32 = 0x20000
+const trt_in: u32 = 0x30000
+
+const cc_success: u32 = 1
+const cc_short: u32 = 13
+
+const ring_trbs: u64 = 256
+const report_slots: u64 = 4
+const report_bytes: u64 = 64
+const max_devices: usize = 8
+const spin_limit: u64 = 20000000
+
+const ep_control: u32 = 4
+const ep_interrupt_in: u32 = 7
+
+const speed_full: u32 = 1
+const speed_low: u32 = 2
+const speed_high: u32 = 3
+
+const kind_keyboard: u64 = 1
+const kind_mouse: u64 = 2
+const kind_tablet: u64 = 3
+
+const desc_device: u64 = 1
+const desc_config: u64 = 2
+const desc_interface: u8 = 4
+const desc_endpoint: u8 = 5
+const class_hid: u8 = 3
+const protocol_keyboard: u8 = 1
+const protocol_mouse: u8 = 2
+const tablet_vendor: u64 = 0x0627
+const tablet_product: u64 = 0x0001
+
+struct Ring {
+    phys: u64,
+    index: u64,
+    cycle: u32,
+}
+
+struct Device {
+    kind: u64,
+    slot: u64,
+    port: u64,
+    speed: u32,
+    dci: u64,
+    ep0: Ring,
+    ring: Ring,
+    buf: u64,
+    in_ctx: u64,
+    out_ctx: u64,
+    mps0: u64,
+    reports: u64,
+    vendor: u64,
+    product: u64,
+}
+
+struct Report {
+    device: usize,
+    kind: u64,
+    data: [u8; 8],
+    len: u64,
+}
+
+static mut cap: u64 = 0
+static mut op: u64 = 0
+static mut rt: u64 = 0
+static mut db: u64 = 0
+static mut ctx_size: u64 = 32
+static mut dcbaa: u64 = 0
+static mut cmd_ring: Ring
+static mut event_phys: u64 = 0
+static mut event_index: u64 = 0
+static mut event_cycle: u32 = 1
+static mut devices: [Device; 8]
+#[getter]
+static mut device_count: usize = 0
+#[getter]
+static mut ready: bool = false
+#[getter]
+static mut port_count: u64 = 0
+#[getter]
+static mut slot_count: u64 = 0
+#[getter]
+static mut errors: u64 = 0
+
+fn r32(base: u64, off: u64) -> u32 {
+    return ((base + off) as *mut u32).read()
+}
+
+fn w32(base: u64, off: u64, v: u32) {
+    ((base + off) as *mut u32).write(v)
+}
+
+fn w64(base: u64, off: u64, v: u64) {
+    w32(base, off, v as u32)
+    w32(base, off + 4, (v >> 32) as u32)
+}
+
+fn mem(phys: u64) -> *mut u8 {
+    return phys_to_virt(phys) as *mut u8
+}
+
+fn page() -> u64 {
+    let p = pmm_alloc_page()
+    if p != 0 {
+        zero_phys(p, size_4k)
+    }
+    return p
+}
+
+fn new_ring() -> Option<Ring> {
+    let p = page()
+    if p == 0 {
+        return None
+    }
+    let link = mem(p + (ring_trbs - 1) * 16)
+    (link as *mut u64).write(p)
+    (link.add(12) as *mut u32).write(trb_link << 10 | trb_toggle)
+    return Some(Ring { phys: p, index: 0, cycle: 1 })
+}
+
+fn enqueue(r: &mut Ring, d0: u32, d1: u32, d2: u32, d3: u32) -> u64 {
+    let at = r.phys + r.index * 16
+    let t = mem(at)
+    (t as *mut u32).write(d0)
+    (t.add(4) as *mut u32).write(d1)
+    (t.add(8) as *mut u32).write(d2)
+    (t.add(12) as *mut u32).write(d3 | r.cycle)
+    r.index += 1
+    if r.index == ring_trbs - 1 {
+        let link = mem(r.phys + r.index * 16).add(12) as *mut u32
+        link.write(trb_link << 10 | trb_toggle | r.cycle)
+        r.cycle ^= 1
+        r.index = 0
+    }
+    return at
+}
+
+fn ring_doorbell(slot: u64, target: u32) {
+    w32(db, slot * 4, target)
+}
+
+fn trb_word(phys: u64, i: u64) -> u32 {
+    return (mem(phys + i * 4) as *mut u32).read()
+}
+
+fn next_event(e: &mut [u32; 4]) -> bool {
+    let at = event_phys + event_index * 16
+    let control = trb_word(at, 3)
+    if control & trb_cycle != event_cycle {
+        return false
+    }
+    for i in 0..4u64 {
+        e[i as usize] = trb_word(at, i)
+    }
+    event_index += 1
+    if event_index == ring_trbs {
+        event_index = 0
+        event_cycle ^= 1
+    }
+    w64(rt, ir_erdp, (event_phys + event_index * 16) | erdp_busy)
+    return true
+}
+
+fn event_type(e: &[u32; 4]) -> u32 {
+    return (e[3] >> 10) & 0x3F
+}
+
+fn event_code(e: &[u32; 4]) -> u32 {
+    return e[2] >> 24
+}
+
+fn wait_event(kind: u32, slot: u64, e: &mut [u32; 4]) -> bool {
+    for i in 0..spin_limit {
+        if next_event(e) {
+            if event_type(e) == kind && (slot == 0 || (e[3] >> 24) as u64 == slot) {
+                return true
+            }
+            handle_event(e)
+        } else {
+            pause()
+        }
+    }
+    errors += 1
+    return false
+}
+
+fn command(d0: u32, d1: u32, d2: u32, d3: u32) -> Option<u64> {
+    enqueue(&mut cmd_ring, d0, d1, d2, d3)
+    ring_doorbell(0, 0)
+    let mut e = [0u32; 4]
+    if !wait_event(trb_command_event, 0, &mut e) || event_code(&e) != cc_success {
+        errors += 1
+        return None
+    }
+    return Some((e[3] >> 24) as u64)
+}
+
+fn legacy_handoff(base: u64) {
+    let mut off = ((r32(base, cap_hccparams1) >> 16) as u64) << 2
+    let mut guard: u64 = 0
+    while off != 0 && guard < 64 {
+        let v = r32(base, off)
+        if v & 0xFF == legacy_id {
+            w32(base, off, v | legacy_os)
+            for i in 0..spin_limit {
+                if r32(base, off) & legacy_bios == 0 {
+                    break
+                }
+                pause()
+            }
+            w32(base, off + 4, 0xE0000000)
+            return
+        }
+        let next = ((v >> 8) & 0xFF) as u64
+        if next == 0 {
+            return
+        }
+        off += next << 2
+        guard += 1
+    }
+}
+
+fn reset_controller() -> bool {
+    w32(op, op_usbcmd, r32(op, op_usbcmd) & ~cmd_run)
+    for i in 0..spin_limit {
+        if r32(op, op_usbsts) & sts_halted != 0 {
+            break
+        }
+        pause()
+    }
+    w32(op, op_usbcmd, cmd_reset)
+    for i in 0..spin_limit {
+        if r32(op, op_usbcmd) & cmd_reset == 0 && r32(op, op_usbsts) & sts_not_ready == 0 {
+            return true
+        }
+        pause()
+    }
+    return false
+}
+
+fn setup_scratchpads(params2: u32) -> bool {
+    let n = (((params2 >> 21) & 0x1F) << 5 | (params2 >> 27)) as u64
+    if n == 0 {
+        return true
+    }
+    let list = page()
+    if list == 0 {
+        return false
+    }
+    for i in 0..n {
+        let p = page()
+        if p == 0 {
+            return false
+        }
+        (mem(list + i * 8) as *mut u64).write(p)
+    }
+    (mem(dcbaa) as *mut u64).write(list)
+    return true
+}
+
+fn init() -> bool {
+    let Some(a) = pci_find_class(class_xhci, 0) else {
+        return false
+    }
+    let Some(bar) = pci_memory_bar(&a, 0) else {
+        return false
+    }
+    pci_enable(&a)
+    let Some(probe) = map_mmio(bar, size_4k) else {
+        return false
+    }
+    let length = (r32(probe, cap_length) & 0xFF) as u64
+    let params1 = r32(probe, cap_hcsparams1)
+    port_count = (params1 >> 24) as u64
+    let mut size = length + op_ports + port_count * 16
+    let dboff = (r32(probe, cap_dboff) & ~3u32) as u64
+    let rtsoff = (r32(probe, cap_rtsoff) & ~31u32) as u64
+    if dboff + 1024 > size {
+        size = dboff + 1024
+    }
+    if rtsoff + 64 > size {
+        size = rtsoff + 64
+    }
+    let Some(base) = map_mmio(bar, size) else {
+        return false
+    }
+    cap = base
+    op = base + length
+    db = base + dboff
+    rt = base + rtsoff
+    if r32(cap, cap_hccparams1) & 0x4 != 0 {
+        ctx_size = 64
+    }
+    legacy_handoff(cap)
+    if !reset_controller() {
+        return false
+    }
+    slot_count = (params1 & 0xFF) as u64
+    if slot_count > max_devices as u64 + 1 {
+        slot_count = max_devices as u64 + 1
+    }
+    w32(op, op_config, slot_count as u32)
+    dcbaa = page()
+    if dcbaa == 0 || !setup_scratchpads(r32(cap, cap_hcsparams2)) {
+        return false
+    }
+    w64(op, op_dcbaap, dcbaa)
+    let Some(cr) = new_ring() else {
+        return false
+    }
+    cmd_ring = cr
+    w64(op, op_crcr, cmd_ring.phys | 1)
+    event_phys = page()
+    let erst = page()
+    if event_phys == 0 || erst == 0 {
+        return false
+    }
+    (mem(erst) as *mut u64).write(event_phys)
+    (mem(erst + 8) as *mut u32).write(ring_trbs as u32)
+    event_index = 0
+    event_cycle = 1
+    w32(rt, ir_erstsz, 1)
+    w64(rt, ir_erdp, event_phys)
+    w64(rt, ir_erstba, erst)
+    w32(rt, ir_iman, 0)
+    w32(op, op_usbcmd, cmd_run)
+    for i in 0..spin_limit {
+        if r32(op, op_usbsts) & sts_halted == 0 {
+            break
+        }
+        pause()
+    }
+    ready = true
+    for p in 1..port_count + 1 {
+        if device_count < max_devices {
+            probe_port(p)
+        }
+    }
+    return true
+}
+
+fn portsc(port: u64) -> u32 {
+    return r32(op, op_ports + (port - 1) * 16)
+}
+
+fn set_portsc(port: u64, v: u32) {
+    w32(op, op_ports + (port - 1) * 16, v)
+}
+
+fn reset_port(port: u64) -> bool {
+    let v = portsc(port)
+    set_portsc(port, (v & portsc_keep & ~portsc_enabled) | portsc_reset)
+    for i in 0..spin_limit {
+        let s = portsc(port)
+        if s & portsc_reset_change != 0 && s & portsc_reset == 0 {
+            set_portsc(port, (s & portsc_keep & ~portsc_enabled) | portsc_changes)
+            return s & portsc_enabled != 0
+        }
+        pause()
+    }
+    return false
+}
+
+fn default_mps(speed: u32) -> u64 {
+    if speed == speed_high {
+        return 64
+    }
+    if speed == speed_full || speed == speed_low {
+        return 8
+    }
+    return 512
+}
+
+fn ctx(base: u64, index: u64) -> *mut u32 {
+    return mem(base + index * ctx_size) as *mut u32
+}
+
+fn control(d: usize, request_type: u32, request: u32, value: u32, index: u32, length: u32) -> bool {
+    let slot = devices[d].slot
+    let mut trt: u32 = 0
+    if length > 0 {
+        if request_type & 0x80 != 0 {
+            trt = trt_in
+        } else {
+            trt = trt_out
+        }
+    }
+    let setup0 = request_type | request << 8 | value << 16
+    let setup1 = index | length << 16
+    enqueue(&mut devices[d].ep0, setup0, setup1, 8, trb_setup << 10 | trb_immediate | trt)
+    let mut status_dir = trb_dir_in
+    if length > 0 {
+        let buf = devices[d].buf
+        let mut dir: u32 = 0
+        if request_type & 0x80 != 0 {
+            dir = trb_dir_in
+            status_dir = 0
+        }
+        enqueue(&mut devices[d].ep0, buf as u32, (buf >> 32) as u32, length, trb_data << 10 | dir)
+    }
+    enqueue(&mut devices[d].ep0, 0, 0, 0, trb_status << 10 | trb_ioc | status_dir)
+    ring_doorbell(slot, 1)
+    let mut e = [0u32; 4]
+    if !wait_event(trb_transfer_event, slot, &mut e) {
+        return false
+    }
+    let code = event_code(&e)
+    if code != cc_success && code != cc_short {
+        errors += 1
+        return false
+    }
+    return true
+}
+
+fn buf_byte(d: usize, i: u64) -> u8 {
+    return mem(devices[d].buf + i).read()
+}
+
+fn buf_word(d: usize, i: u64) -> u64 {
+    return buf_byte(d, i) as u64 | (buf_byte(d, i + 1) as u64) << 8
+}
+
+fn address_device(d: usize, port: u64, speed: u32) -> bool {
+    let Some(slot) = command(0, 0, 0, trb_enable_slot << 10) else {
+        return false
+    }
+    let in_ctx = page()
+    let out_ctx = page()
+    let buf = page()
+    let Some(ep0) = new_ring() else {
+        return false
+    }
+    let Some(ring) = new_ring() else {
+        return false
+    }
+    if in_ctx == 0 || out_ctx == 0 || buf == 0 || slot == 0 || slot >= slot_count {
+        return false
+    }
+    devices[d] = Device { kind: 0, slot: slot, port: port, speed: speed, dci: 0, ep0: ep0, ring: ring, buf: buf, in_ctx: in_ctx, out_ctx: out_ctx, mps0: default_mps(speed), reports: 0, vendor: 0, product: 0 }
+    (mem(dcbaa + slot * 8) as *mut u64).write(out_ctx)
+    let c = ctx(in_ctx, 0)
+    c.add(1).write(3)
+    let s = ctx(in_ctx, 1)
+    s.write(speed << 20 | 1u32 << 27)
+    s.add(1).write((port as u32) << 16)
+    let e = ctx(in_ctx, 2)
+    e.add(1).write(3u32 << 1 | ep_control << 3 | (devices[d].mps0 as u32) << 16)
+    e.add(2).write(ep0.phys as u32 | 1)
+    e.add(3).write((ep0.phys >> 32) as u32)
+    e.add(4).write(8)
+    if command(in_ctx as u32, (in_ctx >> 32) as u32, 0, trb_address_device << 10 | (slot as u32) << 24).is_none() {
+        return false
+    }
+    if !control(d, 0x80, 6, (desc_device << 8) as u32, 0, 8) {
+        return false
+    }
+    let mps = buf_byte(d, 7) as u64
+    if mps != 0 && mps != devices[d].mps0 && devices[d].speed != 4 {
+        devices[d].mps0 = mps
+        ctx(in_ctx, 0).add(1).write(2)
+        ctx(in_ctx, 0).write(0)
+        e.add(1).write(3u32 << 1 | ep_control << 3 | (mps as u32) << 16)
+        if command(in_ctx as u32, (in_ctx >> 32) as u32, 0, trb_evaluate_context << 10 | (slot as u32) << 24).is_none() {
+            return false
+        }
+    }
+    if !control(d, 0x80, 6, (desc_device << 8) as u32, 0, 18) {
+        return false
+    }
+    devices[d].vendor = buf_word(d, 8)
+    devices[d].product = buf_word(d, 10)
+    return true
+}
+
+fn interval_exponent(speed: u32, b: u64) -> u32 {
+    if speed == speed_high || speed > speed_high {
+        if b == 0 {
+            return 0
+        }
+        return (b - 1) as u32
+    }
+    let mut e: u32 = 3
+    let mut v = b
+    while v > 1 && e < 10 {
+        v = v >> 1
+        e += 1
+    }
+    return e
+}
+
+fn configure(d: usize) -> bool {
+    if !control(d, 0x80, 6, (desc_config << 8) as u32, 0, 9) {
+        return false
+    }
+    let mut total = buf_word(d, 2)
+    if total > size_4k {
+        total = size_4k
+    }
+    let config_value = buf_byte(d, 5) as u32
+    if !control(d, 0x80, 6, (desc_config << 8) as u32, 0, total as u32) {
+        return false
+    }
+    let mut at: u64 = 0
+    let mut iface: u64 = 0xFF
+    let mut kind: u64 = 0
+    let mut boot = false
+    let mut ep: u64 = 0
+    let mut mps: u64 = 0
+    let mut interval: u64 = 0
+    let mut in_hid = false
+    while at + 2 <= total {
+        let len = buf_byte(d, at) as u64
+        let t = buf_byte(d, at + 1)
+        if len < 2 {
+            break
+        }
+        if t == desc_interface && ep == 0 {
+            in_hid = buf_byte(d, at + 5) == class_hid
+            if in_hid {
+                iface = buf_byte(d, at + 2) as u64
+                boot = buf_byte(d, at + 6) == 1
+                let protocol = buf_byte(d, at + 7)
+                if boot && protocol == protocol_keyboard {
+                    kind = kind_keyboard
+                } else if boot && protocol == protocol_mouse {
+                    kind = kind_mouse
+                } else if devices[d].vendor == tablet_vendor && devices[d].product == tablet_product {
+                    kind = kind_tablet
+                } else {
+                    in_hid = false
+                }
+            }
+        } else if t == desc_endpoint && in_hid && ep == 0 {
+            let addr = buf_byte(d, at + 2)
+            if addr & 0x80 != 0 && buf_byte(d, at + 3) & 3 == 3 {
+                ep = (addr & 0xF) as u64
+                mps = buf_word(d, at + 4) & 0x7FF
+                interval = buf_byte(d, at + 6) as u64
+            }
+        }
+        at += len
+    }
+    if ep == 0 || kind == 0 {
+        return false
+    }
+    if !control(d, 0x00, 9, config_value, 0, 0) {
+        return false
+    }
+    if boot {
+        control(d, 0x21, 0x0B, 0, iface as u32, 0)
+    }
+    control(d, 0x21, 0x0A, 0, iface as u32, 0)
+    let dci = ep * 2 + 1
+    let in_ctx = devices[d].in_ctx
+    let c = ctx(in_ctx, 0)
+    c.write(0)
+    c.add(1).write(1u32 | 1u32 << dci as u32)
+    let s = ctx(in_ctx, 1)
+    s.write(devices[d].speed << 20 | (dci as u32) << 27)
+    s.add(1).write((devices[d].port as u32) << 16)
+    let e = ctx(in_ctx, 1 + dci)
+    let ring = devices[d].ring.phys
+    e.write(interval_exponent(devices[d].speed, interval) << 16)
+    e.add(1).write(3u32 << 1 | ep_interrupt_in << 3 | (mps as u32) << 16)
+    e.add(2).write(ring as u32 | 1)
+    e.add(3).write((ring >> 32) as u32)
+    e.add(4).write(mps as u32 | (mps as u32) << 16)
+    if command(in_ctx as u32, (in_ctx >> 32) as u32, 0, trb_configure_endpoint << 10 | (devices[d].slot as u32) << 24).is_none() {
+        return false
+    }
+    devices[d].kind = kind
+    devices[d].dci = dci
+    for k in 0..report_slots {
+        queue_report(d, k)
+    }
+    return true
+}
+
+fn report_buffer(d: usize, k: u64) -> u64 {
+    return devices[d].buf + size_4k / 2 + k * report_bytes
+}
+
+fn queue_report(d: usize, k: u64) {
+    let b = report_buffer(d, k)
+    enqueue(&mut devices[d].ring, b as u32, (b >> 32) as u32, 8, trb_normal << 10 | trb_ioc | trb_short_ok)
+    ring_doorbell(devices[d].slot, devices[d].dci as u32)
+}
+
+fn probe_port(port: u64) {
+    let s = portsc(port)
+    if s & portsc_connected == 0 {
+        return
+    }
+    if s & portsc_enabled == 0 && !reset_port(port) {
+        return
+    }
+    let speed = (portsc(port) >> 10) & 0xF
+    let d = device_count
+    if !address_device(d, port, speed) {
+        return
+    }
+    if configure(d) {
+        device_count += 1
+    }
+}
+
+static mut pending: [Report; 8]
+static mut pending_count: usize = 0
+
+fn handle_event(e: &[u32; 4]) {
+    if event_type(e) != trb_transfer_event {
+        return
+    }
+    let slot = (e[3] >> 24) as u64
+    let dci = ((e[3] >> 16) & 0x1F) as u64
+    for d in 0..device_count {
+        if devices[d].slot != slot || devices[d].dci != dci {
+            continue
+        }
+        let trb = e[0] as u64 | (e[1] as u64) << 32
+        let b = trb_word(trb, 0) as u64 | (trb_word(trb, 1) as u64) << 32
+        let code = event_code(e)
+        let k = (b - report_buffer(d, 0)) / report_bytes
+        if (code == cc_success || code == cc_short) && pending_count < 8 {
+            let mut r = Report { device: d, kind: devices[d].kind, data: [0u8; 8], len: 8 - (e[2] & 0xFFFFFF) as u64 }
+            for i in 0..8u64 {
+                r.data[i as usize] = mem(b + i).read()
+            }
+            pending[pending_count] = r
+            pending_count += 1
+            devices[d].reports += 1
+        }
+        if k < report_slots {
+            queue_report(d, k)
+        }
+        return
+    }
+}
+
+fn poll() {
+    if !ready {
+        return
+    }
+    let mut e = [0u32; 4]
+    while next_event(&mut e) {
+        handle_event(&e)
+    }
+}
+
+fn take_report(r: &mut Report) -> bool {
+    if pending_count == 0 {
+        return false
+    }
+    *r = pending[0]
+    for i in 1..pending_count {
+        pending[i - 1] = pending[i]
+    }
+    pending_count -= 1
+    return true
+}
+
+fn device_info(d: usize) -> Device {
+    return devices[d]
+}

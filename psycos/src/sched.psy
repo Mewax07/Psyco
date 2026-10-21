@@ -10,8 +10,9 @@ import "sync.psy"
 import "exceptions.psy"
 import "keyboard.psy"
 import "usermode.psy"
+import "cpu.psy"
 
-const max_tasks: usize = 16
+const max_tasks: usize = 32
 const task_stack_pages: u64 = 4
 const task_stack_size: u64 = 16384
 const task_name_max: usize = 16
@@ -26,6 +27,7 @@ const exit_fault_base: i64 = 128
 const exit_killed: i64 = 137
 
 const time_slice: u64 = 2
+const stack_flush_pages: u64 = 4
 
 enum TaskState: u8 {
     Free,
@@ -52,22 +54,54 @@ struct Task {
     user_entry: u64,
     user_stack: u64,
     exit_code: i64,
+    cpu: usize,
+    pinned: bool,
+    lock_depth: u64,
 }
 
-static mut tasks: [Task; 16]
+static mut tasks: [Task; 32]
+static mut current_of: [usize; 16]
+static mut idle_of: [usize; 16]
+static mut slice_of: [u64; 16]
+static mut busy_of: [u64; 16]
 #[getter]
-static mut current: usize = 0
+static mut max_parallel_user: u64 = 0
 #[getter]
 static mut sched_ready: bool = false
 #[getter]
 static mut context_switches: u64 = 0
 #[getter]
 static mut preemptions: u64 = 0
-static mut slice_left: u64 = 2
 static mut next_task_id: u64 = 0
 
-static mut last_exit: [i64; 16]
-static mut last_exit_id: [u64; 16]
+static mut last_exit: [i64; 32]
+static mut last_exit_id: [u64; 32]
+
+fn cur() -> usize {
+    return current_of[this_cpu()]
+}
+
+fn get_current() -> usize {
+    return cur()
+}
+
+fn is_current_anywhere(slot: usize) -> bool {
+    for c in 0..get_cpus_online() {
+        if current_of[c] == slot {
+            return true
+        }
+    }
+    return false
+}
+
+fn is_idle(slot: usize) -> bool {
+    for c in 0..get_cpus_online() {
+        if idle_of[c] == slot {
+            return true
+        }
+    }
+    return false
+}
 
 fn task_set_name_bytes(slot: usize, name: &[u8]) {
     let mut n = name.len()
@@ -102,17 +136,22 @@ fn init_slot(slot: usize, name: Str, state: TaskState) {
     tasks[slot].cr3 = kernel_root()
     tasks[slot].is_user = false
     tasks[slot].exit_code = 0
+    tasks[slot].cpu = 0
+    tasks[slot].pinned = false
+    tasks[slot].lock_depth = 1
     set_name(slot, name)
 }
 
 fn idle_main() {
     loop {
-        let was_on = irq_save()
+        cli()
         reap()
-        irq_restore(was_on)
+        kernel_unlock_all()
         sti()
         hlt()
-        yield_now()
+        cli()
+        kernel_lock()
+        schedule()
     }
 }
 
@@ -126,9 +165,11 @@ fn sched_init() {
         tasks[i].has_stack = false
     }
     next_task_id = 0
+    kernel_lock()
     init_slot(boot_task, "kernel", TaskState::Running)
-    current = boot_task
-    slice_left = time_slice
+    tasks[boot_task].pinned = true
+    current_of[0] = boot_task
+    slice_of[0] = time_slice
     sched_ready = true
     set_tick_hook(sched_tick)
     set_user_fault_hook(user_fault)
@@ -137,6 +178,32 @@ fn sched_init() {
     if spawn("idle", idle_main) != idle_task as i64 {
         panic("sched_init: idle task is not task 1")
     }
+    tasks[idle_task].pinned = true
+    idle_of[0] = idle_task
+}
+
+fn sched_add_cpu(cpu: usize) -> i64 {
+    let was_on = irq_save()
+    let mut slot = max_tasks
+    for i in 0..max_tasks {
+        if tasks[i].state == TaskState::Free {
+            slot = i
+            break
+        }
+    }
+    if slot == max_tasks {
+        irq_restore(was_on)
+        return -1
+    }
+    tasks[slot].has_stack = false
+    init_slot(slot, "idle", TaskState::Running)
+    tasks[slot].cpu = cpu
+    tasks[slot].pinned = true
+    idle_of[cpu] = slot
+    current_of[cpu] = slot
+    slice_of[cpu] = time_slice
+    irq_restore(was_on)
+    return slot as i64
 }
 
 fn stack_top(slot: usize) -> u64 {
@@ -175,9 +242,13 @@ fn is_stack_guard(addr: u64) -> bool {
     return offset < stack_window - task_stack_size
 }
 
+fn sched_drop_cpu(slot: usize) {
+    tasks[slot].state = TaskState::Free
+}
+
 fn reap() {
     for i in 0..max_tasks {
-        if i != current && tasks[i].state == TaskState::Dead {
+        if !is_current_anywhere(i) && tasks[i].state == TaskState::Dead {
             if tasks[i].is_user {
                 as_destroy(tasks[i].cr3)
                 tasks[i].is_user = false
@@ -192,14 +263,42 @@ fn reap() {
 }
 
 fn task_start() {
+    kernel_lock_resume(1)
     sti()
-    let entry = tasks[current].entry
+    let entry = tasks[cur()].entry
     entry()
     task_exit()
 }
 
 fn user_task_start() {
-    enter_user(tasks[current].user_entry, tasks[current].user_stack)
+    let slot = cur()
+    cli()
+    kernel_unlock_all()
+    enter_user(tasks[slot].user_entry, tasks[slot].user_stack)
+}
+
+fn cpu_load(c: usize) -> u64 {
+    let mut n: u64 = 0
+    for i in 0..max_tasks {
+        let st = tasks[i].state
+        if tasks[i].cpu == c && !is_idle(i) && st != TaskState::Free && st != TaskState::Dead {
+            n += 1
+        }
+    }
+    return n
+}
+
+fn least_loaded_cpu() -> usize {
+    let mut best: usize = 0
+    let mut best_load = cpu_load(0)
+    for c in 1..get_cpus_online() {
+        let l = cpu_load(c)
+        if l < best_load {
+            best = c
+            best_load = l
+        }
+    }
+    return best
 }
 
 fn spawn_user(name: Str, root: u64, entry: u64, stack: u64) -> i64 {
@@ -239,74 +338,117 @@ fn spawn(name: Str, entry: fn()) -> i64 {
     tasks[slot].entry = entry
     tasks[slot].rsp = context_new(stack_top(slot), task_start)
     init_slot(slot, name, TaskState::Ready)
+    tasks[slot].cpu = least_loaded_cpu()
+    cpu_kick(tasks[slot].cpu)
     irq_restore(was_on)
     return slot as i64
 }
 
-fn runnable(slot: usize) -> bool {
-    return tasks[slot].state == TaskState::Ready || tasks[slot].state == TaskState::Running
+fn runnable_on(slot: usize, c: usize) -> bool {
+    if tasks[slot].state == TaskState::Ready {
+        return true
+    }
+    return tasks[slot].state == TaskState::Running && current_of[c] == slot
 }
 
 fn task_run_ticks(slot: usize) -> u64 {
     return tasks[slot].run_ticks
 }
 
-fn pick_next() -> usize {
+fn pick_next(c: usize) -> usize {
+    let me = current_of[c]
     for step in 1..max_tasks + 1 {
-        let i = (current + step) % max_tasks
-        if i != idle_task && runnable(i) {
+        let i = (me + step) % max_tasks
+        if tasks[i].cpu == c && !is_idle(i) && runnable_on(i, c) {
             return i
         }
     }
-    return idle_task
+    for i in 0..max_tasks {
+        if tasks[i].cpu != c && !tasks[i].pinned && !is_idle(i) && tasks[i].state == TaskState::Ready && !is_idle(current_of[tasks[i].cpu]) {
+            return i
+        }
+    }
+    return idle_of[c]
+}
+
+fn flush_stack(slot: usize) {
+    let bottom = stack_top(slot) - task_stack_size
+    for i in 0..stack_flush_pages {
+        invlpg((bottom + i * size_4k) as usize)
+    }
 }
 
 fn schedule() {
     if !sched_ready {
         return
     }
-    let next = pick_next()
-    if next == current {
+    let c = this_cpu()
+    let prev = current_of[c]
+    let next = pick_next(c)
+    if next == prev {
         return
     }
-    let prev = current
     if tasks[prev].state == TaskState::Running {
         tasks[prev].state = TaskState::Ready
     }
     tasks[next].state = TaskState::Running
+    tasks[next].cpu = c
     tasks[next].switches += 1
-    slice_left = time_slice
+    slice_of[c] = time_slice
     context_switches += 1
-    current = next
+    current_of[c] = next
     if tasks[next].has_stack {
-        set_kernel_entry_stack(stack_top(next))
+        set_kernel_entry_stack(c, stack_top(next))
+        flush_stack(next)
     }
     if tasks[next].cr3 != tasks[prev].cr3 {
         switch_address_space(tasks[next].cr3)
     }
+    tasks[prev].lock_depth = get_big_depth()
     context_switch_to(&mut tasks[prev].rsp as *mut u64, tasks[next].rsp)
+    kernel_lock_resume(tasks[cur()].lock_depth)
+}
+
+fn count_parallel_user() {
+    let mut n: u64 = 0
+    for c in 0..get_cpus_online() {
+        if tasks[current_of[c]].is_user && tasks[current_of[c]].state == TaskState::Running {
+            n += 1
+        }
+    }
+    if n > max_parallel_user {
+        max_parallel_user = n
+    }
+}
+
+fn cpu_busy_ticks(c: usize) -> u64 {
+    return busy_of[c]
 }
 
 fn sched_tick() {
     let now = get_ticks()
-    let mut woke = false
     for i in 0..max_tasks {
         if tasks[i].state == TaskState::Sleeping && now >= tasks[i].wake_tick {
             tasks[i].state = TaskState::Ready
-            woke = true
         }
         if tasks[i].state == TaskState::Blocked && tasks[i].wake_tick != 0 && now >= tasks[i].wake_tick {
             tasks[i].state = TaskState::Ready
-            woke = true
         }
     }
-    tasks[current].run_ticks += 1
-    if slice_left > 0 {
-        slice_left -= 1
+    let c = this_cpu()
+    let me = current_of[c]
+    tasks[me].run_ticks += 1
+    if !is_idle(me) {
+        busy_of[c] += 1
     }
-    if slice_left == 0 || (current == idle_task && woke) {
-        slice_left = time_slice
-        if pick_next() != current {
+    count_parallel_user()
+    if slice_of[c] > 0 {
+        slice_of[c] -= 1
+    }
+    let gone = tasks[me].state == TaskState::Dead
+    if slice_of[c] == 0 || gone || (is_idle(me) && pick_next(c) != me) {
+        slice_of[c] = time_slice
+        if pick_next(c) != me && !is_idle(me) {
             preemptions += 1
         }
         schedule()
@@ -315,8 +457,8 @@ fn sched_tick() {
 
 fn task_sleep(ms: u64) {
     let was_on = irq_save()
-    tasks[current].wake_tick = get_ticks() + (ms * timer_hz + 999) / 1000
-    tasks[current].state = TaskState::Sleeping
+    tasks[cur()].wake_tick = get_ticks() + (ms * timer_hz + 999) / 1000
+    tasks[cur()].state = TaskState::Sleeping
     schedule()
     irq_restore(was_on)
 }
@@ -332,7 +474,7 @@ fn task_kill(slot: usize) -> bool {
         return false
     }
     tasks[slot].exit_code = exit_killed
-    if slot == current {
+    if slot == cur() {
         task_exit()
     }
     last_exit[slot] = exit_killed
@@ -343,16 +485,16 @@ fn task_kill(slot: usize) -> bool {
 }
 
 fn task_block() {
-    tasks[current].wake_tick = 0
-    tasks[current].state = TaskState::Blocked
+    tasks[cur()].wake_tick = 0
+    tasks[cur()].state = TaskState::Blocked
     schedule()
 }
 
 fn task_block_until(tick: u64) {
-    tasks[current].wake_tick = tick
-    tasks[current].state = TaskState::Blocked
+    tasks[cur()].wake_tick = tick
+    tasks[cur()].state = TaskState::Blocked
     schedule()
-    tasks[current].wake_tick = 0
+    tasks[cur()].wake_tick = 0
 }
 
 fn ms_to_ticks(ms: u64) -> u64 {
@@ -366,6 +508,7 @@ fn task_alive(id: u64) -> bool {
 fn task_wake(slot: usize) {
     if slot < max_tasks && tasks[slot].state == TaskState::Blocked {
         tasks[slot].state = TaskState::Ready
+        cpu_kick(tasks[slot].cpu)
     }
 }
 
@@ -387,13 +530,14 @@ fn yield_now() {
 
 fn task_exit_code(code: i64) {
     cli()
-    tasks[current].exit_code = code
+    tasks[cur()].exit_code = code
     task_exit()
 }
 
 fn user_fault(vector: u64, rip: u64, addr: u64) {
+    kernel_lock()
     puts("[")
-    put_u64(tasks[current].id)
+    put_u64(tasks[cur()].id)
     puts("] killed: ")
     puts(exception_name(vector))
     puts(" at rip 0x")
@@ -427,9 +571,10 @@ fn task_wait(slot: usize, id: u64) -> i64 {
 
 fn task_exit() {
     cli()
-    last_exit[current] = tasks[current].exit_code
-    last_exit_id[current] = tasks[current].id
-    tasks[current].state = TaskState::Dead
+    let me = cur()
+    last_exit[me] = tasks[me].exit_code
+    last_exit_id[me] = tasks[me].id
+    tasks[cur()].state = TaskState::Dead
     schedule()
     panic("task_exit: a dead task was scheduled")
 }
@@ -475,11 +620,15 @@ fn state_name(state: TaskState) -> Str {
 }
 
 fn current_task_id() -> u64 {
-    return tasks[current].id
+    return tasks[cur()].id
 }
 
 fn task_is_user(slot: usize) -> bool {
     return tasks[slot].is_user
+}
+
+fn task_cpu(slot: usize) -> usize {
+    return tasks[slot].cpu
 }
 
 fn task_switches(slot: usize) -> u64 {

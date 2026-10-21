@@ -755,7 +755,15 @@ impl<'e> Emitter<'e> {
             }
             Intr::SetSyscallStack => {
                 self.get_into(args[0], Rax);
-                self.asm.store_rw(rt.syscall_kernel_rsp, Rax);
+                self.asm.swapgs();
+                self.asm.store_gs(0, Rax);
+                self.asm.swapgs();
+            }
+            Intr::AtomicSwap => {
+                self.get_into(args[0], Rcx);
+                self.get_into(args[1], Rax);
+                self.asm.xchg_mem(Rcx, Rax);
+                result(self, Rax);
             }
             Intr::EfiImageHandle | Intr::EfiSystemTable => {
                 let l = if kind == Intr::EfiImageHandle {

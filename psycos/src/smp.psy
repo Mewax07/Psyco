@@ -1,0 +1,179 @@
+/// Wiki Doc sources:
+///   - https://wiki.osdev.org/SMP
+///   - https://wiki.osdev.org/Symmetric_Multiprocessing
+///   - https://wiki.osdev.org/APIC#Interrupt_Command_Register
+
+#![trusted]
+
+import "trampoline.psy"
+import "apic.psy"
+import "acpi.psy" as acpi
+import "cpu.psy"
+import "sched.psy"
+import "gdt.psy"
+import "idt.psy"
+import "sse.psy"
+import "usermode.psy"
+import "pmm.psy"
+import "paging.psy"
+import "efi.psy"
+import "timer.psy"
+
+const ap_timer_vector: usize = 48
+const ap_stack_pages: u64 = 4
+const ap_stack_bytes: u64 = 16384
+const ipi_init: u32 = 0x4500
+const ipi_startup: u32 = 0x4600
+const low_first: u64 = 0x1000
+const low_limit: u64 = 0xA0000
+const low_preferred: u64 = 0x8000
+const cr3_limit: u64 = 0x100000000
+const boot_timeout_ms: u64 = 200
+
+const mem_boot_code: u32 = 3
+const mem_boot_data: u32 = 4
+const mem_free: u32 = 7
+
+static mut ap_booting: usize = 0
+static mut ap_ready: [bool; 16]
+static mut ap_ist: [u64; 16]
+#[getter]
+static mut trampoline_phys: u64 = 0
+#[getter]
+static mut ap_failures: u64 = 0
+
+fn usable_low(kind: u32) -> bool {
+    return kind == mem_free || kind == mem_boot_code || kind == mem_boot_data
+}
+
+fn find_low_page() -> u64 {
+    let mut found: u64 = 0
+    for i in 0..memory_map_entries() {
+        let r = memory_region(i)
+        if !usable_low(r.kind) {
+            continue
+        }
+        let end = r.start + r.pages * size_4k
+        if r.start <= low_preferred && low_preferred + size_4k <= end {
+            return low_preferred
+        }
+        let mut p = r.start
+        if p < low_first {
+            p = low_first
+        }
+        if found == 0 && p + size_4k <= end && p + size_4k <= low_limit {
+            found = p
+        }
+    }
+    return found
+}
+
+fn wait_ms(ms: u64) {
+    if get_hpet_on() {
+        hpet_wait_ms(ms)
+        return
+    }
+    let target = get_ticks() + ms / 10 + 1
+    while get_ticks() < target {
+        pause()
+    }
+}
+
+#[interrupt]
+fn irq_ap_timer(frame: &Frame) {
+    kernel_lock()
+    lapic_eoi()
+    sched_tick()
+    kernel_unlock()
+}
+
+#[interrupt]
+fn irq_resched(frame: &Frame) {
+    kernel_lock()
+    lapic_eoi()
+    schedule()
+    kernel_unlock()
+}
+
+fn ap_main() {
+    let c = ap_booting
+    sse_init()
+    gdt_init_cpu(c, ap_ist[c])
+    idt_load()
+    lapic_enable()
+    syscall_cpu_init(get_syscall_lstar(), c)
+    lapic_timer_start(ap_timer_vector as u32, get_lapic_ticks_10ms() * 100 / timer_hz)
+    ap_ready[c] = true
+    kernel_lock()
+    idle_main()
+}
+
+fn write_slot(offset: usize, value: u64) {
+    (phys_to_virt(trampoline_phys + offset as u64) as *mut u64).write(value)
+}
+
+fn start_ap(c: usize, apic_id: u32) -> bool {
+    let stack = pmm_alloc_pages(ap_stack_pages)
+    let ist = pmm_alloc_pages(ap_stack_pages)
+    if stack == 0 || ist == 0 {
+        return false
+    }
+    let slot = sched_add_cpu(c)
+    if slot < 0 {
+        return false
+    }
+    cpu_register(c, apic_id)
+    ap_ist[c] = phys_to_virt(ist) + ap_stack_bytes
+    memcpy(phys_to_virt(trampoline_phys) as *mut u8, trampoline_code.as_ptr(), trampoline_code.len())
+    write_slot(trampoline_cr3, kernel_root())
+    write_slot(trampoline_stack, phys_to_virt(stack) + ap_stack_bytes)
+    write_slot(trampoline_entry, ap_main as u64)
+    ap_booting = c
+    ap_ready[c] = false
+    let vector = (trampoline_phys >> 12) as u32
+    lapic_send_ipi(apic_id, ipi_init)
+    wait_ms(10)
+    lapic_send_ipi(apic_id, ipi_startup | vector)
+    wait_ms(1)
+    if !ap_ready[c] {
+        lapic_send_ipi(apic_id, ipi_startup | vector)
+    }
+    let mut waited: u64 = 0
+    while !ap_ready[c] && waited < boot_timeout_ms {
+        wait_ms(10)
+        waited += 10
+    }
+    if !ap_ready[c] {
+        sched_drop_cpu(slot as usize)
+        ap_failures += 1
+        return false
+    }
+    cpu_came_online()
+    return true
+}
+
+fn smp_init() -> usize {
+    if !get_apic_on() || acpi::get_cpu_count() <= 1 || kernel_root() >= cr3_limit {
+        return get_cpus_online()
+    }
+    trampoline_phys = find_low_page()
+    if trampoline_phys == 0 {
+        return get_cpus_online()
+    }
+    let bsp = lapic_current_id()
+    cpu_register(0, bsp)
+    idt_set_gate(ap_timer_vector, irq_ap_timer as u64, 0)
+    idt_set_gate(resched_vector as usize, irq_resched as u64, 0)
+    smp_enable()
+    let mut next: usize = 1
+    for i in 0..acpi::get_cpu_count() {
+        let id = acpi::cpu_apic_id(i)
+        if id == bsp || next >= max_cpus {
+            continue
+        }
+        if start_ap(next, id) {
+            next += 1
+        }
+    }
+    return get_cpus_online()
+}

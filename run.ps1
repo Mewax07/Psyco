@@ -5,5 +5,6 @@ cd .\psycoc
   -drive format=raw,file=fat:rw:esp `
   -drive file=disk.img,if=virtio,format=raw `
   -device virtio-tablet-pci `
+  -audiodev dsound,id=snd0 -device intel-hda -device hda-output,audiodev=snd0 `
   -serial stdio -device isa-debug-exit,iobase=0xf4,iosize=0x04
 cd ..

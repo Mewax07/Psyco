@@ -15,6 +15,7 @@ const sys_write: u64 = 0x1006
 const sys_task_name: u64 = 0x1007
 const sys_task_alive: u64 = 0x1008
 const sys_time: u64 = 0x1009
+const sys_cpu: u64 = 0x100A
 
 const sys_map: u64 = 0x1010
 const sys_unmap: u64 = 0x1011

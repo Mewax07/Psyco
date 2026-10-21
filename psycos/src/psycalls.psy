@@ -54,6 +54,7 @@ fn psy_dispatch(n: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u64) ->
         abi::sys_input_release => return input_release(),
         abi::sys_task_alive => return task_alive(a1) as i64,
         abi::sys_time => return clock_now() as i64,
+        abi::sys_cpu => return this_cpu() as i64,
         abi::sys_port_recv_timeout => return port_recv_timeout(a1, a2, a3),
         abi::sys_display_claim => return display_claim(),
         abi::sys_display_info => return display_info(a1),

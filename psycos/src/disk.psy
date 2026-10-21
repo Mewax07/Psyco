@@ -1,0 +1,314 @@
+/// Wiki Doc sources:
+///   - https://wiki.osdev.org/GPT
+///   - https://wiki.osdev.org/Partition_Table
+///   - https://wiki.osdev.org/Advanced_Format
+
+import "virtio_blk.psy"
+import "ahci.psy" as ahci
+import "nvme.psy" as nvme
+import "ramdisk.psy"
+
+const kind_virtio: u64 = 1
+const kind_ahci: u64 = 2
+const kind_nvme: u64 = 3
+const kind_ram: u64 = 4
+
+const unit_bytes: u64 = 512
+const max_disks: usize = 8
+const max_partitions: usize = 16
+const big_sector: usize = 4096
+
+const scheme_whole: u64 = 0
+const scheme_mbr: u64 = 1
+const scheme_gpt: u64 = 2
+
+const mbr_table: usize = 446
+const mbr_protective: u8 = 0xEE
+const gpt_signature: u64 = 0x5452415020494645
+const gpt_entries_lba: usize = 72
+const gpt_entry_count: usize = 80
+const gpt_entry_size: usize = 84
+const gpt_max_entries: u64 = 128
+
+const esp_guid: [u8; 16] = [0x28, 0x73, 0x2A, 0xC1, 0x1F, 0xF8, 0xD2, 0x11, 0xBA, 0x4B, 0x00, 0xA0, 0xC9, 0x3E, 0xC9, 0x3B]
+
+struct Disk {
+    kind: u64,
+    index: usize,
+    sector_size: u64,
+    sectors: u64,
+}
+
+struct Partition {
+    disk: usize,
+    start: u64,
+    units: u64,
+    scheme: u64,
+    esp: bool,
+}
+
+static mut disks: [Disk; 8]
+#[getter]
+static mut device_count: usize = 0
+static mut partial: [u8; 4096]
+static mut table: [u8; 4096]
+static mut parts: [Partition; 16]
+#[getter]
+static mut part_count: usize = 0
+#[getter]
+static mut errors: u64 = 0
+
+fn add_disk(kind: u64, index: usize, sector_size: u64, sectors: u64) {
+    if device_count == max_disks || sectors == 0 {
+        return
+    }
+    disks[device_count] = Disk { kind: kind, index: index, sector_size: sector_size, sectors: sectors }
+    device_count += 1
+}
+
+fn init() -> usize {
+    if blk_init() {
+        add_disk(kind_virtio, 0, unit_bytes, get_blk_sectors())
+    }
+    let n = ahci::init()
+    for i in 0..n {
+        add_disk(kind_ahci, i, ahci::sector_size(i), ahci::sectors(i))
+    }
+    if nvme::init() {
+        add_disk(kind_nvme, 0, nvme::get_sector_size(), nvme::get_sectors())
+    }
+    if get_ram_bytes() > 0 {
+        add_disk(kind_ram, 0, unit_bytes, get_ram_bytes() / unit_bytes)
+    }
+    for d in 0..device_count {
+        scan_partitions(d)
+    }
+    return device_count
+}
+
+fn info(d: usize) -> Disk {
+    return disks[d]
+}
+
+fn kind_name(kind: u64) -> Str {
+    match kind {
+        kind_virtio => return "virtio",
+        kind_ahci => return "sata",
+        kind_nvme => return "nvme",
+        kind_ram => return "ram",
+        _ => return "?",
+    }
+}
+
+fn units(d: usize) -> u64 {
+    return disks[d].sectors * (disks[d].sector_size / unit_bytes)
+}
+
+fn dev_read(d: usize, lba: u64, count: u64, buf: &mut [u8]) -> bool {
+    let k = disks[d].kind
+    let i = disks[d].index
+    let mut ok = false
+    if k == kind_virtio {
+        ok = blk_read(lba, count, buf)
+    } else if k == kind_ahci {
+        ok = ahci::read(i, lba, count, buf)
+    } else if k == kind_nvme {
+        ok = nvme::read(lba, count, buf)
+    } else if k == kind_ram {
+        ok = ram_read(lba, count, buf)
+    }
+    if !ok {
+        errors += 1
+    }
+    return ok
+}
+
+fn dev_write(d: usize, lba: u64, count: u64, buf: &[u8]) -> bool {
+    let k = disks[d].kind
+    let i = disks[d].index
+    let mut ok = false
+    if k == kind_virtio {
+        ok = blk_write(lba, count, buf)
+    } else if k == kind_ahci {
+        ok = ahci::write(i, lba, count, buf)
+    } else if k == kind_nvme {
+        ok = nvme::write(lba, count, buf)
+    } else if k == kind_ram {
+        ok = ram_write(lba, count, buf)
+    }
+    if !ok {
+        errors += 1
+    }
+    return ok
+}
+
+fn read(d: usize, unit: u64, count: u64, buf: &mut [u8]) -> bool {
+    if d >= device_count || (buf.len() as u64) < count * unit_bytes {
+        return false
+    }
+    let per = disks[d].sector_size / unit_bytes
+    if per == 1 {
+        return dev_read(d, unit, count, buf)
+    }
+    let mut done: u64 = 0
+    while done < count {
+        let u = unit + done
+        let off = u % per
+        let left = count - done
+        let at = (done * unit_bytes) as usize
+        if off == 0 && left >= per {
+            let n = left / per
+            if !dev_read(d, u / per, n, &mut buf[at..at + (n * per * unit_bytes) as usize]) {
+                return false
+            }
+            done += n * per
+        } else {
+            if !dev_read(d, u / per, 1, &mut partial) {
+                return false
+            }
+            let mut take = per - off
+            if take > left {
+                take = left
+            }
+            let from = (off * unit_bytes) as usize
+            let len = (take * unit_bytes) as usize
+            for k in 0..len {
+                buf[at + k] = partial[from + k]
+            }
+            done += take
+        }
+    }
+    return true
+}
+
+fn write(d: usize, unit: u64, count: u64, buf: &[u8]) -> bool {
+    if d >= device_count || (buf.len() as u64) < count * unit_bytes {
+        return false
+    }
+    let per = disks[d].sector_size / unit_bytes
+    if per == 1 {
+        return dev_write(d, unit, count, buf)
+    }
+    let mut done: u64 = 0
+    while done < count {
+        let u = unit + done
+        let off = u % per
+        let left = count - done
+        let at = (done * unit_bytes) as usize
+        if off == 0 && left >= per {
+            let n = left / per
+            if !dev_write(d, u / per, n, &buf[at..at + (n * per * unit_bytes) as usize]) {
+                return false
+            }
+            done += n * per
+        } else {
+            if !dev_read(d, u / per, 1, &mut partial) {
+                return false
+            }
+            let mut take = per - off
+            if take > left {
+                take = left
+            }
+            let from = (off * unit_bytes) as usize
+            let len = (take * unit_bytes) as usize
+            for k in 0..len {
+                partial[from + k] = buf[at + k]
+            }
+            if !dev_write(d, u / per, 1, &partial) {
+                return false
+            }
+            done += take
+        }
+    }
+    return true
+}
+
+fn le32(b: &[u8], at: usize) -> u64 {
+    return b[at] as u64 | (b[at + 1] as u64) << 8 | (b[at + 2] as u64) << 16 | (b[at + 3] as u64) << 24
+}
+
+fn le64(b: &[u8], at: usize) -> u64 {
+    return le32(b, at) | le32(b, at + 4) << 32
+}
+
+fn add_partition(d: usize, start: u64, units: u64, scheme: u64, esp: bool) {
+    if part_count == max_partitions || units == 0 {
+        return
+    }
+    parts[part_count] = Partition { disk: d, start: start, units: units, scheme: scheme, esp: esp }
+    part_count += 1
+}
+
+fn partition(i: usize) -> Partition {
+    return parts[i]
+}
+
+fn is_esp(b: &[u8], at: usize) -> bool {
+    for k in 0..16usize {
+        if b[at + k] != esp_guid[k] {
+            return false
+        }
+    }
+    return true
+}
+
+fn scan_gpt(d: usize) -> bool {
+    let per = disks[d].sector_size / unit_bytes
+    if !read(d, per, 1, &mut table) || le64(&table, 0) != gpt_signature {
+        return false
+    }
+    let first = le64(&table, gpt_entries_lba) * per
+    let mut count = le32(&table, gpt_entry_count)
+    let size = le32(&table, gpt_entry_size)
+    if size < 128 || size > unit_bytes || unit_bytes % size != 0 {
+        return false
+    }
+    if count > gpt_max_entries {
+        count = gpt_max_entries
+    }
+    let per_unit = unit_bytes / size
+    for e in 0..count {
+        if e % per_unit == 0 && !read(d, first + e / per_unit, 1, &mut table) {
+            return true
+        }
+        let at = ((e % per_unit) * size) as usize
+        let lo = le64(&table, at)
+        let hi = le64(&table, at + 8)
+        if lo == 0 && hi == 0 {
+            continue
+        }
+        let start = le64(&table, at + 32)
+        let last = le64(&table, at + 40)
+        if last >= start {
+            add_partition(d, start * per, (last - start + 1) * per, scheme_gpt, is_esp(&table, at))
+        }
+    }
+    return true
+}
+
+fn scan_mbr(d: usize) -> bool {
+    if !read(d, 0, 1, &mut table) || table[510] != 0x55 || table[511] != 0xAA {
+        return false
+    }
+    let per = disks[d].sector_size / unit_bytes
+    let mut any = false
+    for p in 0..4usize {
+        let e = mbr_table + p * 16
+        let kind = table[e + 4]
+        let start = le32(&table, e + 8)
+        let count = le32(&table, e + 12)
+        if kind == 0 || kind == mbr_protective || start == 0 {
+            continue
+        }
+        add_partition(d, start * per, count * per, scheme_mbr, kind == 0xEF)
+        any = true
+    }
+    return any
+}
+
+fn scan_partitions(d: usize) {
+    add_partition(d, 0, units(d), scheme_whole, false)
+    if !scan_gpt(d) {
+        scan_mbr(d)
+    }
+}

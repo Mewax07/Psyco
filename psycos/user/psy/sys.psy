@@ -150,6 +150,10 @@ fn time() -> Clock {
     return Clock { year: d >> 16, month: (d >> 8) & 0xFF, day: d & 0xFF, hour: s / 3600, minute: s / 60 % 60, second: s % 60 }
 }
 
+fn cpu() -> u64 {
+    return call(abi::sys_cpu, 0, 0, 0, 0, 0, 0) as u64
+}
+
 fn recv_timeout(port: u64, m: &mut Message, ms: u64) -> i64 {
     return call(abi::sys_port_recv_timeout, port, m as *mut Message as u64, ms, 0, 0, 0)
 }

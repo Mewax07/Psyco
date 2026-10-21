@@ -26,6 +26,12 @@ import "clock.psy"
 import "term.psy"
 import "mouse.psy"
 import "input.psy"
+import "acpi.psy" as acpi
+import "smp.psy"
+import "disk.psy" as disk
+import "klog.psy"
+import "ramdisk.psy"
+import "hda.psy" as hda
 
 const line_max: usize = 76
 const bytes_per_kib: u64 = 1024
@@ -98,6 +104,14 @@ fn cmd_help() {
     puts("  progs      list the user programs\n")
     puts("  lspci      list PCI devices\n")
     puts("  mouse      pointer position, buttons and devices\n")
+    puts("  disks      disks, sector sizes and partitions\n")
+    puts("  usb        USB controller (xHCI) and devices\n")
+    puts("  log [save] boot log (save: write it to /psyos.log)\n")
+    puts("  audio      sound card (Intel HD Audio)\n")
+    puts("  beep [H M] play a tone of H Hz for M ms (default 480 Hz, 500 ms)\n")
+    puts("  acpi       ACPI tables and power management\n")
+    puts("  cpus       processors and interrupt controllers (ACPI MADT)\n")
+    puts("  irq        interrupt controller, timers, measured timer rate\n")
     puts("  ls [DIR]   list a directory of the disk (default /)\n")
     puts("  cat FILE   print a file\n")
     puts("  write F T  write the text T into file F (created or replaced)\n")
@@ -177,14 +191,21 @@ fn cmd_ver() {
     puts(" GiB, ")
     put_u64(get_table_pages())
     puts(" table pages\n")
-    puts("Disk: ")
-    if get_blk_ready() {
-        puts("virtio, ")
-        put_u64(get_blk_sectors() * 512 / bytes_per_mib)
-        puts(" MiB\n")
-    } else {
-        puts("none (QEMU: -drive file=disk.img,if=virtio,format=raw)\n")
+    puts("Disks: ")
+    if disk::get_device_count() == 0 {
+        puts("none (QEMU: -drive file=disk.img,if=virtio,format=raw)")
     }
+    for d in 0..disk::get_device_count() {
+        let k = disk::info(d)
+        if d > 0 {
+            puts(", ")
+        }
+        puts(disk::kind_name(k.kind))
+        putc(' ')
+        put_u64(disk::units(d) * 512 / bytes_per_mib)
+        puts(" MiB")
+    }
+    putc('\n')
     puts("File system: ")
     if get_fat_mounted() {
         puts("FAT32 '")
@@ -334,7 +355,7 @@ fn put_u64_padded(n: u64, width: usize) {
 
 fn cmd_ps() {
     set_color(yellow)
-    puts("SLOT  ID    RING  STATE     SWITCHES  TICKS     NAME\n")
+    puts("SLOT  ID    RING  CPU  STATE     SWITCHES  TICKS     NAME\n")
     set_color(gray)
     let mut name = [0u8; 16]
     for slot in 0..max_tasks {
@@ -349,6 +370,7 @@ fn cmd_ps() {
         } else {
             put_padded("0", 6)
         }
+        put_u64_padded(task_cpu(slot) as u64, 5)
         put_padded(state_name(state), 10)
         put_u64_padded(task_switches(slot), 10)
         put_u64_padded(task_run_ticks(slot), 10)
@@ -496,6 +518,233 @@ fn cmd_mouse() {
     putc('\n')
 }
 
+fn put_signature(sig: u32) {
+    for i in 0..4u32 {
+        putc((sig >> (i * 8)) as u8)
+    }
+}
+
+fn cmd_acpi() {
+    if !acpi::get_ready() {
+        puts("acpi: no tables\n")
+        return
+    }
+    puts("acpi: revision ")
+    put_u64(acpi::get_revision() as u64)
+    puts(", ")
+    put_u64(acpi::get_table_count() as u64)
+    puts(" tables\n")
+    for i in 0..acpi::get_table_count() {
+        let t = acpi::table_info(i)
+        puts("  ")
+        put_signature(t.signature)
+        puts("  rev ")
+        put_u64(t.revision as u64)
+        puts("  ")
+        put_u64(t.length as u64)
+        puts(" bytes at ")
+        put_hex(t.address)
+        putc('\n')
+    }
+    puts("power off: ")
+    if acpi::get_s5_found() {
+        puts("S5 type ")
+        put_u64(acpi::get_sleep_type_a() as u64)
+    } else {
+        puts("no _S5")
+    }
+    puts(", reset register ")
+    if acpi::get_reset_supported() {
+        puts("yes")
+    } else {
+        puts("no")
+    }
+    puts(", SCI irq ")
+    put_u64(acpi::get_sci_irq() as u64)
+    putc('\n')
+}
+
+fn cmd_cpus() {
+    puts("cpus: ")
+    put_u64(acpi::get_cpu_count() as u64)
+    puts(" (APIC ids")
+    for i in 0..acpi::get_cpu_count() {
+        putc(' ')
+        put_u64(acpi::cpu_apic_id(i) as u64)
+    }
+    puts(")\nonline: ")
+    put_u64(get_cpus_online() as u64)
+    puts(", user tasks in parallel (max): ")
+    put_u64(get_max_parallel_user())
+    puts(", kernel lock waits: ")
+    put_u64(get_lock_spins())
+    for c in 0..get_cpus_online() {
+        puts("\n  cpu ")
+        put_u64(c as u64)
+        puts(": APIC id ")
+        put_u64(cpu_apic(c) as u64)
+        puts(", busy ")
+        put_u64(cpu_busy_ticks(c))
+        puts(" ticks")
+    }
+    puts("\nlocal APIC at ")
+    put_hex(acpi::get_lapic_address())
+    if acpi::get_legacy_pics() {
+        puts(", 8259 PICs present")
+    }
+    putc('\n')
+    for i in 0..acpi::get_ioapic_count() {
+        let io = acpi::ioapic(i)
+        puts("IOAPIC ")
+        put_u64(io.id as u64)
+        puts(" at ")
+        put_hex(io.address)
+        puts(", GSI base ")
+        put_u64(io.gsi_base as u64)
+        putc('\n')
+    }
+    for i in 0..acpi::get_override_count() {
+        let o = acpi::irq_override(i)
+        puts("override: irq ")
+        put_u64(o.irq as u64)
+        puts(" -> GSI ")
+        put_u64(o.gsi as u64)
+        puts(" flags ")
+        put_u64(o.flags as u64)
+        putc('\n')
+    }
+}
+
+fn cmd_irq() {
+    puts("interrupts: ")
+    if get_apic_on() {
+        puts("APIC (local APIC timer, IOAPIC)\n")
+        puts("local APIC timer: ")
+        put_u64(get_lapic_ticks_10ms())
+        puts(" ticks per 10 ms (divide 16)\n")
+    } else {
+        puts("8259 PIC + PIT\n")
+    }
+    puts("HPET: ")
+    if !get_hpet_on() {
+        puts("off\n")
+        return
+    }
+    put_u64(1000000000 / get_hpet_period_fs())
+    puts(" MHz\n")
+    let start = get_ticks()
+    hpet_wait_ms(500)
+    let hz = (get_ticks() - start) * 2
+    puts("timer rate: ")
+    put_u64(hz)
+    puts(" Hz")
+    if hz >= 90 && hz <= 110 {
+        puts(" (ok)")
+    }
+    puts(", spurious ")
+    put_u64(get_spurious_count())
+    putc('\n')
+}
+
+fn cmd_disks() {
+    for d in 0..disk::get_device_count() {
+        let k = disk::info(d)
+        puts("disk ")
+        put_u64(d as u64)
+        puts(": ")
+        puts(disk::kind_name(k.kind))
+        puts(", ")
+        put_u64(k.sectors)
+        puts(" sectors of ")
+        put_u64(k.sector_size)
+        puts(" bytes (")
+        put_u64(disk::units(d) * 512 / bytes_per_mib)
+        puts(" MiB)\n")
+    }
+    for i in 0..disk::get_part_count() {
+        let p = disk::partition(i)
+        if p.scheme == disk::scheme_whole {
+            continue
+        }
+        puts("  partition: disk ")
+        put_u64(p.disk as u64)
+        if p.scheme == disk::scheme_gpt {
+            puts(" gpt")
+        } else {
+            puts(" mbr")
+        }
+        puts(" start ")
+        put_u64(p.start)
+        puts(" size ")
+        put_u64(p.units * 512 / bytes_per_mib)
+        puts(" MiB")
+        if p.esp {
+            puts(" (EFI system)")
+        }
+        putc('\n')
+    }
+    if get_fat_mounted() {
+        puts("mounted: disk ")
+        put_u64(get_fat_disk() as u64)
+        puts(", FAT32 with ")
+        put_u64(get_sector_bytes())
+        puts("-byte sectors\n")
+    } else {
+        puts("mounted: none\n")
+    }
+}
+
+fn cmd_usb() {
+    if !get_usb_ready() {
+        puts("usb: no xHCI controller\n")
+        return
+    }
+    puts("usb: xHCI, ")
+    put_u64(xhci::get_port_count())
+    puts(" ports, ")
+    put_u64(xhci::get_device_count() as u64)
+    puts(" devices\n")
+    for d in 0..xhci::get_device_count() {
+        let dev = xhci::device_info(d)
+        puts("  port ")
+        put_u64(dev.port)
+        puts(": ")
+        puts(usb_kind_name(dev.kind))
+        puts(" (")
+        put_hex_width(dev.vendor, 4)
+        putc(':')
+        put_hex_width(dev.product, 4)
+        puts("), slot ")
+        put_u64(dev.slot)
+        puts(", reports ")
+        if dev.reports > 0 {
+            puts("yes")
+        } else {
+            puts("no")
+        }
+        putc('\n')
+    }
+    puts("errors: ")
+    put_u64(xhci::get_errors())
+    putc('\n')
+}
+
+fn cmd_shutdown() {
+    if acpi::get_s5_found() {
+        print("[acpi] power off (S5)")
+        acpi::power_off()
+    }
+    shutdown()
+}
+
+fn cmd_reboot() {
+    if acpi::get_reset_supported() {
+        print("[acpi] reset")
+        acpi::reset()
+    }
+    reboot()
+}
+
 fn cmd_progs() {
     set_color(yellow)
     puts("User programs (ring 3, psycoc Linux executables):\n")
@@ -565,9 +814,11 @@ fn cmd_run(start: usize, wait: bool) {
     }
     let s = slot as usize
     if !wait {
+        let was_on = irq_save()
         puts("started in slot ")
         put_u64(s as u64)
         putc('\n')
+        irq_restore(was_on)
         return
     }
     let code = task_wait(s, task_id(s))
@@ -590,11 +841,13 @@ fn cmd_gui() {
         puts("gui: /bin/terminal not found\n")
         return
     }
+    let was_on = irq_save()
     puts("gui: window server in slot ")
     put_u64(server as u64)
     puts(", terminal in slot ")
     put_u64(term as u64)
     putc('\n')
+    irq_restore(was_on)
 }
 
 fn skip_spaces(start: usize) -> usize {
@@ -857,6 +1110,22 @@ fn run_command() {
         cmd_lspci()
     } else if line_is("mouse") {
         cmd_mouse()
+    } else if line_is("acpi") {
+        cmd_acpi()
+    } else if line_is("cpus") {
+        cmd_cpus()
+    } else if line_is("irq") {
+        cmd_irq()
+    } else if line_is("disks") {
+        cmd_disks()
+    } else if line_is("usb") {
+        cmd_usb()
+    } else if line_is("log") || line_is("log save") {
+        cmd_log()
+    } else if line_is("audio") {
+        cmd_audio()
+    } else if line_is("beep") || line_starts_with("beep ") {
+        cmd_beep()
     } else if line_is("ls") || line_starts_with("ls ") {
         cmd_ls(2)
     } else if line_starts_with("cat ") {
@@ -883,9 +1152,9 @@ fn run_command() {
     } else if line_starts_with("crash") {
         cmd_crash()
     } else if line_is("reboot") {
-        reboot()
+        cmd_reboot()
     } else if line_is("shutdown") {
-        shutdown()
+        cmd_shutdown()
     } else {
         set_color(red)
         puts("unknown command: ")
@@ -928,12 +1197,211 @@ fn cpu_init() {
     exceptions_init()
 }
 
+fn log_firmware() {
+    let mut vendor = [0u8; 40]
+    let n = firmware_vendor(&mut vendor)
+    log_begin("uefi")
+    log_bytes(&vendor[..n])
+    log_str(", revision ")
+    log_u64((uefi_revision() >> 16) as u64)
+    log_put('.')
+    log_u64((uefi_revision() & 0xFFFF) as u64 / 10)
+    log_end()
+    log_begin("video")
+    if has_fb {
+        log_u64(get_fb_width() as u64)
+        log_put('x')
+        log_u64(get_fb_height() as u64)
+        log_str(" (GOP)")
+    } else {
+        log_str("no framebuffer")
+    }
+    log_end()
+}
+
+fn log_hardware() {
+    log_begin("memory")
+    log_u64(get_pmm_free_pages() * page_bytes / bytes_per_mib)
+    log_str(" MiB free")
+    log_end()
+    log_begin("acpi")
+    if acpi::get_ready() {
+        log_u64(acpi::get_table_count() as u64)
+        log_str(" tables, ")
+        log_u64(acpi::get_cpu_count() as u64)
+        log_str(" cpus")
+    } else {
+        log_str("not found")
+    }
+    log_end()
+    log_begin("irq")
+    if get_apic_on() {
+        log_str("local APIC + IOAPIC")
+    } else {
+        log_str("8259 PIC + PIT")
+    }
+    if get_hpet_on() {
+        log_str(", HPET")
+    }
+    log_end()
+}
+
+fn log_devices() {
+    log_begin("disks")
+    log_u64(disk::get_device_count() as u64)
+    for d in 0..disk::get_device_count() {
+        let k = disk::info(d)
+        log_put(' ')
+        log_str(disk::kind_name(k.kind))
+        log_put('/')
+        log_u64(k.sector_size)
+    }
+    log_end()
+    log_begin("fs")
+    if get_fat_mounted() {
+        log_str("FAT32 on disk ")
+        log_u64(get_fat_disk() as u64)
+        log_str(" (")
+        log_str(disk::kind_name(disk::info(get_fat_disk()).kind))
+        log_put(')')
+    } else {
+        log_str("no volume")
+    }
+    log_end()
+    log_begin("input")
+    if get_kbd_ps2() {
+        log_str("ps2 keyboard")
+    } else {
+        log_str("no ps2 keyboard")
+    }
+    if mouse_present() {
+        log_str(", ps2 mouse")
+    }
+    if tablet::get_ready() {
+        log_str(", virtio tablet")
+    }
+    if get_usb_ready() {
+        log_str(", usb devices ")
+        log_u64(xhci::get_device_count() as u64)
+    }
+    log_end()
+    if hda::get_ready() {
+        log_begin("audio")
+        log_str("HD Audio codec ")
+        log_hex(hda::get_vendor() as u64)
+        log_end()
+    }
+}
+
+fn cmd_audio() {
+    if !hda::get_ready() {
+        puts("audio: no HD Audio controller with an output\n")
+        return
+    }
+    puts("audio: HD Audio, codec ")
+    put_u64(hda::get_codec() as u64)
+    puts(" vendor ")
+    put_hex_width((hda::get_vendor() >> 16) as u64, 4)
+    putc(':')
+    put_hex_width((hda::get_vendor() & 0xFFFF) as u64, 4)
+    puts(", function group ")
+    put_u64(hda::get_afg() as u64)
+    puts(", DAC ")
+    put_u64(hda::get_dac() as u64)
+    puts(" -> pin ")
+    put_u64(hda::get_pin() as u64)
+    puts(", errors ")
+    put_u64(hda::get_errors())
+    putc('\n')
+}
+
+fn word_number(at: &mut usize) -> Option<u64> {
+    while *at < line_len && line[*at] == ' ' {
+        *at += 1
+    }
+    let mut n: u64 = 0
+    let mut digits: usize = 0
+    while *at < line_len && line[*at] >= '0' && line[*at] <= '9' && digits < 9 {
+        n = n * 10 + (line[*at] - '0') as u64
+        digits += 1
+        *at += 1
+    }
+    if digits == 0 {
+        return None
+    }
+    return Some(n)
+}
+
+fn cmd_beep() {
+    let mut hz: u64 = 480
+    let mut ms: u64 = 500
+    let mut at: usize = 5
+    if let Some(v) = word_number(&mut at) {
+        hz = v
+    }
+    if let Some(v) = word_number(&mut at) {
+        ms = v
+    }
+    if !hda::play_tone(hz) {
+        puts("beep: no sound output\n")
+        return
+    }
+    let start = hda::position()
+    task_sleep(ms)
+    let moved = hda::position() != start
+    hda::stop()
+    puts("beep: ")
+    put_u64(hz)
+    puts(" Hz, ")
+    put_u64(ms)
+    puts(" ms, stream moved: ")
+    if moved {
+        puts("true\n")
+    } else {
+        puts("false\n")
+    }
+}
+
+fn cmd_log() {
+    if line_is("log save") {
+        if !get_fat_mounted() {
+            puts("log: no volume mounted\n")
+            return
+        }
+        if fat_write_file("/psyos.log".as_bytes(), log_contents()) {
+            puts("log saved to /psyos.log\n")
+        } else {
+            puts("log: write failed\n")
+        }
+        return
+    }
+    log_dump()
+    if get_log_lost() > 0 {
+        puts("(")
+        put_u64(get_log_lost())
+        puts(" bytes lost)\n")
+    }
+}
+
 fn main() {
     efi_init()
     config_load()
     let video = config_video()
     has_fb = fb_init_mode(video.width, video.height)
     con_init(has_fb)
+    set_log_echo(config_is("log", "on"))
+    log_line("boot", "PsycOS v0.1")
+    log_firmware()
+    let ram = !config_is("ramdisk", "off") && ramdisk_load()
+    log_begin("ramdisk")
+    if ram {
+        log_str("\\PSYOS.IMG, ")
+        log_u64(get_ram_bytes() / bytes_per_mib)
+        log_str(" MiB")
+    } else {
+        log_str("none")
+    }
+    log_end()
 
     if !exit_boot_services() {
         panic("ExitBootServices failed")
@@ -951,21 +1419,47 @@ fn kmain() {
         panic("statics still point to the low half")
     }
     cpu_init()
+    log_line("boot", "boot services left, higher half")
+    acpi::init()
     reclaimed_pages = pmm_reclaim_boot_services()
     heap_init()
     irq_init()
+    if !config_is("apic", "off") {
+        irq_use_apic()
+    }
+    log_hardware()
     sched_init()
     process_init()
-    if blk_init() {
-        fat_mount()
-    }
+    disk::init()
+    fat_mount()
     kbd_init()
     mouse_init()
     tablet_init()
+    if !config_is("usb", "off") {
+        usb_init()
+    }
     input_init()
     term_init()
+    if !config_is("audio", "off") {
+        hda::init()
+    }
+    log_devices()
     sti()
+    let mut cores: usize = 1
+    if !config_is("smp", "off") {
+        cores = smp_init()
+    }
+    if cores > 1 {
+        puts("[smp] ")
+        put_u64(cores as u64)
+        puts(" processors online\n")
+    }
+    log_begin("smp")
+    log_u64(cores as u64)
+    log_str(" cpus online")
+    log_end()
     clock_init()
+    log_line("boot", "ready")
     print("PsycOS: boot ok")
     banner()
     if config_is("gui", "on") {

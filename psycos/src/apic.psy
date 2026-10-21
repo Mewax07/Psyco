@@ -1,0 +1,298 @@
+/// Wiki Doc sources:
+///   - https://wiki.osdev.org/APIC
+///   - https://wiki.osdev.org/APIC_Timer
+///   - https://wiki.osdev.org/IOAPIC
+///   - https://wiki.osdev.org/HPET
+///   - https://wiki.osdev.org/Programmable_Interval_Timer#Reading_The_Current_Count
+
+#![trusted]
+
+import "acpi.psy" as acpi
+import "paging.psy"
+import "idt.psy"
+
+const apic_base_msr: u32 = 0x1B
+const apic_base_enable: u64 = 0x800
+const apic_base_mask: u64 = 0x000FFFFFFFFFF000
+
+const lapic_id: u64 = 0x20
+const lapic_version: u64 = 0x30
+const lapic_tpr: u64 = 0x80
+const lapic_eoi_reg: u64 = 0xB0
+const lapic_svr: u64 = 0xF0
+const lapic_icr_low: u64 = 0x300
+const lapic_icr_high: u64 = 0x310
+const lapic_lvt_timer: u64 = 0x320
+const lapic_lvt_lint0: u64 = 0x350
+const lapic_lvt_lint1: u64 = 0x360
+const lapic_lvt_error: u64 = 0x370
+const lapic_timer_initial: u64 = 0x380
+const lapic_timer_current: u64 = 0x390
+const lapic_timer_divide: u64 = 0x3E0
+
+const svr_enable: u32 = 0x100
+const spurious_vector: u32 = 0xFF
+const lvt_masked: u32 = 0x10000
+const lvt_periodic: u32 = 0x20000
+const divide_by_16: u32 = 0x3
+const icr_pending: u32 = 0x1000
+
+const ioapic_regsel: u64 = 0x00
+const ioapic_window: u64 = 0x10
+const ioapic_version_reg: u32 = 0x01
+const ioapic_redirect: u32 = 0x10
+const redirect_masked: u32 = 0x10000
+const redirect_level: u32 = 0x8000
+const redirect_low: u32 = 0x2000
+
+const flag_polarity_mask: u32 = 0x3
+const flag_polarity_low: u32 = 0x3
+const flag_trigger_mask: u32 = 0xC
+const flag_trigger_level: u32 = 0xC
+
+const hpet_address_offset: u64 = 44
+const hpet_capabilities: u64 = 0x00
+const hpet_config: u64 = 0x10
+const hpet_counter: u64 = 0xF0
+const hpet_enable: u64 = 1
+const hpet_wide: u64 = 0x2000
+const femto_per_ms: u64 = 1000000000000
+
+const pit_latch0: u8 = 0x00
+const pit_oneshot: u8 = 0x30
+
+const apic_irq_vector: u32 = 32
+const calibrate_ms: u64 = 10
+const wait_tries: u64 = 100000000
+
+static mut lapic: u64 = 0
+static mut ioapic_virt: [u64; 8]
+static mut ioapic_entries: [u32; 8]
+#[getter]
+static mut apic_on: bool = false
+#[getter]
+static mut lapic_ticks_10ms: u64 = 0
+#[getter]
+static mut hpet_on: bool = false
+static mut hpet_base: u64 = 0
+#[getter]
+static mut hpet_period_fs: u64 = 0
+static mut hpet_mask: u64 = 0xFFFFFFFFFFFFFFFF
+#[getter]
+static mut spurious_count: u64 = 0
+
+fn lapic_read(reg: u64) -> u32 {
+    return ((lapic + reg) as *mut u32).read()
+}
+
+fn lapic_write(reg: u64, value: u32) {
+    ((lapic + reg) as *mut u32).write(value)
+}
+
+fn lapic_eoi() {
+    lapic_write(lapic_eoi_reg, 0)
+}
+
+fn lapic_current_id() -> u32 {
+    return lapic_read(lapic_id) >> 24
+}
+
+fn ioapic_read(i: usize, reg: u32) -> u32 {
+    ((ioapic_virt[i] + ioapic_regsel) as *mut u32).write(reg)
+    return ((ioapic_virt[i] + ioapic_window) as *mut u32).read()
+}
+
+fn ioapic_write(i: usize, reg: u32, value: u32) {
+    ((ioapic_virt[i] + ioapic_regsel) as *mut u32).write(reg)
+    ((ioapic_virt[i] + ioapic_window) as *mut u32).write(value)
+}
+
+fn hpet_read(reg: u64) -> u64 {
+    return ((hpet_base + reg) as *mut u64).read()
+}
+
+fn hpet_write(reg: u64, value: u64) {
+    ((hpet_base + reg) as *mut u64).write(value)
+}
+
+fn hpet_now() -> u64 {
+    return hpet_read(hpet_counter) & hpet_mask
+}
+
+fn hpet_elapsed_fs(start: u64) -> u64 {
+    return ((hpet_now() -% start) & hpet_mask) * hpet_period_fs
+}
+
+fn hpet_init() -> bool {
+    let Some(t) = acpi::find("HPET") else {
+        return false
+    }
+    let phys = acpi::rd64(t + hpet_address_offset)
+    let Some(base) = map_mmio(phys, 1024) else {
+        return false
+    }
+    hpet_base = base
+    let caps = hpet_read(hpet_capabilities)
+    hpet_period_fs = caps >> 32
+    if hpet_period_fs == 0 || hpet_period_fs > 100000000 {
+        return false
+    }
+    if caps & hpet_wide == 0 {
+        hpet_mask = 0xFFFFFFFF
+    }
+    hpet_write(hpet_config, (hpet_read(hpet_config) | hpet_enable) & ~2u64)
+    hpet_on = true
+    return true
+}
+
+fn hpet_wait_ms(ms: u64) {
+    let start = hpet_now()
+    while hpet_elapsed_fs(start) < ms * femto_per_ms {
+        pause()
+    }
+}
+
+fn hpet_ms() -> u64 {
+    return hpet_now() / (femto_per_ms / hpet_period_fs)
+}
+
+fn pit_count() -> u16 {
+    outb(pit_command, pit_latch0)
+    let lo = inb(pit_channel0) as u16
+    let hi = inb(pit_channel0) as u16
+    return lo | hi << 8
+}
+
+fn pit_wait_period() {
+    let mut last = pit_count()
+    for i in 0..wait_tries {
+        let now = pit_count()
+        if now > last {
+            return
+        }
+        last = now
+    }
+}
+
+fn pit_stop() {
+    outb(pit_command, pit_oneshot)
+    outb(pit_channel0, 1)
+    outb(pit_channel0, 0)
+}
+
+#[interrupt]
+fn irq_apic_spurious(frame: &Frame) {
+    spurious_count += 1
+}
+
+fn lapic_enable() {
+    wrmsr(apic_base_msr, rdmsr(apic_base_msr) | apic_base_enable)
+    lapic_write(lapic_tpr, 0)
+    lapic_write(lapic_lvt_lint0, lvt_masked)
+    lapic_write(lapic_lvt_lint1, lvt_masked)
+    lapic_write(lapic_lvt_error, lvt_masked)
+    lapic_write(lapic_svr, svr_enable | spurious_vector)
+}
+
+fn lapic_calibrate() -> u64 {
+    lapic_write(lapic_timer_divide, divide_by_16)
+    lapic_write(lapic_lvt_timer, lvt_masked)
+    if hpet_on {
+        lapic_write(lapic_timer_initial, 0xFFFFFFFF)
+        hpet_wait_ms(calibrate_ms)
+    } else {
+        pit_wait_period()
+        lapic_write(lapic_timer_initial, 0xFFFFFFFF)
+        pit_wait_period()
+    }
+    let used = 0xFFFFFFFF - lapic_read(lapic_timer_current)
+    lapic_write(lapic_timer_initial, 0)
+    return used as u64
+}
+
+fn lapic_timer_start(vector: u32, count: u64) {
+    lapic_write(lapic_timer_divide, divide_by_16)
+    lapic_write(lapic_lvt_timer, lvt_periodic | vector)
+    lapic_write(lapic_timer_initial, count as u32)
+}
+
+fn ioapic_for(gsi: u32) -> Option<usize> {
+    for i in 0..acpi::get_ioapic_count() {
+        let io = acpi::ioapic(i)
+        if gsi >= io.gsi_base && gsi < io.gsi_base + ioapic_entries[i] {
+            return Some(i)
+        }
+    }
+    return None
+}
+
+fn ioapic_set(gsi: u32, low: u32, dest: u32) -> bool {
+    let Some(i) = ioapic_for(gsi) else {
+        return false
+    }
+    let n = gsi - acpi::ioapic(i).gsi_base
+    ioapic_write(i, ioapic_redirect + 2 * n, redirect_masked)
+    ioapic_write(i, ioapic_redirect + 2 * n + 1, dest << 24)
+    ioapic_write(i, ioapic_redirect + 2 * n, low)
+    return true
+}
+
+fn isa_route(irq: u8, enabled: bool) -> bool {
+    let o = acpi::irq_to_gsi(irq as u32)
+    let mut low = apic_irq_vector + irq as u32
+    if o.flags & flag_polarity_mask == flag_polarity_low {
+        low |= redirect_low
+    }
+    if o.flags & flag_trigger_mask == flag_trigger_level {
+        low |= redirect_level
+    }
+    if !enabled {
+        low |= redirect_masked
+    }
+    return ioapic_set(o.gsi, low, lapic_current_id())
+}
+
+fn apic_init(spurious: usize) -> bool {
+    if !acpi::get_ready() || acpi::get_lapic_address() == 0 || acpi::get_ioapic_count() == 0 {
+        return false
+    }
+    let base = rdmsr(apic_base_msr) & apic_base_mask
+    let mut phys = acpi::get_lapic_address()
+    if base != 0 {
+        phys = base
+    }
+    let Some(l) = map_mmio(phys, 4096) else {
+        return false
+    }
+    lapic = l
+    for i in 0..acpi::get_ioapic_count() {
+        let Some(v) = map_mmio(acpi::ioapic(i).address, 4096) else {
+            return false
+        }
+        ioapic_virt[i] = v
+        ioapic_entries[i] = ((ioapic_read(i, ioapic_version_reg) >> 16) & 0xFF) + 1
+        for n in 0..ioapic_entries[i] {
+            ioapic_write(i, ioapic_redirect + 2 * n, redirect_masked)
+        }
+    }
+    idt_set_gate(spurious, irq_apic_spurious as u64, 0)
+    hpet_init()
+    lapic_enable()
+    lapic_ticks_10ms = lapic_calibrate()
+    if lapic_ticks_10ms == 0 {
+        return false
+    }
+    apic_on = true
+    return true
+}
+
+fn lapic_send_ipi(apic_id: u32, value: u32) {
+    lapic_write(lapic_icr_high, apic_id << 24)
+    lapic_write(lapic_icr_low, value)
+    for i in 0..wait_tries {
+        if lapic_read(lapic_icr_low) & icr_pending == 0 {
+            return
+        }
+        pause()
+    }
+}

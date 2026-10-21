@@ -6,6 +6,7 @@ import "ps2.psy"
 import "serial.psy"
 import "idt.psy"
 import "pic.psy"
+import "cpu.psy"
 
 const key_enter: u8 = 13
 const key_backspace: u8 = 8
@@ -89,12 +90,18 @@ fn kbd_init() {
 
 #[interrupt]
 fn irq_keyboard(frame: &Frame) {
+    kernel_lock()
     kbd_irqs += 1
-    let c = kbd_translate(ps2_read_data())
+    kbd_feed(ps2_read_data())
+    pic_eoi(keyboard_irq)
+    kernel_unlock()
+}
+
+fn kbd_feed(sc: u8) {
+    let c = kbd_translate(sc)
     if c != 0 && !route(c) {
         kbd_push(c)
     }
-    pic_eoi(keyboard_irq)
 }
 
 fn set_key_routing(router: fn(u8) -> bool, active: fn() -> bool) {

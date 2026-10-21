@@ -103,6 +103,27 @@ fn pci_find_nth(vendor: u32, device_a: u32, device_b: u32, n: u32) -> Option<Pci
     return None
 }
 
+fn pci_find_class(class: u32, n: u32) -> Option<PciAddr> {
+    let mut seen: u32 = 0
+    for bus in 0..pci_max_bus {
+        for device in 0..pci_max_device {
+            if pci_vendor(bus, device, 0) == pci_no_vendor {
+                continue
+            }
+            for function in 0..pci_function_count(bus, device) {
+                if pci_vendor(bus, device, function) == pci_no_vendor || pci_class(bus, device, function) != class {
+                    continue
+                }
+                if seen == n {
+                    return Some(PciAddr { bus: bus, device: device, function: function })
+                }
+                seen += 1
+            }
+        }
+    }
+    return None
+}
+
 fn pci_bar(a: &PciAddr, index: u32) -> u32 {
     return pci_read32(a.bus, a.device, a.function, pci_bar0_offset + index * 4)
 }

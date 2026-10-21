@@ -9,12 +9,14 @@
 import "paging.psy"
 import "gdt.psy"
 
-// Constants
-
 const msr_efer: u32 = 0xC0000080
 const msr_star: u32 = 0xC0000081
 const msr_lstar: u32 = 0xC0000082
 const msr_sfmask: u32 = 0xC0000084
+const msr_gs_base: u32 = 0xC0000101
+const msr_kernel_gs_base: u32 = 0xC0000102
+const percpu_words: usize = 2
+const percpu_max: usize = 64
 const efer_sce: u64 = 0x1
 
 const syscall_rflags_mask: u64 = 0x700
@@ -37,8 +39,6 @@ mod elf {
     const pt_load: u32 = 1
     const pf_write: u32 = 2
 }
-
-// Structures
 
 struct SyscallRegs {
     r15: u64,
@@ -70,15 +70,30 @@ struct LoadedProgram {
     image_end: u64,
 }
 
+#[align(64)]
+static mut percpu_syscall: [u64; 128]
+#[getter]
+static mut syscall_lstar: u64 = 0
+
 fn syscall_init(entry: u64) {
+    syscall_cpu_init(entry, 0)
+}
+
+fn syscall_cpu_init(entry: u64, cpu: usize) {
+    if cpu >= percpu_max {
+        panic("syscall_cpu_init: too many processors")
+    }
+    wrmsr(msr_gs_base, 0)
+    wrmsr(msr_kernel_gs_base, &percpu_syscall[cpu * percpu_words] as *const u64 as u64)
     wrmsr(msr_efer, rdmsr(msr_efer) | efer_sce)
     wrmsr(msr_star, (user_base_selector << 48) | ((kernel_cs as u64) << 32))
     wrmsr(msr_lstar, entry)
+    syscall_lstar = entry
     wrmsr(msr_sfmask, syscall_rflags_mask)
 }
 
-fn set_kernel_entry_stack(top: u64) {
-    tss_set_rsp0(top)
+fn set_kernel_entry_stack(cpu: usize, top: u64) {
+    tss_set_rsp0(cpu, top)
     set_syscall_stack(top)
 }
 

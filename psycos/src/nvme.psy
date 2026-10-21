@@ -1,0 +1,259 @@
+/// Wiki Doc sources:
+///   - https://wiki.osdev.org/NVMe
+///   - https://nvmexpress.org/specifications/
+
+#![trusted]
+
+import "pci.psy"
+import "paging.psy"
+import "pmm.psy"
+
+const class_nvme: u32 = 0x010802
+const regs_size: u64 = 0x2000
+
+const reg_cap: u64 = 0x00
+const reg_cc: u64 = 0x14
+const reg_csts: u64 = 0x1C
+const reg_aqa: u64 = 0x24
+const reg_asq: u64 = 0x28
+const reg_acq: u64 = 0x30
+const doorbell_base: u64 = 0x1000
+
+const cc_enable: u32 = 1
+const cc_queue_sizes: u32 = 0x00460000
+const csts_ready: u32 = 1
+const csts_fatal: u32 = 2
+
+const queue_entries: u64 = 16
+const sq_entry: u64 = 64
+const cq_entry: u64 = 16
+
+const admin_create_sq: u8 = 0x01
+const admin_create_cq: u8 = 0x05
+const admin_identify: u8 = 0x06
+const io_write: u8 = 0x01
+const io_read: u8 = 0x02
+const identify_namespace: u32 = 0
+const identify_controller: u32 = 1
+const queue_contiguous: u32 = 1
+
+const bounce_pages: u64 = 2
+const bounce_bytes: u64 = 8192
+const spin_limit: u64 = 50000000
+
+struct Queue {
+    sq: u64,
+    cq: u64,
+    tail: u64,
+    head: u64,
+    phase: u32,
+    id: u64,
+}
+
+static mut regs: u64 = 0
+static mut stride: u64 = 4
+static mut admin: Queue
+static mut io: Queue
+static mut bounce_phys: u64 = 0
+static mut next_cid: u16 = 0
+#[getter]
+static mut ready: bool = false
+#[getter]
+static mut sectors: u64 = 0
+#[getter]
+static mut sector_size: u64 = 512
+#[getter]
+static mut errors: u64 = 0
+#[getter]
+static mut model: [u8; 40]
+
+fn rd32(off: u64) -> u32 {
+    return ((regs + off) as *mut u32).read()
+}
+
+fn wr32(off: u64, v: u32) {
+    ((regs + off) as *mut u32).write(v)
+}
+
+fn wr64(off: u64, v: u64) {
+    wr32(off, v as u32)
+    wr32(off + 4, (v >> 32) as u32)
+}
+
+fn mem(phys: u64) -> *mut u8 {
+    return phys_to_virt(phys) as *mut u8
+}
+
+fn wait_ready(want: bool) -> bool {
+    for i in 0..spin_limit {
+        let s = rd32(reg_csts)
+        if s & csts_fatal != 0 {
+            return false
+        }
+        if (s & csts_ready != 0) == want {
+            return true
+        }
+        pause()
+    }
+    return false
+}
+
+fn new_queue(id: u64) -> Option<Queue> {
+    let sq = pmm_alloc_page()
+    let cq = pmm_alloc_page()
+    if sq == 0 || cq == 0 {
+        return None
+    }
+    zero_phys(sq, size_4k)
+    zero_phys(cq, size_4k)
+    return Some(Queue { sq: sq, cq: cq, tail: 0, head: 0, phase: 1, id: id })
+}
+
+fn submit(q: &mut Queue, opcode: u8, nsid: u32, prp1: u64, prp2: u64, cdw: [u32; 6]) -> bool {
+    let e = mem(q.sq + q.tail * sq_entry)
+    memset(e, 0, sq_entry as usize)
+    next_cid = next_cid +% 1
+    (e as *mut u32).write(opcode as u32 | (next_cid as u32) << 16)
+    (e.add(4) as *mut u32).write(nsid)
+    (e.add(24) as *mut u64).write(prp1)
+    (e.add(32) as *mut u64).write(prp2)
+    for k in 0..6usize {
+        (e.add(40 + 4 * k) as *mut u32).write(cdw[k])
+    }
+    q.tail = (q.tail + 1) % queue_entries
+    wr32(doorbell_base + 2 * q.id * stride, q.tail as u32)
+    let c = mem(q.cq + q.head * cq_entry)
+    for i in 0..spin_limit {
+        let dw3 = (c.add(12) as *mut u32).read()
+        if (dw3 >> 16) & 1 == q.phase {
+            q.head = (q.head + 1) % queue_entries
+            if q.head == 0 {
+                q.phase ^= 1
+            }
+            wr32(doorbell_base + (2 * q.id + 1) * stride, q.head as u32)
+            if (dw3 >> 17) & 0x7FFF != 0 {
+                errors += 1
+                return false
+            }
+            return true
+        }
+        pause()
+    }
+    errors += 1
+    return false
+}
+
+fn init() -> bool {
+    let Some(a) = pci_find_class(class_nvme, 0) else {
+        return false
+    }
+    let Some(bar) = pci_memory_bar(&a, 0) else {
+        return false
+    }
+    pci_enable(&a)
+    let Some(base) = map_mmio(bar, regs_size) else {
+        return false
+    }
+    regs = base
+    let cap = rd32(reg_cap) as u64 | (rd32(reg_cap + 4) as u64) << 32
+    stride = 4u64 << ((cap >> 32) & 0xF)
+    wr32(reg_cc, 0)
+    if !wait_ready(false) {
+        return false
+    }
+    let Some(aq) = new_queue(0) else {
+        return false
+    }
+    admin = aq
+    let n = (queue_entries - 1) as u32
+    wr32(reg_aqa, n << 16 | n)
+    wr64(reg_asq, admin.sq)
+    wr64(reg_acq, admin.cq)
+    wr32(reg_cc, cc_enable | cc_queue_sizes)
+    if !wait_ready(true) {
+        return false
+    }
+    bounce_phys = pmm_alloc_pages(bounce_pages)
+    if bounce_phys == 0 {
+        return false
+    }
+    if !submit(&mut admin, admin_identify, 0, bounce_phys, 0, [identify_controller, 0, 0, 0, 0, 0]) {
+        return false
+    }
+    for k in 0..40usize {
+        model[k] = mem(bounce_phys + 24 + k as u64).read()
+    }
+    if !submit(&mut admin, admin_identify, 1, bounce_phys, 0, [identify_namespace, 0, 0, 0, 0, 0]) {
+        return false
+    }
+    let ns = mem(bounce_phys)
+    sectors = (ns as *mut u64).read()
+    let format = (ns.add(26).read() & 0xF) as usize
+    let lbads = ns.add(128 + 4 * format + 2).read() as u64
+    sector_size = 1u64 << lbads
+    if sectors == 0 || (sector_size != 512 && sector_size != 4096) {
+        return false
+    }
+    let Some(q) = new_queue(1) else {
+        return false
+    }
+    io = q
+    let size = (queue_entries - 1) as u32 << 16 | 1
+    if !submit(&mut admin, admin_create_cq, 0, io.cq, 0, [size, queue_contiguous, 0, 0, 0, 0]) {
+        return false
+    }
+    if !submit(&mut admin, admin_create_sq, 0, io.sq, 0, [size, 1u32 << 16 | queue_contiguous, 0, 0, 0, 0]) {
+        return false
+    }
+    ready = true
+    return true
+}
+
+fn transfer(lba: u64, count: u64, buf: u64, write: bool) -> bool {
+    if !ready || count == 0 || lba + count > sectors {
+        return false
+    }
+    let per = bounce_bytes / sector_size
+    let mut done: u64 = 0
+    while done < count {
+        let mut n = count - done
+        if n > per {
+            n = per
+        }
+        let bytes = n * sector_size
+        let at = (buf + done * sector_size) as *mut u8
+        let mut prp2: u64 = 0
+        if bytes > size_4k {
+            prp2 = bounce_phys + size_4k
+        }
+        let slba = lba + done
+        let cdw = [slba as u32, (slba >> 32) as u32, (n - 1) as u32, 0, 0, 0]
+        if write {
+            memcpy(mem(bounce_phys), at, bytes as usize)
+            if !submit(&mut io, io_write, 1, bounce_phys, prp2, cdw) {
+                return false
+            }
+        } else {
+            if !submit(&mut io, io_read, 1, bounce_phys, prp2, cdw) {
+                return false
+            }
+            memcpy(at, mem(bounce_phys), bytes as usize)
+        }
+        done += n
+    }
+    return true
+}
+
+fn read(lba: u64, count: u64, buf: &mut [u8]) -> bool {
+    if (buf.len() as u64) < count * sector_size {
+        return false
+    }
+    return transfer(lba, count, buf.as_mut_ptr() as u64, false)
+}
+
+fn write(lba: u64, count: u64, buf: &[u8]) -> bool {
+    if (buf.len() as u64) < count * sector_size {
+        return false
+    }
+    return transfer(lba, count, buf.as_ptr() as u64, true)
+}

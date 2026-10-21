@@ -1,0 +1,296 @@
+/// Wiki Doc sources:
+///   - https://wiki.osdev.org/AHCI
+///   - https://wiki.osdev.org/ATA_Command_Matrix
+///   - https://www.intel.com/content/www/us/en/io/serial-ata/serial-ata-ahci-spec-rev1-3-1.html
+
+#![trusted]
+
+import "pci.psy"
+import "paging.psy"
+import "pmm.psy"
+
+const class_ahci: u32 = 0x010601
+const abar_index: u32 = 5
+const abar_size: u64 = 0x1100
+
+const reg_ghc: u64 = 0x04
+const reg_pi: u64 = 0x0C
+const ghc_enable: u32 = 0x80000000
+
+const port_base: u64 = 0x100
+const port_stride: u64 = 0x80
+const px_clb: u64 = 0x00
+const px_clbu: u64 = 0x04
+const px_fb: u64 = 0x08
+const px_fbu: u64 = 0x0C
+const px_is: u64 = 0x10
+const px_ie: u64 = 0x14
+const px_cmd: u64 = 0x18
+const px_tfd: u64 = 0x20
+const px_sig: u64 = 0x24
+const px_ssts: u64 = 0x28
+const px_serr: u64 = 0x30
+const px_ci: u64 = 0x38
+
+const cmd_start: u32 = 0x1
+const cmd_fis_receive: u32 = 0x10
+const cmd_fis_running: u32 = 0x4000
+const cmd_list_running: u32 = 0x8000
+const ssts_present: u32 = 0x3
+const sig_disk: u32 = 0x00000101
+const tfd_busy: u32 = 0x80
+const tfd_request: u32 = 0x08
+const tfd_error: u32 = 0x01
+const is_task_error: u32 = 0x40000000
+
+const fis_h2d: u8 = 0x27
+const fis_command: u8 = 0x80
+const device_lba: u8 = 0x40
+const ata_identify: u8 = 0xEC
+const ata_read_dma_ext: u8 = 0x25
+const ata_write_dma_ext: u8 = 0x35
+
+const header_write: u32 = 0x40
+const fis_dwords: u32 = 5
+const prdt_offset: u64 = 0x80
+const bounce_pages: u64 = 16
+const bounce_bytes: u64 = 65536
+const max_disks: usize = 4
+const spin_limit: u64 = 50000000
+
+struct Port {
+    base: u64,
+    list_phys: u64,
+    table_phys: u64,
+    bounce_phys: u64,
+    sectors: u64,
+    sector_size: u64,
+}
+
+static mut abar: u64 = 0
+static mut ports: [Port; 4]
+#[getter]
+static mut disk_count: usize = 0
+#[getter]
+static mut ports_implemented: u32 = 0
+#[getter]
+static mut errors: u64 = 0
+
+fn hba_read(off: u64) -> u32 {
+    return ((abar + off) as *mut u32).read()
+}
+
+fn hba_write(off: u64, v: u32) {
+    ((abar + off) as *mut u32).write(v)
+}
+
+fn rd(p: u64, off: u64) -> u32 {
+    return ((p + off) as *mut u32).read()
+}
+
+fn wr(p: u64, off: u64, v: u32) {
+    ((p + off) as *mut u32).write(v)
+}
+
+fn mem(phys: u64) -> *mut u8 {
+    return phys_to_virt(phys) as *mut u8
+}
+
+fn wait_clear(p: u64, off: u64, bits: u32) -> bool {
+    for i in 0..spin_limit {
+        if rd(p, off) & bits == 0 {
+            return true
+        }
+        pause()
+    }
+    return false
+}
+
+fn port_stop(p: u64) -> bool {
+    wr(p, px_cmd, rd(p, px_cmd) & ~cmd_start)
+    if !wait_clear(p, px_cmd, cmd_list_running) {
+        return false
+    }
+    wr(p, px_cmd, rd(p, px_cmd) & ~cmd_fis_receive)
+    return wait_clear(p, px_cmd, cmd_fis_running)
+}
+
+fn port_setup(i: usize, p: u64) -> bool {
+    if !port_stop(p) {
+        return false
+    }
+    let list = pmm_alloc_page()
+    let fis = pmm_alloc_page()
+    let table = pmm_alloc_page()
+    let bounce = pmm_alloc_pages(bounce_pages)
+    if list == 0 || fis == 0 || table == 0 || bounce == 0 {
+        return false
+    }
+    zero_phys(list, size_4k)
+    zero_phys(fis, size_4k)
+    zero_phys(table, size_4k)
+    wr(p, px_clb, list as u32)
+    wr(p, px_clbu, (list >> 32) as u32)
+    wr(p, px_fb, fis as u32)
+    wr(p, px_fbu, (fis >> 32) as u32)
+    wr(p, px_serr, 0xFFFFFFFF)
+    wr(p, px_is, 0xFFFFFFFF)
+    wr(p, px_ie, 0)
+    wr(p, px_cmd, rd(p, px_cmd) | cmd_fis_receive)
+    if !wait_clear(p, px_tfd, tfd_busy | tfd_request) {
+        return false
+    }
+    wr(p, px_cmd, rd(p, px_cmd) | cmd_start)
+    ports[i] = Port { base: p, list_phys: list, table_phys: table, bounce_phys: bounce, sectors: 0, sector_size: 512 }
+    return true
+}
+
+fn command(i: usize, cmd: u8, lba: u64, count: u64, bytes: u64, write: bool) -> bool {
+    let port = ports[i]
+    let p = port.base
+    if !wait_clear(p, px_tfd, tfd_busy | tfd_request) {
+        return false
+    }
+    let header = mem(port.list_phys)
+    let mut flags = fis_dwords | (1u32 << 16)
+    if write {
+        flags |= header_write
+    }
+    (header as *mut u32).write(flags)
+    (header.add(4) as *mut u32).write(0)
+    (header.add(8) as *mut u64).write(port.table_phys)
+    let t = mem(port.table_phys)
+    memset(t, 0, 0x90)
+    t.write(fis_h2d)
+    t.add(1).write(fis_command)
+    t.add(2).write(cmd)
+    t.add(4).write(lba as u8)
+    t.add(5).write((lba >> 8) as u8)
+    t.add(6).write((lba >> 16) as u8)
+    t.add(7).write(device_lba)
+    t.add(8).write((lba >> 24) as u8)
+    t.add(9).write((lba >> 32) as u8)
+    t.add(10).write((lba >> 40) as u8)
+    t.add(12).write(count as u8)
+    t.add(13).write((count >> 8) as u8)
+    let prd = t.add(prdt_offset as usize)
+    (prd as *mut u64).write(port.bounce_phys)
+    (prd.add(12) as *mut u32).write((bytes - 1) as u32)
+    wr(p, px_is, 0xFFFFFFFF)
+    wr(p, px_ci, 1)
+    for k in 0..spin_limit {
+        if rd(p, px_is) & is_task_error != 0 {
+            errors += 1
+            return false
+        }
+        if rd(p, px_ci) & 1 == 0 {
+            return rd(p, px_tfd) & tfd_error == 0
+        }
+        pause()
+    }
+    errors += 1
+    return false
+}
+
+fn identify(i: usize) -> bool {
+    if !command(i, ata_identify, 0, 0, 512, false) {
+        return false
+    }
+    let id = mem(ports[i].bounce_phys) as *mut u16
+    let mut sectors: u64 = 0
+    for w in 0..4usize {
+        sectors |= (id.add(100 + w).read() as u64) << (16 * w as u64)
+    }
+    if sectors == 0 {
+        sectors = id.add(60).read() as u64 | (id.add(61).read() as u64) << 16
+    }
+    let mut size: u64 = 512
+    let w106 = id.add(106).read()
+    if w106 & 0xC000 == 0x4000 && w106 & 0x1000 != 0 {
+        size = (id.add(117).read() as u64 | (id.add(118).read() as u64) << 16) * 2
+    }
+    ports[i].sectors = sectors
+    ports[i].sector_size = size
+    return sectors != 0 && (size == 512 || size == 4096)
+}
+
+fn init() -> usize {
+    let Some(a) = pci_find_class(class_ahci, 0) else {
+        return 0
+    }
+    let Some(bar) = pci_memory_bar(&a, abar_index) else {
+        return 0
+    }
+    pci_enable(&a)
+    let Some(base) = map_mmio(bar, abar_size) else {
+        return 0
+    }
+    abar = base
+    hba_write(reg_ghc, hba_read(reg_ghc) | ghc_enable)
+    ports_implemented = hba_read(reg_pi)
+    for n in 0..32u64 {
+        if disk_count == max_disks || ports_implemented & (1u32 << n as u32) == 0 {
+            continue
+        }
+        let p = abar + port_base + n * port_stride
+        if rd(p, px_ssts) & 0xF != ssts_present || rd(p, px_sig) != sig_disk {
+            continue
+        }
+        if port_setup(disk_count, p) && identify(disk_count) {
+            disk_count += 1
+        }
+    }
+    return disk_count
+}
+
+fn sectors(i: usize) -> u64 {
+    return ports[i].sectors
+}
+
+fn sector_size(i: usize) -> u64 {
+    return ports[i].sector_size
+}
+
+fn transfer(i: usize, lba: u64, count: u64, buf: u64, write: bool) -> bool {
+    if i >= disk_count || count == 0 || lba + count > ports[i].sectors {
+        return false
+    }
+    let ss = ports[i].sector_size
+    let per = bounce_bytes / ss
+    let mut done: u64 = 0
+    while done < count {
+        let mut n = count - done
+        if n > per {
+            n = per
+        }
+        let bytes = n * ss
+        let at = (buf + done * ss) as *mut u8
+        if write {
+            memcpy(mem(ports[i].bounce_phys), at, bytes as usize)
+            if !command(i, ata_write_dma_ext, lba + done, n, bytes, true) {
+                return false
+            }
+        } else {
+            if !command(i, ata_read_dma_ext, lba + done, n, bytes, false) {
+                return false
+            }
+            memcpy(at, mem(ports[i].bounce_phys), bytes as usize)
+        }
+        done += n
+    }
+    return true
+}
+
+fn read(i: usize, lba: u64, count: u64, buf: &mut [u8]) -> bool {
+    if (buf.len() as u64) < count * ports[i].sector_size {
+        return false
+    }
+    return transfer(i, lba, count, buf.as_mut_ptr() as u64, false)
+}
+
+fn write(i: usize, lba: u64, count: u64, buf: &[u8]) -> bool {
+    if (buf.len() as u64) < count * ports[i].sector_size {
+        return false
+    }
+    return transfer(i, lba, count, buf.as_ptr() as u64, true)
+}

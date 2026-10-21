@@ -1127,6 +1127,34 @@ impl Assembler {
         self.rel32(AddrTarget::Rw(data));
     }
 
+    pub fn swapgs(&mut self) {
+        self.bytes(&[0x0F, 0x01, 0xF8]);
+    }
+
+    pub fn store_gs(&mut self, disp: i32, src: Reg) {
+        self.byte(0x65);
+        self.rex(true, src.ext(), 0);
+        self.byte(0x89);
+        self.byte(src.low() << 3 | 0b100);
+        self.byte(0x25);
+        self.bytes(&disp.to_le_bytes());
+    }
+
+    pub fn load_gs(&mut self, dst: Reg, disp: i32) {
+        self.byte(0x65);
+        self.rex(true, dst.ext(), 0);
+        self.byte(0x8B);
+        self.byte(dst.low() << 3 | 0b100);
+        self.byte(0x25);
+        self.bytes(&disp.to_le_bytes());
+    }
+
+    pub fn xchg_mem(&mut self, base: Reg, src: Reg) {
+        self.rex(true, src.ext(), base.ext());
+        self.byte(0x87);
+        self.modrm_mem(src as u8, base, 0);
+    }
+
     pub fn sysretq(&mut self) {
         self.bytes(&[0x48, 0x0F, 0x07]);
     }

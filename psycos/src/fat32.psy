@@ -4,9 +4,9 @@
 ///   - https://wiki.osdev.org/FAT#Long_File_Names
 ///   - https://wiki.osdev.org/MBR_(x86)
 
-import "virtio_blk.psy"
+import "disk.psy" as disk
 
-const sector_bytes: u64 = 512
+
 const dir_entry_size: u64 = 32
 const max_cluster_bytes: u64 = 32768
 const name_max: usize = 64
@@ -31,9 +31,6 @@ const lfn_last: u8 = 0x40
 const ntres_lower_base: u8 = 0x08
 const ntres_lower_ext: u8 = 0x10
 
-const part_fat32: u8 = 0x0B
-const part_fat32_lba: u8 = 0x0C
-const mbr_table: usize = 446
 
 const fsinfo_free_offset: usize = 488
 const fsinfo_next_offset: usize = 492
@@ -71,6 +68,11 @@ static mut fat_mounted: bool = false
 #[getter]
 static mut fat_partition_start: u64 = 0
 #[getter]
+static mut fat_disk: usize = 0
+#[getter]
+static mut sector_bytes: u64 = 512
+static mut units_per_sector: u64 = 1
+#[getter]
 static mut fat_cluster_bytes: u64 = 0
 #[getter]
 static mut fat_total_clusters: u64 = 0
@@ -88,8 +90,8 @@ static mut root_cluster: u64 = 0
 static mut fsinfo_sector: u64 = 0
 static mut alloc_hint: u64 = 2
 
-static mut sector: [u8; 512]
-static mut fat_cache: [u8; 512]
+static mut sector: [u8; 4096]
+static mut fat_cache: [u8; 4096]
 static mut fat_cache_sector: u64 = 0xFFFFFFFFFFFFFFFF
 static mut dir_buf: [u8; 32768]
 static mut dir_buf_cluster: u64 = 0
@@ -128,11 +130,11 @@ fn lower(c: u8) -> u8 {
 }
 
 fn vol_read(first: u64, count: u64, buf: &mut [u8]) -> bool {
-    return blk_read(fat_partition_start + first, count, buf)
+    return disk::read(fat_disk, fat_partition_start + first * units_per_sector, count * units_per_sector, buf)
 }
 
 fn vol_write(first: u64, count: u64, buf: &[u8]) -> bool {
-    return blk_write(fat_partition_start + first, count, buf)
+    return disk::write(fat_disk, fat_partition_start + first * units_per_sector, count * units_per_sector, buf)
 }
 
 fn cluster_sector(cluster: u64) -> u64 {
@@ -164,39 +166,57 @@ fn is_fat32_boot(b: &[u8]) -> bool {
     if b[510] != 0x55 || b[511] != 0xAA {
         return false
     }
-    if le16(b, 11) != sector_bytes || le16(b, 22) != 0 || le32(b, 36) == 0 {
+    let bps = le16(b, 11)
+    if bps < disk::unit_bytes || bps > 4096 || bps & (bps - 1) != 0 || le16(b, 22) != 0 || le32(b, 36) == 0 {
         return false
     }
     let spc = b[13] as u64
-    return spc != 0 && spc & (spc - 1) == 0 && spc * sector_bytes <= max_cluster_bytes && b[16] != 0
+    return spc != 0 && spc & (spc - 1) == 0 && spc * bps <= max_cluster_bytes && b[16] != 0
+}
+
+fn volume_label_is(b: &[u8], want: Str) -> bool {
+    let w = want.as_bytes()
+    for i in 0..11usize {
+        let mut c: u8 = 32
+        if i < w.len() {
+            c = w[i]
+        }
+        if b[71 + i] != c {
+            return false
+        }
+    }
+    return true
+}
+
+fn find_volume(label: Str) -> Option<disk::Partition> {
+    for i in 0..disk::get_part_count() {
+        let p = disk::partition(i)
+        if p.units == 0 || !disk::read(p.disk, p.start, 1, &mut sector) || !is_fat32_boot(&sector) {
+            continue
+        }
+        if label.len() == 0 || volume_label_is(&sector, label) {
+            return Some(p)
+        }
+    }
+    return None
 }
 
 fn fat_mount() -> bool {
     fat_mounted = false
-    if !get_blk_ready() {
+    let mut found = find_volume("PSYOS")
+    if found.is_none() {
+        found = find_volume("")
+    }
+    let Some(p) = found else {
         return false
     }
-    fat_partition_start = 0
-    if !blk_read(0, 1, &mut sector) {
+    if !disk::read(p.disk, p.start, 1, &mut sector) {
         return false
     }
-    if !is_fat32_boot(&sector) {
-        if sector[510] != 0x55 || sector[511] != 0xAA {
-            return false
-        }
-        let mut start: u64 = 0
-        for p in 0..4usize {
-            let e = mbr_table + p * 16
-            let kind = sector[e + 4]
-            if start == 0 && (kind == part_fat32 || kind == part_fat32_lba) {
-                start = le32(&sector, e + 8)
-            }
-        }
-        if start == 0 || !blk_read(start, 1, &mut sector) || !is_fat32_boot(&sector) {
-            return false
-        }
-        fat_partition_start = start
-    }
+    fat_disk = p.disk
+    fat_partition_start = p.start
+    sector_bytes = le16(&sector, 11)
+    units_per_sector = sector_bytes / disk::unit_bytes
     sectors_per_cluster = sector[13] as u64
     reserved_sectors = le16(&sector, 14)
     fat_count = sector[16] as u64

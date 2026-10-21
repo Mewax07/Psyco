@@ -1,0 +1,385 @@
+/// Wiki Doc sources:
+///   - https://wiki.osdev.org/Intel_High_Definition_Audio
+///   - https://www.intel.com/content/www/us/en/standards/high-definition-audio-specification.html
+
+#![trusted]
+
+import "pci.psy"
+import "paging.psy"
+import "pmm.psy"
+
+const class_hda: u32 = 0x040300
+const regs_size: u64 = 0x4000
+
+const reg_gcap: u64 = 0x00
+const reg_gctl: u64 = 0x08
+const reg_statests: u64 = 0x0E
+const reg_corb_lo: u64 = 0x40
+const reg_corb_hi: u64 = 0x44
+const reg_corb_wp: u64 = 0x48
+const reg_corb_rp: u64 = 0x4A
+const reg_corb_ctl: u64 = 0x4C
+const reg_corb_size: u64 = 0x4E
+const reg_rirb_lo: u64 = 0x50
+const reg_rirb_hi: u64 = 0x54
+const reg_rirb_wp: u64 = 0x58
+const reg_rirb_count: u64 = 0x5A
+const reg_rirb_ctl: u64 = 0x5C
+const reg_rirb_sts: u64 = 0x5D
+const reg_rirb_size: u64 = 0x5E
+const stream_base: u64 = 0x80
+const stream_stride: u64 = 0x20
+
+const sd_ctl: u64 = 0x00
+const sd_lpib: u64 = 0x04
+const sd_cbl: u64 = 0x08
+const sd_lvi: u64 = 0x0C
+const sd_fmt: u64 = 0x12
+const sd_bdl_lo: u64 = 0x18
+const sd_bdl_hi: u64 = 0x1C
+
+const gctl_reset: u32 = 0x1
+const corb_run: u8 = 0x2
+const rirb_run: u8 = 0x2
+const pointer_reset: u16 = 0x8000
+const rirb_status_clear: u8 = 0x5
+const response_count: u16 = 0xFF
+const size_256: u8 = 0x2
+const ring_entries: u64 = 256
+const sd_reset: u32 = 0x1
+const sd_run: u32 = 0x2
+const stream_tag: u32 = 1
+
+const verb_get_param: u32 = 0xF00
+const verb_get_connection: u32 = 0xF02
+const verb_power: u32 = 0x705
+const verb_stream: u32 = 0x706
+const verb_pin_control: u32 = 0x707
+const verb_eapd: u32 = 0x70C
+const verb_format: u32 = 0x2
+const verb_amp: u32 = 0x3
+
+const param_vendor: u32 = 0x00
+const param_nodes: u32 = 0x04
+const param_group: u32 = 0x05
+const param_widget: u32 = 0x09
+const param_pin: u32 = 0x0C
+const param_connections: u32 = 0x0E
+const param_out_amp: u32 = 0x12
+
+const group_audio: u32 = 1
+const widget_output: u32 = 0
+const widget_mixer: u32 = 2
+const widget_selector: u32 = 3
+const widget_pin: u32 = 4
+const pin_can_output: u32 = 0x10
+const pin_enable_out: u32 = 0x40
+const amp_out_both: u32 = 0xB000
+const eapd_on: u32 = 2
+
+const format_48k_16_stereo: u16 = 0x0011
+const sample_rate: u64 = 48000
+const frames: u64 = 4000
+const buffer_bytes: u64 = 16000
+const half_bytes: u64 = 8000
+const amplitude: i64 = 8000
+const spin_limit: u64 = 10000000
+
+static mut regs: u64 = 0
+static mut corb_phys: u64 = 0
+static mut rirb_phys: u64 = 0
+static mut rirb_read: u64 = 0
+static mut bdl_phys: u64 = 0
+static mut sound_phys: u64 = 0
+static mut out_stream: u64 = 0
+#[getter]
+static mut ready: bool = false
+#[getter]
+static mut codec: u32 = 0
+#[getter]
+static mut vendor: u32 = 0
+#[getter]
+static mut afg: u32 = 0
+#[getter]
+static mut dac: u32 = 0
+#[getter]
+static mut pin: u32 = 0
+#[getter]
+static mut playing: bool = false
+#[getter]
+static mut errors: u64 = 0
+
+fn r8(off: u64) -> u8 {
+    return ((regs + off) as *mut u8).read()
+}
+
+fn w8(off: u64, v: u8) {
+    ((regs + off) as *mut u8).write(v)
+}
+
+fn r16(off: u64) -> u16 {
+    return ((regs + off) as *mut u16).read()
+}
+
+fn w16(off: u64, v: u16) {
+    ((regs + off) as *mut u16).write(v)
+}
+
+fn r32(off: u64) -> u32 {
+    return ((regs + off) as *mut u32).read()
+}
+
+fn w32(off: u64, v: u32) {
+    ((regs + off) as *mut u32).write(v)
+}
+
+fn mem(phys: u64) -> *mut u8 {
+    return phys_to_virt(phys) as *mut u8
+}
+
+fn wait_bit32(off: u64, bit: u32, set: bool) -> bool {
+    for i in 0..spin_limit {
+        if (r32(off) & bit != 0) == set {
+            return true
+        }
+        pause()
+    }
+    return false
+}
+
+fn send(node: u32, verb: u32, payload: u32) -> Option<u32> {
+    let mut v = codec << 28 | node << 20
+    if verb < 0x10 {
+        v |= verb << 16 | (payload & 0xFFFF)
+    } else {
+        v |= verb << 8 | (payload & 0xFF)
+    }
+    let wp = ((r16(reg_corb_wp) & 0xFF) as u64 + 1) % ring_entries
+    (mem(corb_phys + wp * 4) as *mut u32).write(v)
+    w16(reg_corb_wp, wp as u16)
+    for i in 0..spin_limit {
+        let rp = (r16(reg_rirb_wp) & 0xFF) as u64
+        if rp != rirb_read {
+            rirb_read = (rirb_read + 1) % ring_entries
+            let response = (mem(rirb_phys + rirb_read * 8) as *mut u32).read()
+            w8(reg_rirb_sts, rirb_status_clear)
+            return Some(response)
+        }
+        pause()
+    }
+    errors += 1
+    return None
+}
+
+fn param(node: u32, id: u32) -> u32 {
+    return send(node, verb_get_param, id).unwrap_or(0)
+}
+
+fn widget_type(node: u32) -> u32 {
+    return (param(node, param_widget) >> 20) & 0xF
+}
+
+fn first_connection(node: u32) -> u32 {
+    if param(node, param_connections) & 0x7F == 0 {
+        return 0
+    }
+    return send(node, verb_get_connection, 0).unwrap_or(0) & 0xFF
+}
+
+fn setup_rings() -> bool {
+    corb_phys = pmm_alloc_page()
+    rirb_phys = pmm_alloc_page()
+    if corb_phys == 0 || rirb_phys == 0 {
+        return false
+    }
+    zero_phys(corb_phys, size_4k)
+    zero_phys(rirb_phys, size_4k)
+    w8(reg_corb_ctl, 0)
+    w8(reg_rirb_ctl, 0)
+    w32(reg_corb_lo, corb_phys as u32)
+    w32(reg_corb_hi, (corb_phys >> 32) as u32)
+    w8(reg_corb_size, size_256)
+    w16(reg_corb_rp, pointer_reset)
+    for i in 0..spin_limit {
+        if r16(reg_corb_rp) & pointer_reset != 0 {
+            break
+        }
+        pause()
+    }
+    w16(reg_corb_rp, 0)
+    w16(reg_corb_wp, 0)
+    w32(reg_rirb_lo, rirb_phys as u32)
+    w32(reg_rirb_hi, (rirb_phys >> 32) as u32)
+    w8(reg_rirb_size, size_256)
+    w16(reg_rirb_wp, pointer_reset)
+    w16(reg_rirb_count, response_count)
+    rirb_read = 0
+    w8(reg_corb_ctl, corb_run)
+    w8(reg_rirb_ctl, rirb_run)
+    return true
+}
+
+fn find_path() -> bool {
+    let groups = param(0, param_nodes)
+    let first_group = (groups >> 16) & 0xFF
+    for g in first_group..first_group + (groups & 0xFF) {
+        if param(g, param_group) & 0xFF == group_audio {
+            afg = g
+        }
+    }
+    if afg == 0 {
+        return false
+    }
+    send(afg, verb_power, 0)
+    let nodes = param(afg, param_nodes)
+    let first = (nodes >> 16) & 0xFF
+    for n in first..first + (nodes & 0xFF) {
+        if widget_type(n) != widget_pin || param(n, param_pin) & pin_can_output == 0 {
+            continue
+        }
+        let mut c = first_connection(n)
+        let mut hops: u32 = 0
+        while c != 0 && hops < 4 {
+            let t = widget_type(c)
+            if t == widget_output {
+                pin = n
+                dac = c
+                return true
+            }
+            if t != widget_mixer && t != widget_selector {
+                break
+            }
+            send(c, verb_amp, amp_out_both | 0x7F)
+            c = first_connection(c)
+            hops += 1
+        }
+    }
+    return false
+}
+
+fn init() -> bool {
+    let Some(a) = pci_find_class(class_hda, 0) else {
+        return false
+    }
+    let Some(bar) = pci_memory_bar(&a, 0) else {
+        return false
+    }
+    pci_enable(&a)
+    let Some(base) = map_mmio(bar, regs_size) else {
+        return false
+    }
+    regs = base
+    w32(reg_gctl, r32(reg_gctl) & ~gctl_reset)
+    if !wait_bit32(reg_gctl, gctl_reset, false) {
+        return false
+    }
+    w32(reg_gctl, r32(reg_gctl) | gctl_reset)
+    if !wait_bit32(reg_gctl, gctl_reset, true) {
+        return false
+    }
+    for i in 0..spin_limit {
+        if r16(reg_statests) != 0 {
+            break
+        }
+        pause()
+    }
+    let present = r16(reg_statests)
+    if present == 0 {
+        return false
+    }
+    for c in 0..15u32 {
+        if present & (1u16 << c as u16) != 0 {
+            codec = c
+            break
+        }
+    }
+    let input_streams = ((r16(reg_gcap) >> 8) & 0xF) as u64
+    out_stream = input_streams
+    if !setup_rings() {
+        return false
+    }
+    vendor = param(0, param_vendor)
+    if !find_path() {
+        return false
+    }
+    send(dac, verb_power, 0)
+    send(pin, verb_power, 0)
+    send(pin, verb_pin_control, pin_enable_out)
+    send(pin, verb_eapd, eapd_on)
+    send(pin, verb_amp, amp_out_both | 0x7F)
+    let steps = (param(dac, param_out_amp) >> 8) & 0x7F
+    send(dac, verb_amp, amp_out_both | steps)
+    bdl_phys = pmm_alloc_page()
+    sound_phys = pmm_alloc_pages(4)
+    if bdl_phys == 0 || sound_phys == 0 {
+        return false
+    }
+    ready = true
+    return true
+}
+
+fn sd(off: u64) -> u64 {
+    return stream_base + stream_stride * out_stream + off
+}
+
+fn fill_tone(hz: u64) {
+    let period = sample_rate / hz
+    let p = mem(sound_phys) as *mut u16
+    for f in 0..frames {
+        let mut v = amplitude
+        if f % period >= period / 2 {
+            v = 0 - amplitude
+        }
+        p.add((2 * f) as usize).write(v as u16)
+        p.add((2 * f + 1) as usize).write(v as u16)
+    }
+}
+
+fn stream_reset() {
+    w32(sd(sd_ctl), r32(sd(sd_ctl)) & ~sd_run)
+    w32(sd(sd_ctl), r32(sd(sd_ctl)) | sd_reset)
+    wait_bit32(sd(sd_ctl), sd_reset, true)
+    w32(sd(sd_ctl), r32(sd(sd_ctl)) & ~sd_reset)
+    wait_bit32(sd(sd_ctl), sd_reset, false)
+}
+
+fn play_tone(hz: u64) -> bool {
+    if !ready || hz == 0 || hz > sample_rate / 2 {
+        return false
+    }
+    fill_tone(hz)
+    stream_reset()
+    let b = mem(bdl_phys)
+    for k in 0..2u64 {
+        let e = b.add((k * 16) as usize)
+        (e as *mut u64).write(sound_phys + k * half_bytes)
+        (e.add(8) as *mut u32).write(half_bytes as u32)
+        (e.add(12) as *mut u32).write(0)
+    }
+    w32(sd(sd_bdl_lo), bdl_phys as u32)
+    w32(sd(sd_bdl_hi), (bdl_phys >> 32) as u32)
+    w32(sd(sd_cbl), buffer_bytes as u32)
+    w16(sd(sd_lvi), 1)
+    w16(sd(sd_fmt), format_48k_16_stereo)
+    send(dac, verb_format, format_48k_16_stereo as u32)
+    send(dac, verb_stream, stream_tag << 4)
+    w32(sd(sd_ctl), (r32(sd(sd_ctl)) & ~(0xFu32 << 20)) | stream_tag << 20 | sd_run)
+    playing = true
+    return true
+}
+
+fn stop() {
+    if !ready {
+        return
+    }
+    w32(sd(sd_ctl), r32(sd(sd_ctl)) & ~sd_run)
+    send(dac, verb_stream, 0)
+    playing = false
+}
+
+fn position() -> u32 {
+    if !ready {
+        return 0
+    }
+    return r32(sd(sd_lpib))
+}

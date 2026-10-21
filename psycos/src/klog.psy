@@ -1,0 +1,121 @@
+/// Wiki Doc sources:
+///   - https://wiki.osdev.org/Printing_To_Screen
+///   - https://wiki.osdev.org/Serial_Ports
+
+import "console.psy"
+import "timer.psy"
+import "apic.psy"
+
+const log_size: usize = 16384
+const stamp_width: usize = 6
+
+static mut log_buf: [u8; 16384]
+#[getter]
+static mut log_len: usize = 0
+#[getter]
+static mut log_lost: u64 = 0
+#[setter]
+static mut log_echo: bool = false
+
+fn log_put(b: u8) {
+    if log_len < log_size {
+        log_buf[log_len] = b
+        log_len += 1
+    } else {
+        log_lost += 1
+    }
+    if log_echo {
+        putc(b)
+    }
+}
+
+fn log_str(s: Str) {
+    let b = s.as_bytes()
+    for i in 0..b.len() {
+        log_put(b[i])
+    }
+}
+
+fn log_bytes(b: &[u8]) {
+    for i in 0..b.len() {
+        log_put(b[i])
+    }
+}
+
+fn log_u64(n: u64) {
+    let mut digits = [0u8; 20]
+    let mut v = n
+    let mut count: usize = 0
+    loop {
+        digits[count] = '0' + (v % 10) as u8
+        count += 1
+        v = v / 10
+        if v == 0 {
+            break
+        }
+    }
+    while count > 0 {
+        count -= 1
+        log_put(digits[count])
+    }
+}
+
+fn log_hex(n: u64) {
+    let hex = "0123456789ABCDEF".as_bytes()
+    let mut started = false
+    let mut shift: u64 = 64
+    while shift > 0 {
+        shift -= 4
+        let d = ((n >> shift) & 0xF) as usize
+        if d != 0 || started || shift == 0 {
+            started = true
+            log_put(hex[d])
+        }
+    }
+}
+
+fn log_time() -> u64 {
+    if get_hpet_on() {
+        return hpet_ms()
+    }
+    return uptime_ms()
+}
+
+fn log_begin(tag: Str) {
+    let ms = log_time()
+    let mut width: usize = 1
+    let mut v = ms
+    while v >= 10 {
+        v = v / 10
+        width += 1
+    }
+    log_put('[')
+    while width < stamp_width {
+        log_put(' ')
+        width += 1
+    }
+    log_u64(ms)
+    log_str(" ms] ")
+    log_str(tag)
+    log_str(": ")
+}
+
+fn log_end() {
+    log_put('\n')
+}
+
+fn log_line(tag: Str, text: Str) {
+    log_begin(tag)
+    log_str(text)
+    log_end()
+}
+
+fn log_dump() {
+    for i in 0..log_len {
+        putc(log_buf[i])
+    }
+}
+
+fn log_contents() -> &[u8] {
+    return &log_buf[..log_len]
+}
